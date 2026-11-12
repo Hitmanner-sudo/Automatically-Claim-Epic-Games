@@ -361,28 +361,71 @@ if ($Test -eq 'silent') {
 }
 
 if ($Test -eq 'desktop') {
-    Section "test: hidden desktop, -cefdebug=$Port (no -silent)"
+    function Watch-Procs([int]$seconds, [string]$tag) {
+        $last = ''
+        for ($i = 0; $i -lt $seconds; $i++) {
+            $procs = @(Get-EpicProcs)
+            $sig = ($procs | ForEach-Object { "$($_.ProcessId):$($_.Name)" }) -join ','
+            if ($sig -ne $last) { Show-EpicProcs "$tag t+${i}s"; $last = $sig }
+            Start-Sleep -Seconds 1
+        }
+    }
+    function Show-LogTail([string]$tag, [int]$lines = 45) {
+        Write-Host "[launcher log tail: $tag]"
+        if (Test-Path $log) {
+            Get-Content $log -Tail $lines | ForEach-Object { $l = $_; if ($l.Length -gt 240) { $l = $l.Substring(0, 240) }; Write-Host "    $l" }
+        }
+        Get-ChildItem "$env:LOCALAPPDATA\EpicGamesLauncher\Saved\Logs" -Filter 'EpicGamesUpdater*.log' -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "[updater log $($_.Name) ($($_.Length) bytes)]"
+            Get-Content $_.FullName -Tail 25 | ForEach-Object { Write-Host "    $_" }
+        }
+    }
+
     $deskName = 'EglProbeDesk'
     $hDesk = [WinProbe]::CreateDesktopW($deskName, [IntPtr]::Zero, [IntPtr]::Zero, 0, 0x10000000, [IntPtr]::Zero)
     Write-Host "CreateDesktopW -> $hDesk (lastError=$([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
-    $launch = { $newPid = [WinProbe]::StartOnDesktop($deskName, "`"$exe`" -cefdebug=$Port", $cwd); Write-Host "started pid=$newPid on desktop $deskName" }
+    $launch = { $newPid = [WinProbe]::StartOnDesktop($deskName, "`"$exe`" -cefdebug=$Port -silent", $cwd); Write-Host "started pid=$newPid on desktop $deskName" }
+
+    Section 'step 1: OUTDATED launcher on the hidden desktop (it wants to self-update)'
     try { & $launch } catch { Write-Host "launch on hidden desktop FAILED: $_" }
-    $up = Wait-Cdp $Port $exe "-cefdebug=$Port" $BootMinutes $launch
+    Watch-Procs 40 'outdated-hidden'
+    Write-Host "cdp up: $([bool](Get-Http "http://127.0.0.1:$Port/json/version"))"
+    Show-Windows 'step 1: DEFAULT desktop' ([IntPtr]::Zero)
+    Show-Windows 'step 1: HIDDEN desktop' $hDesk
+    Show-LogTail 'outdated launcher on hidden desktop'
+    Stop-Epic
+
+    Section 'step 2: let the launcher update itself on the normal desktop (-silent)'
+    $PortW = $Port + 5
+    $warm = { Start-Process -FilePath $exe -ArgumentList '-silent', "-cefdebug=$PortW" -WorkingDirectory $cwd }
+    & $warm
+    $script:t0 = Get-Date
+    $warmUp = Wait-Cdp $PortW $exe "-silent -cefdebug=$PortW" $BootMinutes $warm
+    Show-Windows 'step 2: DEFAULT desktop during -silent warm-up' ([IntPtr]::Zero)
+    Write-Host "warm-up cdp up: $warmUp ; exe version now $((Get-Item $exe).VersionInfo.FileVersion)"
+    Stop-Epic
+
+    Section "step 3: UP-TO-DATE launcher on the hidden desktop, -cefdebug=$Port -silent"
+    $script:t0 = Get-Date
+    try { & $launch } catch { Write-Host "launch on hidden desktop FAILED: $_" }
+    $up = Wait-Cdp $Port $exe "-cefdebug=$Port -silent" 5 $launch
     Show-EpicProcs 'desktop'
-    Show-Windows 'hidden-desktop test: DEFAULT desktop (want launcher-owned=0)' ([IntPtr]::Zero)
-    Show-Windows 'hidden-desktop test: HIDDEN desktop' $hDesk
+    Show-Windows 'step 3: DEFAULT desktop (want launcher-owned=0)' ([IntPtr]::Zero)
+    Show-Windows 'step 3: HIDDEN desktop' $hDesk
+    if (-not $up) { Show-LogTail 'up-to-date launcher on hidden desktop' }
     if ($up) {
         Start-Sleep -Seconds 20
         Test-Cdp $Port 'hidden desktop' $true
-        Show-Windows 'hidden-desktop test: DEFAULT desktop after navigation' ([IntPtr]::Zero)
-        Show-Windows 'hidden-desktop test: HIDDEN desktop after navigation' $hDesk
-    }
+        Show-Windows 'step 3: DEFAULT desktop after navigation' ([IntPtr]::Zero)
+        Show-Windows 'step 3: HIDDEN desktop after navigation' $hDesk
 
-    Section 'second instance from the NORMAL desktop while the hidden one runs'
-    Start-Process -FilePath $exe -WorkingDirectory $cwd
-    for ($i = 0; $i -lt 6; $i++) { Start-Sleep -Seconds 2; Show-EpicProcs "second-instance t+$(($i + 1) * 2)s" }
-    Show-Windows 'DEFAULT desktop after second instance' ([IntPtr]::Zero)
-    Show-Windows 'HIDDEN desktop after second instance' $hDesk
+        Section 'second instance from the NORMAL desktop while the hidden one runs'
+        Start-Process -FilePath $exe -WorkingDirectory $cwd
+        for ($i = 0; $i -lt 5; $i++) { Start-Sleep -Seconds 2; Show-EpicProcs "second-instance t+$(($i + 1) * 2)s" }
+        Show-Windows 'DEFAULT desktop after second instance' ([IntPtr]::Zero)
+        Show-Windows 'HIDDEN desktop after second instance' $hDesk
+        Write-Host "cdp still up: $([bool](Get-Http "http://127.0.0.1:$Port/json/version"))"
+    }
     [void][WinProbe]::CloseDesktop($hDesk)
 }
 

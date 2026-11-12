@@ -117,8 +117,11 @@ type Conn struct {
 	closed  bool
 	err     error
 
-	events chan Event
-	done   chan struct{}
+	evMu    sync.Mutex
+	evQueue []Event
+	evWake  chan struct{}
+	events  chan Event
+	done    chan struct{}
 }
 
 // ErrClosed is returned by calls on a connection that has gone away.
@@ -146,11 +149,52 @@ func Dial(ctx context.Context, wsURL string) (*Conn, error) {
 	c := &Conn{
 		ws:      ws,
 		pending: map[int64]chan reply{},
-		events:  make(chan Event, 256),
+		evWake:  make(chan struct{}, 1),
+		events:  make(chan Event),
 		done:    make(chan struct{}),
 	}
 	go c.readLoop()
+	go c.pumpEvents()
 	return c, nil
+}
+
+// pumpEvents hands queued events to whoever reads Events(). The queue is
+// unbounded on purpose: some events (a paused network request) must never be
+// lost, because the browser waits for an answer to them.
+func (c *Conn) pumpEvents() {
+	for {
+		c.evMu.Lock()
+		var next Event
+		has := len(c.evQueue) > 0
+		if has {
+			next = c.evQueue[0]
+			c.evQueue = c.evQueue[1:]
+		}
+		c.evMu.Unlock()
+		if !has {
+			select {
+			case <-c.evWake:
+				continue
+			case <-c.done:
+				return
+			}
+		}
+		select {
+		case c.events <- next:
+		case <-c.done:
+			return
+		}
+	}
+}
+
+func (c *Conn) queueEvent(e Event) {
+	c.evMu.Lock()
+	c.evQueue = append(c.evQueue, e)
+	c.evMu.Unlock()
+	select {
+	case c.evWake <- struct{}{}:
+	default:
+	}
 }
 
 func (c *Conn) readLoop() {
@@ -186,10 +230,7 @@ func (c *Conn) readLoop() {
 			continue
 		}
 		if msg.Method != "" {
-			select {
-			case c.events <- Event{Method: msg.Method, Params: msg.Params}:
-			default: // nobody is listening fast enough; drop rather than stall replies
-			}
+			c.queueEvent(Event{Method: msg.Method, Params: msg.Params})
 		}
 	}
 	c.mu.Lock()
@@ -204,7 +245,8 @@ func (c *Conn) readLoop() {
 	close(c.done)
 }
 
-// Events delivers browser events. Events are dropped when the buffer is full.
+// Events delivers browser events in order. None are dropped; events only
+// arrive for protocol domains that have been enabled.
 func (c *Conn) Events() <-chan Event { return c.events }
 
 // Done is closed when the connection ends.

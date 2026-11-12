@@ -1,0 +1,279 @@
+package claim
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+)
+
+// scenario configures the stand-in for Epic's store used by the tests. It
+// mimics the real checkout's structure: the #purchase-app root, the
+// payment-* class names, the order-preview and confirm-order calls, the
+// invisible hCaptcha frames, and the "Unexpected Error" page shown to
+// signed-out visitors.
+type scenario struct {
+	SignedIn     bool   `json:"signedIn"`     // checkout opens directly
+	HopWorks     bool   `json:"hopWorks"`     // the sign-in page hands a session over
+	Owned        bool   `json:"owned"`        // account already has the offer
+	MissingBase  bool   `json:"missingBase"`  // needs a base game
+	PreviewTotal int    `json:"previewTotal"` // total in the order preview
+	NoPreview    bool   `json:"noPreview"`    // page makes no preview call
+	DomTotal     string `json:"domTotal"`     // total shown on the page ("" = none shown)
+	ConfirmTotal *int   `json:"confirmTotal"` // totalAmount sent with the order (nil = field omitted)
+	EU           bool   `json:"eu"`           // asks for withdrawal-waiver consent
+	Captcha      bool   `json:"captcha"`      // shows a challenge after the button is pressed
+	CaptchaFirst bool   `json:"captchaFirst"` // shows a challenge before the button is ready
+	SlowMs       int    `json:"slowMs"`       // how long the button stays disabled
+	ConfirmError string `json:"confirmError"` // Epic rejects the order with this message
+	GraphQLDown  bool   `json:"graphqlDown"`  // ownership query unavailable
+	German       bool   `json:"german"`       // non-English labels
+	OwnedMessage bool   `json:"ownedMessage"` // checkout itself says "already own"
+	Region       bool   `json:"region"`       // checkout says unavailable in region
+	Pin          bool   `json:"pin"`          // parental PIN prompt
+	FormPost     bool   `json:"formPost"`     // order is sent as a form, not JSON
+}
+
+func intp(i int) *int { return &i }
+
+type mockStore struct {
+	t   *testing.T
+	sc  scenario
+	srv *httptest.Server
+
+	mu       sync.Mutex
+	orders   []string // bodies of confirm-order requests that arrived
+	previews int
+	owned    bool
+	cookie   string
+}
+
+var mockSeq int
+
+func newMockStore(t *testing.T, sc scenario) *mockStore {
+	t.Helper()
+	mockSeq++
+	m := &mockStore{t: t, sc: sc, owned: sc.Owned, cookie: fmt.Sprintf("sess%d", mockSeq)}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/purchase", m.handleCheckout)
+	mux.HandleFunc("/purchase/order-preview", m.handlePreview)
+	mux.HandleFunc("/purchase/confirm-order", m.handleConfirm)
+	mux.HandleFunc("/graphql", m.handleGraphQL)
+	mux.HandleFunc("/id/login", m.handleLogin)
+	mux.HandleFunc("/frame", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, "<!doctype html><body>frame</body>")
+	})
+	m.srv = httptest.NewServer(mux)
+	t.Cleanup(m.srv.Close)
+	return m
+}
+
+func (m *mockStore) URL() string { return m.srv.URL }
+
+func (m *mockStore) orderCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.orders)
+}
+
+func (m *mockStore) lastOrder() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.orders) == 0 {
+		return ""
+	}
+	return m.orders[len(m.orders)-1]
+}
+
+func (m *mockStore) hasSession(r *http.Request) bool {
+	if m.sc.SignedIn {
+		return true
+	}
+	c, err := r.Cookie(m.cookie)
+	return err == nil && c.Value == "1"
+}
+
+func (m *mockStore) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if m.sc.HopWorks {
+		http.SetCookie(w, &http.Cookie{Name: m.cookie, Value: "1", Path: "/"})
+		http.Redirect(w, r, r.URL.Query().Get("redirectUrl"), http.StatusFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html")
+	_, _ = io.WriteString(w, `<!doctype html><html><head><title>Sign in to Your Epic Games account | Epic Games</title></head><body>
+<h1>Sign in to Epic Games</h1><form><input id="email" name="email"><input id="password" type="password"><button type="submit">Continue</button></form></body></html>`)
+}
+
+func (m *mockStore) handlePreview(w http.ResponseWriter, r *http.Request) {
+	m.mu.Lock()
+	m.previews++
+	m.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	resp := map[string]any{
+		"country":   "US",
+		"syncToken": "tok",
+		"orderResponse": map[string]any{
+			"totalPrice": m.sc.PreviewTotal,
+			"currency":   "USD",
+			"lineOffers": []map[string]any{{"unitPrice": 2499, "discount": 2499 - m.sc.PreviewTotal, "totalPrice": m.sc.PreviewTotal, "quantity": 1}},
+		},
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (m *mockStore) handleConfirm(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	m.mu.Lock()
+	m.orders = append(m.orders, string(body))
+	if m.sc.ConfirmError == "" {
+		m.owned = true
+	}
+	m.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	if m.sc.ConfirmError != "" {
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "errors.com.epicgames.purchase", "message": m.sc.ConfirmError})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"confirmation": "ORDER-123", "error": nil})
+}
+
+func (m *mockStore) handleGraphQL(w http.ResponseWriter, r *http.Request) {
+	if m.sc.GraphQLDown || r.URL.Query().Get("operationName") != "getOffersValidation" || !m.hasSession(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"errors":[{"message":"PersistedQueryNotFound"}]}`)
+		return
+	}
+	m.mu.Lock()
+	owned := m.owned
+	m.mu.Unlock()
+	v := map[string]any{"conflictingOffers": nil, "missingPrerequisites": nil, "fullyOwnedOffers": nil, "unablePartiallyUpgradeOffers": nil}
+	if owned {
+		v["fullyOwnedOffers"] = []map[string]string{{"namespace": "ns", "offerId": "id"}}
+	}
+	if m.sc.MissingBase {
+		v["missingPrerequisites"] = []map[string]any{{"namespace": "ns", "offerId": "id", "missingPrerequisiteItems": []any{"base"}}}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"Entitlements": map[string]any{"cartOffersValidation": v}}})
+}
+
+const errorPage = `<!doctype html><html><head><title>Payment by Epic Games</title></head><body>
+<div id="purchase-app"><div class="message"><h2>Unexpected Error</h2><p>Uh oh, something went wrong.</p></div></div>
+<input type="hidden" id="purchaseToken" value=""><script>window.__epic_web_purchase_dataPreload = {};</script></body></html>`
+
+func (m *mockStore) handleCheckout(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	if !m.hasSession(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, errorPage)
+		return
+	}
+	if !strings.HasPrefix(r.URL.Query().Get("offers"), "1-") {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, errorPage)
+		return
+	}
+	sc, _ := json.Marshal(m.sc)
+	_, _ = io.WriteString(w, strings.ReplaceAll(checkoutPage, "__SCENARIO__", string(sc)))
+}
+
+const checkoutPage = `<!doctype html><html><head><title>Payment by Epic Games</title>
+<style>
+ body { margin: 0; font-family: sans-serif; background: #101014; color: #fff; }
+ #purchase-app { width: 100vw; height: 100vh; position: relative; }
+ .payment-summary { padding: 20px; }
+ .payment-order-confirm { position: absolute; right: 30px; bottom: 30px; }
+ .payment-btn { width: 220px; height: 48px; }
+ .payment-confirm { position: absolute; left: 200px; top: 150px; width: 480px; background: #333; padding: 20px; }
+</style></head><body>
+<div id="purchase-app">
+  <div class="payment-summary">
+    <div class="payment-offer">Flotsam</div>
+    <div class="payment-price"><span>Price</span> <span class="payment-price__value">$24.99</span></div>
+    <div class="payment-price"><span>Sale Discount</span> <span class="payment-price__value">-$24.99</span></div>
+    <div id="total-slot"></div>
+  </div>
+  <div class="payment-order-confirm">
+    <button class="payment-btn payment-order-confirm__btn payment-btn--primary" disabled><span class="payment-loading payment-loading--loading"></span><span id="place-label">Place Order</span></button>
+  </div>
+  <div id="extra"></div>
+  <!-- the real checkout always carries invisible captcha frames -->
+  <iframe src="/frame" title="hCaptcha" data-hcaptcha-widget-id="x" style="display:none"></iframe>
+  <div id="h_captcha_challenge_checkout_free_prod" style="position:absolute;left:0;top:0;width:0;height:0;overflow:hidden"><iframe src="/frame?hcaptcha=challenge" style="width:0;height:0;border:0"></iframe></div>
+</div>
+<input type="hidden" id="purchaseToken" value="tok">
+<script>
+var S = __SCENARIO__;
+window.__epic_web_purchase_dataPreload = { locale: 'en-US' };
+window.clicks = [];
+var offers = new URLSearchParams(location.search).getAll('offers');
+var btn = document.querySelector('.payment-order-confirm__btn');
+var extra = document.getElementById('extra');
+if (S.german) document.getElementById('place-label').textContent = 'Bestellung aufgeben';
+if (S.domTotal) {
+  document.getElementById('total-slot').innerHTML = '<div class="payment-price payment-price--total"><span class="payment-price__label">' + (S.german ? 'Gesamt' : 'Total') + '</span> <span class="payment-price__value">' + S.domTotal + '</span></div>';
+}
+if (S.ownedMessage) extra.innerHTML = '<div class="payment__errors">You already own this item.</div>';
+if (S.region) extra.innerHTML = '<div class="payment__errors">This product is unavailable in your region.</div>';
+if (S.pin) extra.innerHTML = '<div class="payment-pin-code"><input class="payment-pin-code__input"></div>';
+function challenge() {
+  var box = document.getElementById('h_captcha_challenge_checkout_free_prod');
+  box.style.cssText = 'position:absolute;left:300px;top:100px;width:400px;height:500px;background:#fff';
+  box.querySelector('iframe').style.cssText = 'width:400px;height:500px;border:0';
+}
+function ready() {
+  setTimeout(function () {
+    btn.disabled = false;
+    var l = btn.querySelector('.payment-loading');
+    if (l) l.remove();
+  }, S.slowMs || 0);
+}
+if (S.captchaFirst) challenge();
+if (S.noPreview) ready();
+else fetch('/purchase/order-preview', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ offers: offers, namespace: 'ns', lineOffers: [{ offerId: 'id', quantity: 1 }] }) })
+  .then(function (r) { return r.json(); }).then(function (p) { window.preview = p; ready(); });
+
+function fail(text) { extra.innerHTML = '<div class="payment__errors">' + text + '</div>'; }
+function send() {
+  var payload = { useDefault: true, offers: offers, syncToken: 'tok', includeAccountBalance: false };
+  if (S.confirmTotal !== null && S.confirmTotal !== undefined) payload.totalAmount = S.confirmTotal;
+  var init = { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) };
+  if (S.formPost) {
+    var form = new URLSearchParams();
+    Object.keys(payload).forEach(function (k) { form.set(k, payload[k]); });
+    init = { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form.toString() };
+  }
+  fetch('/purchase/confirm-order', init).then(function (r) { return r.json(); }).then(function (c) {
+    if (c.error) fail(c.message);
+    else document.getElementById('purchase-app').innerHTML = '<h1>' + (S.german ? 'Vielen Dank!' : 'Thanks for your order!') + '</h1>';
+  }).catch(function () { fail(S.german ? 'Fehler' : 'Sorry, there was an error placing your order.'); });
+}
+function submit() {
+  if (S.eu && !window.consented) {
+    var d = document.createElement('div');
+    d.className = 'payment-confirm';
+    d.innerHTML = '<p>By clicking below you waive your right of withdrawal.</p><div class="payment-confirm__actions">' +
+      '<button class="payment-btn payment-confirm__btn payment-btn--secondary">' + (S.german ? 'Abbrechen' : 'Cancel') + '</button> ' +
+      '<button class="payment-btn payment-confirm__btn payment-btn--primary">' + (S.german ? 'Ich stimme zu' : 'I Accept') + '</button></div>';
+    document.getElementById('purchase-app').appendChild(d);
+    d.querySelector('.payment-btn--primary').addEventListener('click', function (ev) {
+      window.clicks.push({ what: 'consent', trusted: ev.isTrusted });
+      window.consented = true; d.remove(); submit();
+    });
+    d.querySelector('.payment-btn--secondary').addEventListener('click', function () { window.cancelled = true; d.remove(); });
+    return;
+  }
+  if (S.captcha) { challenge(); return; }
+  send();
+}
+btn.addEventListener('click', function (ev) {
+  window.clicks.push({ what: 'place', trusted: ev.isTrusted });
+  submit();
+});
+</script></body></html>`

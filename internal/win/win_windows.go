@@ -517,3 +517,31 @@ func MessageBox(title, text string, isError bool) {
 func LocalAppData() (string, error) {
 	return windows.KnownFolderPath(windows.FOLDERID_LocalAppData, 0)
 }
+
+// CommandLine returns the command line a process was started with, or "".
+func CommandLine(pid uint32) string {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return ""
+	}
+	defer windows.CloseHandle(h)
+	size := uint32(8 << 10)
+	for attempt := 0; attempt < 3; attempt++ {
+		// The kernel writes a UNICODE_STRING header followed by the text,
+		// with the header's pointer aimed into this same buffer.
+		buf := make([]uint64, (size+7)/8)
+		var need uint32
+		err := windows.NtQueryInformationProcess(h, windows.ProcessCommandLineInformation, unsafe.Pointer(&buf[0]), uint32(len(buf)*8), &need)
+		if err == nil {
+			us := (*windows.NTUnicodeString)(unsafe.Pointer(&buf[0]))
+			s := us.String()
+			runtime.KeepAlive(buf)
+			return s
+		}
+		if need <= size {
+			return ""
+		}
+		size = need
+	}
+	return ""
+}
