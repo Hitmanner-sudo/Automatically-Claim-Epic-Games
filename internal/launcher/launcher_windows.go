@@ -343,6 +343,60 @@ func killLaunchers(pids []uint32) {
 	}
 }
 
+// updaterRunning reports whether the launcher's own updater is at work.
+func updaterRunning() bool {
+	procs, err := win.Processes()
+	if err != nil {
+		return false
+	}
+	for _, p := range procs {
+		if strings.EqualFold(p.Name, "EpicGamesUpdater.exe") && win.InThisSession(p.PID) {
+			return true
+		}
+	}
+	return false
+}
+
+// Describe lists the launcher processes of this session in a line for the
+// log: process ids, what started them, and which of the switches this
+// program cares about they carry. (Not their full command lines.)
+func Describe() string {
+	procs, err := win.Processes()
+	if err != nil {
+		return "unknown (" + err.Error() + ")"
+	}
+	byPID := make(map[uint32]win.ProcInfo, len(procs))
+	for _, p := range procs {
+		byPID[p.PID] = p
+	}
+	var parts []string
+	for _, p := range procs {
+		updater := strings.EqualFold(p.Name, "EpicGamesUpdater.exe") && win.InThisSession(p.PID)
+		if !isLauncher(p) && !updater {
+			continue
+		}
+		parent := "a process that is gone"
+		if pp, ok := byPID[p.PPID]; ok {
+			parent = pp.Name
+		}
+		var notes []string
+		cmd := win.CommandLine(p.PID)
+		for _, sw := range []string{"-cefdebug=", "-silent", "-Commandlet=", "com.epicgames.launcher:"} {
+			if strings.Contains(cmd, sw) {
+				notes = append(notes, strings.TrimRight(sw, "=:"))
+			}
+		}
+		if cmd == "" {
+			notes = append(notes, "command line not readable")
+		}
+		parts = append(parts, fmt.Sprintf("%s pid %d (started by %s; %s)", p.Name, p.PID, parent, strings.Join(notes, " ")))
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, ", ")
+}
+
 func launcherRunning() bool {
 	procs, err := win.Processes()
 	if err != nil {
@@ -533,15 +587,26 @@ func startedFromOutside(p win.ProcInfo, byPID map[uint32]win.ProcInfo) bool {
 // launchers splits the running launcher processes into this instance's own
 // and those started by someone else.
 func (in *Instance) launchers() (mine, foreign []win.ProcInfo) {
+	mine, foreign, _ = in.classify()
+	return mine, foreign
+}
+
+// classify splits the running launcher processes three ways: this
+// instance's own; those started by someone else (the user); and stale ones,
+// which carry this program's DevTools switch without belonging to this
+// instance. The last kind is a launcher that the launcher's own update
+// machinery started late, after an update round had already been ended. It
+// is nobody's: no user starts the launcher with that switch.
+func (in *Instance) classify() (mine, foreign, stale []win.ProcInfo) {
 	if in.proc == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	in.spawnMu.Lock()
 	procs, err := win.Processes()
 	job := in.proc.PIDs()
 	in.spawnMu.Unlock()
 	if err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	byPID := make(map[uint32]win.ProcInfo, len(procs))
 	for _, p := range procs {
@@ -555,11 +620,38 @@ func (in *Instance) launchers() (mine, foreign []win.ProcInfo) {
 		switch {
 		case m:
 			mine = append(mine, p)
+		case known && strings.Contains(win.CommandLine(p.PID), "-cefdebug="):
+			stale = append(stale, p)
 		case known && startedFromOutside(p, byPID):
 			foreign = append(foreign, p)
 		}
 	}
-	return mine, foreign
+	return mine, foreign, stale
+}
+
+// EndStale ends stale launchers (see classify) and returns the windows
+// they were showing on the visible desktop, each of which is hidden first.
+// Such a launcher would swallow this program's next start of the launcher,
+// and show its window in answer.
+func (in *Instance) EndStale() (ended int, shown []win.Window) {
+	_, _, stale := in.classify()
+	if len(stale) == 0 {
+		return 0, nil
+	}
+	pids := make([]uint32, 0, len(stale))
+	is := map[uint32]bool{}
+	for _, p := range stale {
+		pids = append(pids, p.PID)
+		is[p.PID] = true
+	}
+	for _, w := range win.Windows() {
+		if is[w.PID] && w.Visible {
+			win.HideWindow(w.HWND)
+			shown = append(shown, w)
+		}
+	}
+	killLaunchers(pids)
+	return len(pids), shown
 }
 
 // Alive reports whether the hidden launcher is running.
@@ -739,10 +831,11 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 		return "", false
 	}
 
-	// The guard hides, within a few hundredths of a second, any window that
-	// this run's own processes show, and it is also what notices the user
-	// starting the launcher (a start that lives only for a moment before
-	// the launcher running here absorbs it).
+	// The guard hides, within about a hundredth of a second (less than one
+	// screen refresh, most of the time), any window that this run's own
+	// processes show, and it is also what notices the user starting the
+	// launcher (a start that lives only for a moment before the launcher
+	// running here absorbs it).
 	stopGuard := make(chan struct{})
 	userStart := make(chan string, 1)
 	var guardDone sync.WaitGroup
@@ -750,7 +843,7 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 	guardDone.Add(1)
 	go func() {
 		defer guardDone.Done()
-		t := time.NewTicker(40 * time.Millisecond)
+		t := time.NewTicker(12 * time.Millisecond)
 		defer t.Stop()
 		extra := map[uint32]bool{}
 		scanned := time.Time{}
@@ -808,21 +901,36 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 	defer stopGuardNow()
 
 	// endRun ends every launcher that carries this run's switch, wherever
-	// the updater started it from, and waits until none is left.
-	endRun := func() {
-		var mine []uint32
-		if procs, err := win.Processes(); err == nil {
-			for _, p := range procs {
-				if isLauncher(p) && strings.Contains(win.CommandLine(p.PID), flag) {
-					mine = append(mine, p.PID)
+	// the updater started it from, and waits until the launcher's update
+	// machinery has come to rest: it can start the launcher once more a
+	// moment after the last one was ended, and that one would be left
+	// behind (and would swallow the hidden start that follows). quiet is
+	// how long nothing of the launcher must be running before it counts as
+	// at rest.
+	endRun := func(quiet time.Duration) {
+		killMine := func() bool {
+			var mine []uint32
+			if procs, err := win.Processes(); err == nil {
+				for _, p := range procs {
+					if isLauncher(p) && strings.Contains(win.CommandLine(p.PID), flag) {
+						mine = append(mine, p.PID)
+					}
 				}
 			}
+			killLaunchers(mine)
+			return len(mine) > 0
 		}
-		killLaunchers(mine)
+		killMine()
 		proc.Kill()
-		stop := time.Now().Add(10 * time.Second)
-		for time.Now().Before(stop) && launcherRunning() {
-			time.Sleep(300 * time.Millisecond)
+		stop := time.Now().Add(25 * time.Second)
+		quietSince := time.Now()
+		for time.Now().Before(stop) {
+			if killMine() || launcherRunning() || updaterRunning() {
+				quietSince = time.Now()
+			} else if time.Since(quietSince) >= quiet {
+				return
+			}
+			time.Sleep(250 * time.Millisecond)
 		}
 	}
 
@@ -833,7 +941,7 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 	// their own.
 	handOver := func(cmd string) error {
 		stopGuardNow()
-		endRun()
+		endRun(time.Second)
 		_ = win.StartDetached(inst.Exe, userArgs(cmd), inst.Dir)
 		logf("the launcher was started by the user while it was updating; leaving it to them")
 		return ErrUserStarted
@@ -878,8 +986,7 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 	default:
 	}
 
-	endRun()
-	time.Sleep(1500 * time.Millisecond)
+	endRun(3 * time.Second)
 
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -890,7 +997,7 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 	}
 	took := time.Since(started).Round(time.Second)
 	if hiddenCount > 0 {
-		logf("the launcher finished updating itself after %v (it tried to show a window %d time(s); each was hidden again within a few hundredths of a second)", took, hiddenCount)
+		logf("the launcher finished updating itself after %v (it tried to show a window %d time(s); each was hidden again within about a hundredth of a second)", took, hiddenCount)
 	} else {
 		logf("the launcher finished updating itself after %v (no window was shown)", took)
 	}

@@ -97,6 +97,13 @@ func (r *Runner) startWatch(h *hidden) {
 					h.cancel()
 					return
 				}
+				if n, shown := h.in.EndStale(); n > 0 {
+					// A launcher that the update machinery started late.
+					r.logf("ended %d launcher process(es) left over from the launcher's self-update", n)
+					h.strayMu.Lock()
+					h.strays = append(h.strays, shown...)
+					h.strayMu.Unlock()
+				}
 				if stray := h.in.OnUserDesktop(); len(stray) > 0 {
 					h.strayMu.Lock()
 					for _, w := range stray {
@@ -171,8 +178,14 @@ func (r *Runner) bringUp(ctx context.Context, inst launcher.Install) (*hidden, e
 	// A launcher with an update of its own to install exits instead of
 	// coming up. It is then let update (see launcher.UpdateRun) and started
 	// again; a large update can take more than one such round.
-	const attempts = 3
+	const attempts = 4
 	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			// Nothing of an earlier round may be left to swallow this start.
+			if n := launcher.KillLeftovers(); n > 0 {
+				r.logf("ended %d launcher process(es) left over from the previous round", n)
+			}
+		}
 		port, err := launcher.FreePort()
 		if err != nil {
 			return nil, err
@@ -200,6 +213,13 @@ func (r *Runner) bringUp(ctx context.Context, inst launcher.Install) (*hidden, e
 		if !exited {
 			return nil, errors.New("the hidden launcher did not open its DevTools endpoint (this launcher version may no longer support it)")
 		}
+		seen := launcher.Describe()
+		if n := launcher.KillLeftovers(); n > 0 {
+			// The hidden start was passed on to a launcher that the
+			// launcher's own update machinery had started late.
+			r.logf("the hidden start was taken by a launcher left over from the self-update (%s); ended it and starting again", seen)
+			continue
+		}
 		if launcher.Running() {
 			// The hidden start was passed on to a launcher that something
 			// else started in the meantime (Windows at login, the user).
@@ -211,7 +231,7 @@ func (r *Runner) bringUp(ctx context.Context, inst launcher.Install) (*hidden, e
 		if attempt == 0 {
 			r.logf("the launcher closed itself right after starting, which it does when it has an update of its own to install; letting it update in the tray first")
 		} else {
-			r.logf("the launcher closed itself again; its update does not seem to be finished, so it gets another round in the tray")
+			r.logf("the launcher closed itself again (launcher processes seen: %s); its update does not seem to be finished, so it gets another round in the tray", seen)
 		}
 		if err := launcher.UpdateRun(ctx, inst, r.logf); err != nil {
 			if errors.Is(err, launcher.ErrUserStarted) {
