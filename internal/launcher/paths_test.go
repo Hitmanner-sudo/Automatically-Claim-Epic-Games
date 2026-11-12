@@ -165,3 +165,29 @@ func TestStoreLinks(t *testing.T) {
 		t.Error("no slug, no links")
 	}
 }
+
+func TestPendingInstall(t *testing.T) {
+	dir := t.TempDir()
+	if pendingInstall(dir) {
+		t.Fatal("no Pending folder means nothing is pending")
+	}
+	pending := filepath.Join(dir, "Pending")
+	if err := os.Mkdir(pending, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if pendingInstall(dir) {
+		t.Fatal("an empty Pending folder means nothing is pending")
+	}
+	if err := os.WriteFile(filepath.Join(pending, "notes.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if pendingInstall(dir) {
+		t.Fatal("only .item files count")
+	}
+	if err := os.WriteFile(filepath.Join(pending, "72A9391D4D5E46E802EDC78827BD18DA.item"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !pendingInstall(dir) {
+		t.Fatal("an .item file in Pending is an unfinished install")
+	}
+}

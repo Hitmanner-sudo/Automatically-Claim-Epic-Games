@@ -248,10 +248,70 @@ func Inspect() Activity {
 			delta += n - was
 		}
 	}
-	if delta > 6<<20 {
-		a.Busy, a.Reason = true, fmt.Sprintf("the launcher is transferring data (%d MB in 3 s): a download, install or save-sync seems to be in progress", delta>>20)
+	// With an install on record as unfinished, even a trickle counts: a
+	// slow or throttled download must not be cut off.
+	limit := uint64(6 << 20)
+	if pendingInstall(manifestDir()) {
+		limit = 128 << 10
+	}
+	if delta > limit {
+		a.Busy, a.Reason = true, fmt.Sprintf("the launcher is transferring data (%d KB in 3 s): a download, install or save-sync seems to be in progress", delta>>10)
 	}
 	return a
+}
+
+// visibleLauncherWindow reports whether any launcher process shows a window
+// on the user's desktop.
+func visibleLauncherWindow() bool {
+	procs, err := win.Processes()
+	if err != nil {
+		return true
+	}
+	tree := map[uint32]bool{}
+	for _, p := range procs {
+		if strings.EqualFold(p.Name, ExeName) {
+			tree[p.PID] = true
+		}
+	}
+	for _, p := range procs {
+		if tree[p.PPID] && helperNames[strings.ToLower(p.Name)] {
+			tree[p.PID] = true
+		}
+	}
+	for _, w := range win.Windows() {
+		if tree[w.PID] && w.Visible && (w.Iconic || (w.Right-w.Left >= 200 && w.Bottom-w.Top >= 150)) {
+			return true
+		}
+	}
+	return false
+}
+
+// KillLeftovers ends hidden launchers left behind by an earlier run of this
+// program that ended abnormally. They are recognised by the DevTools switch
+// only this program uses; one that shows a window is left alone. The caller
+// must hold the session lock, so that another running copy's launcher is
+// never taken for a leftover. It reports how many were ended.
+func KillLeftovers() int {
+	procs, err := win.Processes()
+	if err != nil {
+		return 0
+	}
+	var stale []uint32
+	for _, p := range procs {
+		if strings.EqualFold(p.Name, ExeName) && strings.Contains(win.CommandLine(p.PID), "-cefdebug=") {
+			stale = append(stale, p.PID)
+		}
+	}
+	if len(stale) == 0 || visibleLauncherWindow() {
+		return 0
+	}
+	killLaunchers(stale)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && launcherRunning() {
+		time.Sleep(300 * time.Millisecond)
+	}
+	time.Sleep(time.Second)
+	return len(stale)
 }
 
 // killLaunchers ends the given launcher processes and their browser helpers.
@@ -289,9 +349,28 @@ func launcherRunning() bool {
 }
 
 // StopUserInstance ends the launcher the user left idle in the tray, so that
-// a private hidden instance can take its place for a moment.
-func StopUserInstance(a Activity) {
-	killLaunchers(a.PIDs)
+// a private hidden instance can take its place for a moment. The check that
+// found it idle took a few seconds, so it is repeated here: if the user has
+// opened the launcher in the meantime, nothing is touched and false is
+// returned.
+func StopUserInstance(a Activity) bool {
+	if visibleLauncherWindow() {
+		return false
+	}
+	// Only processes that still are the launcher (ids get reused).
+	var pids []uint32
+	if procs, err := win.Processes(); err == nil {
+		was := map[uint32]bool{}
+		for _, pid := range a.PIDs {
+			was[pid] = true
+		}
+		for _, p := range procs {
+			if was[p.PID] && strings.EqualFold(p.Name, ExeName) {
+				pids = append(pids, p.PID)
+			}
+		}
+	}
+	killLaunchers(pids)
 	// Give Windows a moment to release the launcher's files and its
 	// single-instance lock.
 	deadline := time.Now().Add(10 * time.Second)
@@ -299,7 +378,11 @@ func StopUserInstance(a Activity) {
 		time.Sleep(300 * time.Millisecond)
 	}
 	time.Sleep(1500 * time.Millisecond)
+	return true
 }
+
+// Running reports whether any launcher process exists.
+func Running() bool { return launcherRunning() }
 
 // StartForUser starts the launcher on the user's desktop, detached from this
 // program. With silent it goes straight to the tray, as it does at login.
@@ -581,6 +664,11 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 	if inst.Gen != Legacy {
 		return errors.New("self-update handling is only known for the classic launcher")
 	}
+	if launcherRunning() {
+		// Somebody else's launcher: a start here would only be passed on to
+		// it, and would bring its window up.
+		return ErrUserStarted
+	}
 	port, err := FreePort()
 	if err != nil {
 		return err
@@ -637,10 +725,16 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 			case <-t.C:
 				if time.Since(refresh) > 500*time.Millisecond {
 					refresh = time.Now()
-					names = map[uint32]bool{}
+					// This run's own processes only: what it started, the
+					// launcher that comes back from the update carrying this
+					// run's switch, and the updater in between.
+					names = proc.PIDs()
 					if procs, err := win.Processes(); err == nil {
 						for _, p := range procs {
-							if strings.EqualFold(p.Name, ExeName) || strings.EqualFold(p.Name, "EpicGamesUpdater.exe") {
+							switch {
+							case strings.EqualFold(p.Name, "EpicGamesUpdater.exe"):
+								names[p.PID] = true
+							case strings.EqualFold(p.Name, ExeName) && strings.Contains(win.CommandLine(p.PID), flag):
 								names[p.PID] = true
 							}
 						}

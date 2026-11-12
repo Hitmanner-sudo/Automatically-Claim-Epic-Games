@@ -291,9 +291,7 @@ func Start(exe string, args []string, dir, desktop string, env []string) (*Proce
 	if err != nil {
 		return nil, fmt.Errorf("CreateJobObject: %w", err)
 	}
-	info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
-	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
+	if err := setJobLimits(job, windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE); err != nil {
 		_ = windows.CloseHandle(job)
 		return nil, fmt.Errorf("SetInformationJobObject: %w", err)
 	}
@@ -319,29 +317,52 @@ func (p *Process) Spawn(exe string, args []string, dir, desktop string, env []st
 	return pi.ProcessId, nil
 }
 
+// jobIDList is JOBOBJECT_BASIC_PROCESS_ID_LIST: two DWORDs followed by
+// ULONG_PTR ids.
+type jobIDList struct {
+	Assigned uint32
+	InList   uint32
+	IDs      [1024]uintptr
+}
+
+// The Windows calls below take the address of their buffer as a plain
+// number, which hides it from Go's runtime. A buffer on a goroutine stack
+// could be moved while such a call is being set up, so these buffers live
+// in package-level variables (never on a stack), one call at a time.
+var (
+	jobCallMu   sync.Mutex
+	jobIDBuf    jobIDList
+	jobLimitBuf windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+)
+
+// setJobLimits applies limit flags to a job.
+func setJobLimits(job windows.Handle, flags uint32) error {
+	jobCallMu.Lock()
+	defer jobCallMu.Unlock()
+	jobLimitBuf = windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
+	jobLimitBuf.BasicLimitInformation.LimitFlags = flags
+	_, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&jobLimitBuf)), uint32(unsafe.Sizeof(jobLimitBuf)))
+	return err
+}
+
 // PIDs returns the ids of every live process in the tree.
 func (p *Process) PIDs() map[uint32]bool {
 	out := map[uint32]bool{}
 	if p == nil || p.job == 0 {
 		return out
 	}
-	// JOBOBJECT_BASIC_PROCESS_ID_LIST: two DWORDs followed by ULONG_PTR ids.
-	const max = 1024
-	type list struct {
-		Assigned uint32
-		InList   uint32
-		IDs      [max]uintptr
-	}
-	var l list
-	if err := windows.QueryInformationJobObject(p.job, windows.JobObjectBasicProcessIdList, uintptr(unsafe.Pointer(&l)), uint32(unsafe.Sizeof(l)), nil); err != nil && !errors.Is(err, windows.ERROR_MORE_DATA) {
+	jobCallMu.Lock()
+	defer jobCallMu.Unlock()
+	jobIDBuf.Assigned, jobIDBuf.InList = 0, 0
+	if err := windows.QueryInformationJobObject(p.job, windows.JobObjectBasicProcessIdList, uintptr(unsafe.Pointer(&jobIDBuf)), uint32(unsafe.Sizeof(jobIDBuf)), nil); err != nil && !errors.Is(err, windows.ERROR_MORE_DATA) {
 		return out
 	}
-	n := l.InList
-	if n > max {
-		n = max
+	n := jobIDBuf.InList
+	if n > uint32(len(jobIDBuf.IDs)) {
+		n = uint32(len(jobIDBuf.IDs))
 	}
 	for i := uint32(0); i < n; i++ {
-		out[uint32(l.IDs[i])] = true
+		out[uint32(jobIDBuf.IDs[i])] = true
 	}
 	return out
 }
@@ -377,8 +398,7 @@ func (p *Process) Release() {
 		return
 	}
 	if p.job != 0 {
-		info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
-		_, _ = windows.SetInformationJobObject(p.job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)))
+		_ = setJobLimits(p.job, 0) // no longer "kill when the handle closes"
 		_ = windows.CloseHandle(p.job)
 		p.job = 0
 	}
@@ -622,9 +642,6 @@ func CommandLine(pid uint32) string {
 	}
 	return ""
 }
-
-// Uptime is how long Windows has been running.
-func Uptime() time.Duration { return windows.DurationSinceBoot() }
 
 // StopSignal is a named, system-wide "please exit" flag shared by the
 // background process and the commands that control it.

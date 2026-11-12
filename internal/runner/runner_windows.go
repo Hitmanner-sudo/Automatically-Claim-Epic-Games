@@ -45,42 +45,130 @@ func (r *Runner) logf(format string, args ...any) {
 	}
 }
 
-// startHidden brings up the hidden launcher and returns it together with
-// the base address of its DevTools endpoint.
-func (r *Runner) startHidden(ctx context.Context, inst launcher.Install) (*launcher.Instance, string, error) {
+// sessionLock keeps two copies of this program (the background process and
+// a command run by hand) from running hidden launchers at the same time and
+// taking each other's for the user's.
+const sessionLock = `Local\EpicAutoClaim-session`
+
+// errUserAsked means the user asked for the launcher; it has been started
+// for them and the session is over.
+var errUserAsked = errors.New("the user asked for the launcher")
+
+// hidden is a running hidden launcher together with the watch that notices
+// the user asking for the launcher and keeps stray windows off their screen.
+type hidden struct {
+	in   *launcher.Instance
+	base string
+
+	ctx    context.Context // ends when the user asks for the launcher
+	cancel context.CancelFunc
+
+	watch   sync.WaitGroup
+	userCmd atomic.Pointer[string]
+}
+
+func (r *Runner) startWatch(h *hidden) {
+	h.watch.Add(1)
+	go func() {
+		defer h.watch.Done()
+		t := time.NewTicker(200 * time.Millisecond)
+		defer t.Stop()
+		warned := false
+		for {
+			select {
+			case <-h.ctx.Done():
+				return
+			case <-t.C:
+				if foreign := h.in.Foreign(); len(foreign) > 0 {
+					cmd := win.CommandLine(foreign[0].PID)
+					h.userCmd.Store(&cmd)
+					h.cancel()
+					return
+				}
+				if stray := h.in.OnUserDesktop(); len(stray) > 0 {
+					for _, w := range stray {
+						win.HideWindow(w.HWND)
+					}
+					if !warned {
+						warned = true
+						r.logf("a window of the hidden launcher appeared on the visible desktop and was hidden again (class %q, title %q)", stray[0].Class, stray[0].Title)
+					}
+				}
+			}
+		}
+	}()
+}
+
+// close ends the watch and the hidden launcher.
+func (h *hidden) close(grace time.Duration) {
+	h.cancel()
+	h.watch.Wait()
+	h.in.Stop(grace)
+}
+
+// handOver gets out of the user's way: their start of the launcher was
+// swallowed by the hidden one, so that one is ended at once and the launcher
+// is started for them, with whatever link they started it with.
+func (r *Runner) handOver(inst launcher.Install, h *hidden) {
+	cmd := ""
+	if c := h.userCmd.Load(); c != nil {
+		cmd = *c
+	}
+	h.close(0)
+	if err := launcher.StartForUser(inst, false, launcher.UserArgs(cmd)); err != nil {
+		r.logf("could not start the launcher for the user: %v", err)
+	}
+}
+
+// bringUp starts the hidden launcher and waits for its DevTools endpoint.
+// A launcher that first wants to update itself is let do so. On errUserAsked
+// the launcher is already running for the user.
+func (r *Runner) bringUp(ctx context.Context, inst launcher.Install) (*hidden, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		port, err := launcher.FreePort()
 		if err != nil {
-			return nil, "", err
+			return nil, err
 		}
 		in, err := launcher.StartHidden(inst, port)
 		if err != nil {
-			return nil, "", fmt.Errorf("start the hidden launcher: %w", err)
+			return nil, fmt.Errorf("start the hidden launcher: %w", err)
 		}
-		up, exited := in.WaitDevTools(ctx, 3*time.Minute)
+		h := &hidden{in: in, base: cdp.Base(port)}
+		h.ctx, h.cancel = context.WithCancel(ctx)
+		r.startWatch(h)
+
+		up, exited := in.WaitDevTools(h.ctx, 3*time.Minute)
 		if up {
-			return in, cdp.Base(port), nil
+			return h, nil
 		}
-		in.Stop(0)
+		if h.userCmd.Load() != nil {
+			r.handOver(inst, h)
+			return nil, errUserAsked
+		}
+		h.close(0)
 		if ctx.Err() != nil {
-			return nil, "", ctx.Err()
+			return nil, ctx.Err()
 		}
-		if exited && attempt == 0 && inst.Gen == launcher.Legacy {
-			r.logf("the launcher closed itself right after starting, which it does when it has an update of its own to install; letting it update in the tray first")
-			if err := launcher.UpdateRun(ctx, inst, r.logf); err != nil {
-				if errors.Is(err, launcher.ErrUserStarted) {
-					return nil, "", err
-				}
-				return nil, "", fmt.Errorf("launcher self-update: %w", err)
+		if !exited {
+			return nil, errors.New("the hidden launcher did not open its DevTools endpoint (this launcher version may no longer support it)")
+		}
+		if launcher.Running() {
+			// The hidden start was passed on to a launcher that something
+			// else started in the meantime (Windows at login, the user).
+			return nil, &daemon.BusyError{Reason: "the launcher was started by something else just now"}
+		}
+		if attempt > 0 {
+			return nil, errors.New("the hidden launcher exited before it was ready")
+		}
+		r.logf("the launcher closed itself right after starting, which it does when it has an update of its own to install; letting it update in the tray first")
+		if err := launcher.UpdateRun(ctx, inst, r.logf); err != nil {
+			if errors.Is(err, launcher.ErrUserStarted) {
+				return nil, errUserAsked
 			}
-			continue
+			return nil, fmt.Errorf("launcher self-update: %w", err)
 		}
-		if exited {
-			return nil, "", errors.New("the hidden launcher exited before it was ready")
-		}
-		return nil, "", errors.New("the hidden launcher did not open its DevTools endpoint (this launcher version may no longer support it)")
 	}
-	return nil, "", errors.New("the hidden launcher could not be started")
+	return nil, errors.New("the hidden launcher could not be started")
 }
 
 // openSession summons the launcher's interface and attaches to it.
@@ -116,44 +204,69 @@ func (r *Runner) openSession(ctx context.Context, in *launcher.Instance, base st
 	return nil, lastErr
 }
 
+// makeRoom checks that a hidden launcher may run now and, if the user's own
+// launcher is idle in the tray, closes it. restore reports that it should be
+// put back afterwards. release must be called when the session is over.
+func (r *Runner) makeRoom() (inst launcher.Install, restore bool, release func(), err error) {
+	inst, err = launcher.Locate(r.LauncherPath)
+	if err != nil {
+		if errors.Is(err, launcher.ErrNotInstalled) {
+			err = fmt.Errorf("%w (%v)", daemon.ErrNotInstalled, err)
+		}
+		return inst, false, nil, err
+	}
+	if inst.Gen != launcher.Legacy {
+		return inst, false, nil, fmt.Errorf("%w: %s", daemon.ErrUnsupported, unsupportedNote)
+	}
+	release, ok, lockErr := win.SingleInstance(sessionLock)
+	if lockErr != nil {
+		return inst, false, nil, lockErr
+	}
+	if !ok {
+		return inst, false, nil, &daemon.BusyError{Reason: "another copy of this program is running a session"}
+	}
+	fail := func(e error) (launcher.Install, bool, func(), error) {
+		release()
+		return inst, false, nil, e
+	}
+	if n := launcher.KillLeftovers(); n > 0 {
+		r.logf("ended %d hidden launcher(s) left over from an earlier run", n)
+	}
+	// Never get in the user's way.
+	if win.FullscreenActivity() {
+		return fail(&daemon.BusyError{Reason: "a full-screen game or presentation is running"})
+	}
+	act := launcher.Inspect()
+	if act.Running {
+		if act.Busy {
+			return fail(&daemon.BusyError{Reason: act.Reason})
+		}
+		if !r.RestartIdleLauncher {
+			return fail(&daemon.BusyError{Reason: "the launcher is running in the tray, and the settings say not to restart it"})
+		}
+		if !launcher.StopUserInstance(act) {
+			return fail(&daemon.BusyError{Reason: "the launcher window is open"})
+		}
+		r.logf("the launcher was idle in the tray; closed it for a moment so a hidden one can run")
+		restore = true
+	}
+	return inst, restore, release, nil
+}
+
 // ClaimAll runs one session for the given offers.
 func (r *Runner) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]claim.Result, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	results := map[string]claim.Result{}
 
-	inst, err := launcher.Locate(r.LauncherPath)
+	inst, restore, release, err := r.makeRoom()
 	if err != nil {
-		if errors.Is(err, launcher.ErrNotInstalled) {
-			return results, fmt.Errorf("%w (%v)", daemon.ErrNotInstalled, err)
-		}
 		return results, err
 	}
-
-	if inst.Gen != launcher.Legacy {
-		return results, fmt.Errorf("%w: %s", daemon.ErrUnsupported, unsupportedNote)
-	}
-
-	// Never get in the user's way.
-	if win.FullscreenActivity() {
-		return results, &daemon.BusyError{Reason: "a full-screen game or presentation is running"}
-	}
-	act := launcher.Inspect()
-	restore := false
-	if act.Running {
-		if act.Busy {
-			return results, &daemon.BusyError{Reason: act.Reason}
-		}
-		if !r.RestartIdleLauncher {
-			return results, &daemon.BusyError{Reason: "the launcher is running in the tray, and the settings say not to restart it"}
-		}
-		r.logf("the launcher is idle in the tray; closing it for a moment so a hidden one can run")
-		launcher.StopUserInstance(act)
-		restore = true
-	}
-	yielded := false
+	defer release()
+	handedOver := false
 	defer func() {
-		if restore && !yielded {
+		if restore && !handedOver {
 			if err := launcher.StartForUser(inst, true, nil); err != nil {
 				r.logf("could not put the launcher back in the tray: %v", err)
 			} else {
@@ -162,70 +275,33 @@ func (r *Runner) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]
 		}
 	}()
 
-	sctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
 	started := time.Now()
-	in, base, err := r.startHidden(sctx, inst)
+	h, err := r.bringUp(ctx, inst)
 	if err != nil {
-		if errors.Is(err, launcher.ErrUserStarted) {
-			yielded = true // the launcher is running for the user now
+		if errors.Is(err, errUserAsked) {
+			handedOver = true // the launcher is running for the user now
 			return results, daemon.ErrYielded
 		}
 		return results, err
 	}
-	defer in.Stop(8 * time.Second)
-	r.logf("hidden %s is up after %v (DevTools on port %d)", inst.Gen, time.Since(started).Round(time.Second), in.Port)
+	defer h.close(8 * time.Second)
+	r.logf("hidden %s is up after %v (DevTools on port %d)", inst.Gen, time.Since(started).Round(time.Second), h.in.Port)
 
-	// Watch for the user asking for the launcher while it runs hidden, and
-	// make sure nothing of the hidden one ever shows on their desktop.
-	var userCommand atomic.Pointer[string]
-	var watch sync.WaitGroup
-	watch.Add(1)
-	go func() {
-		defer watch.Done()
-		t := time.NewTicker(200 * time.Millisecond)
-		defer t.Stop()
-		warned := false
-		for {
-			select {
-			case <-sctx.Done():
-				return
-			case <-t.C:
-				if foreign := in.Foreign(); len(foreign) > 0 {
-					cmd := win.CommandLine(foreign[0].PID)
-					userCommand.Store(&cmd)
-					cancel()
-					return
-				}
-				if stray := in.OnUserDesktop(); len(stray) > 0 {
-					for _, w := range stray {
-						win.HideWindow(w.HWND)
-					}
-					if !warned {
-						warned = true
-						r.logf("a window of the hidden launcher appeared on the visible desktop and was hidden again (class %q, title %q)", stray[0].Class, stray[0].Title)
-					}
-				}
-			}
-		}
-	}()
-
-	sess, err := r.openSession(sctx, in, base)
+	sess, err := r.openSession(h.ctx, h.in, h.base)
 	if err == nil {
 		for i, o := range offers {
-			if sctx.Err() != nil {
+			if h.ctx.Err() != nil {
 				break
 			}
 			if i > 0 {
 				select {
-				case <-sctx.Done():
+				case <-h.ctx.Done():
 				case <-time.After(3 * time.Second):
 				}
 			}
 			r.logf("claiming %s ...", o.Title)
-			res := sess.Claim(sctx, o)
-			if sctx.Err() != nil && res.Outcome == claim.Failed && strings.HasPrefix(res.Detail, "interrupted") && !strings.Contains(res.Detail, "after the order button") {
+			res := sess.Claim(h.ctx, o)
+			if h.ctx.Err() != nil && res.Outcome == claim.Failed && strings.HasPrefix(res.Detail, "interrupted") && !strings.Contains(res.Detail, "after the order button") {
 				break // never got anywhere; do not record it as an attempt
 			}
 			results[o.Key()] = res
@@ -235,19 +311,10 @@ func (r *Runner) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]
 		}
 		sess.Close()
 	}
-	cancel()
-	watch.Wait()
 
-	if cmd := userCommand.Load(); cmd != nil {
-		// The user's start was swallowed by the hidden launcher. Get out of
-		// the way at once and start the launcher for them, with whatever
-		// link they started it with.
-		yielded = true
-		in.Stop(0)
-		args := launcher.UserArgs(*cmd)
-		if err := launcher.StartForUser(inst, false, args); err != nil {
-			r.logf("could not start the launcher for the user: %v", err)
-		}
+	if h.userCmd.Load() != nil {
+		handedOver = true
+		r.handOver(inst, h)
 		return results, daemon.ErrYielded
 	}
 	if err != nil {
@@ -345,44 +412,33 @@ func (r *Runner) TrialLaunch(ctx context.Context) LaunchReport {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var rep LaunchReport
-	inst, err := launcher.Locate(r.LauncherPath)
+	inst, restore, release, err := r.makeRoom()
+	rep.Install = inst
 	if err != nil {
 		rep.Err = err.Error()
 		return rep
 	}
-	rep.Install = inst
-	if inst.Gen != launcher.Legacy {
-		rep.Err = unsupportedNote
-		return rep
-	}
-	act := launcher.Inspect()
-	restore := false
-	if act.Running {
-		if act.Busy {
-			rep.Err = "postponed: " + act.Reason
-			return rep
-		}
-		if !r.RestartIdleLauncher {
-			rep.Err = "the launcher is running; close it first"
-			return rep
-		}
-		r.logf("the launcher is idle in the tray; closing it for the trial")
-		launcher.StopUserInstance(act)
-		restore = true
-	}
+	defer release()
+	handedOver := false
 	defer func() {
-		if restore {
+		if restore && !handedOver {
 			_ = launcher.StartForUser(inst, true, nil)
 		}
 	}()
 
 	started := time.Now()
-	in, base, err := r.startHidden(ctx, inst)
+	h, err := r.bringUp(ctx, inst)
 	if err != nil {
+		if errors.Is(err, errUserAsked) {
+			handedOver = true
+			rep.Err = "the launcher was started by the user; stepped aside"
+			return rep
+		}
 		rep.Err = err.Error()
 		return rep
 	}
-	defer in.Stop(8 * time.Second)
+	defer h.close(8 * time.Second)
+	in, base := h.in, h.base
 	rep.Up = true
 	rep.StartupSeconds = time.Since(started).Seconds()
 
@@ -437,5 +493,10 @@ func (r *Runner) TrialLaunch(ctx context.Context) LaunchReport {
 	rep.Pages = surveyPages(ctx, base)
 	rep.HiddenWindows = in.HiddenWindows()
 	rep.OnUserDesktop = in.OnUserDesktop()
+	if h.userCmd.Load() != nil {
+		handedOver = true
+		r.handOver(inst, h)
+		rep.Err = "the launcher was started by the user during the trial; stepped aside"
+	}
 	return rep
 }

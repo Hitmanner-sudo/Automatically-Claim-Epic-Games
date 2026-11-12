@@ -83,7 +83,10 @@ func setAutostart(exe string) error {
 		return err
 	}
 	defer k.Close()
-	return k.SetStringValue(appName, `"`+exe+`" run`)
+	// "--login" tells the background process it was started by Windows at
+	// sign-in, when the PC is busy and the launcher's own autostart is
+	// still under way.
+	return k.SetStringValue(appName, `"`+exe+`" run --login`)
 }
 
 func removeAutostart() {
@@ -188,7 +191,7 @@ func (a *app) daemon() *daemon.Daemon {
 
 // ---------------------------------------------------------------- commands
 
-func cmdRun(a *app) int {
+func cmdRun(a *app, atLogin bool) int {
 	release, ok, err := win.SingleInstance(mutexName)
 	if err != nil {
 		a.log.Printf("cannot start: %v", err)
@@ -210,11 +213,12 @@ func cmdRun(a *app) int {
 		}()
 	}
 
-	// Right after login the PC (and the launcher's own autostart) is busy;
-	// wait for things to settle.
+	// Right after sign-in the PC (and the launcher's own autostart) is
+	// busy; wait for things to settle. (Uptime is no guide: with Windows'
+	// fast start-up it keeps counting across shutdowns.)
 	delay := 15 * time.Second
-	if win.Uptime() < 5*time.Minute {
-		delay = 3 * time.Minute
+	if atLogin {
+		delay = 4 * time.Minute
 	}
 	mode := ""
 	if a.cfg.DryRun {
@@ -551,7 +555,13 @@ func main() {
 		if err != nil {
 			os.Exit(1)
 		}
-		code := cmdRun(a)
+		atLogin := false
+		for _, arg := range args[1:] {
+			if arg == "--login" {
+				atLogin = true
+			}
+		}
+		code := cmdRun(a, atLogin)
 		a.log.Close()
 		os.Exit(code)
 	}

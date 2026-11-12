@@ -226,3 +226,19 @@ func StoreLinks(pagePath, slug string) []string {
 	// store's current web addresses.
 	return []string{scheme + "product/" + slug, scheme + "p/" + slug}
 }
+
+// pendingInstall reports whether the launcher has an unfinished install or
+// download on record (it keeps one .item file per such job in a "Pending"
+// folder next to its install manifests).
+func pendingInstall(manifestDir string) bool {
+	entries, err := os.ReadDir(filepath.Join(manifestDir, "Pending"))
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.EqualFold(filepath.Ext(e.Name()), ".item") {
+			return true
+		}
+	}
+	return false
+}
