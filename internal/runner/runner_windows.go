@@ -168,7 +168,11 @@ func (r *Runner) handOver(inst launcher.Install, h *hidden) {
 // A launcher that first wants to update itself is let do so. On errUserAsked
 // the launcher is already running for the user.
 func (r *Runner) bringUp(ctx context.Context, inst launcher.Install) (*hidden, error) {
-	for attempt := 0; attempt < 2; attempt++ {
+	// A launcher with an update of its own to install exits instead of
+	// coming up. It is then let update (see launcher.UpdateRun) and started
+	// again; a large update can take more than one such round.
+	const attempts = 3
+	for attempt := 0; attempt < attempts; attempt++ {
 		port, err := launcher.FreePort()
 		if err != nil {
 			return nil, err
@@ -201,10 +205,14 @@ func (r *Runner) bringUp(ctx context.Context, inst launcher.Install) (*hidden, e
 			// else started in the meantime (Windows at login, the user).
 			return nil, &daemon.BusyError{Reason: "the launcher was started by something else just now"}
 		}
-		if attempt > 0 {
-			return nil, errors.New("the hidden launcher exited before it was ready")
+		if attempt == attempts-1 {
+			return nil, errors.New("the hidden launcher keeps exiting before it is ready, also after it was given the chance to update itself")
 		}
-		r.logf("the launcher closed itself right after starting, which it does when it has an update of its own to install; letting it update in the tray first")
+		if attempt == 0 {
+			r.logf("the launcher closed itself right after starting, which it does when it has an update of its own to install; letting it update in the tray first")
+		} else {
+			r.logf("the launcher closed itself again; its update does not seem to be finished, so it gets another round in the tray")
+		}
 		if err := launcher.UpdateRun(ctx, inst, r.logf); err != nil {
 			if errors.Is(err, launcher.ErrUserStarted) {
 				return nil, errUserAsked

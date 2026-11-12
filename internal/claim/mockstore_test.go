@@ -54,6 +54,7 @@ type scenario struct {
 	ExtraHTML     string `json:"-"`             // added to the checkout page
 	ProductExtra  string `json:"-"`             // added to the store page
 	ProductOpens  string `json:"-"`             // offer the store page's button opens (default 1-ns-id)
+	ProductInPage bool   `json:"-"`             // "Get" shows the checkout in a frame inside the page, as the web store does
 	// ChallengeFor makes the checkout answer with a Cloudflare-style
 	// "One more step" page for this long before the real page is served
 	// (the challenge page reloads itself, as the real one does).
@@ -498,7 +499,15 @@ func (m *mockStore) handleProduct(w http.ResponseWriter, r *http.Request) {
 window.presses = 0;
 document.getElementById('cta').addEventListener('click', function () {
   window.presses++;
-  if (/^get$/i.test(this.textContent)) window.open('/purchase?highlightColor=0078f2&offers=`+opens+`&via=store');
+  if (!/^get$/i.test(this.textContent)) return;
+  if (`+fmt.Sprint(m.sc.ProductInPage)+`) {
+    var box = document.createElement('div');
+    box.id = 'webPurchaseContainer';
+    box.innerHTML = '<iframe src="/purchase?highlightColor=0078f2&offers=`+opens+`&via=store" style="width:900px;height:600px;border:0"></iframe>';
+    document.body.appendChild(box);
+    return;
+  }
+  window.open('/purchase?highlightColor=0078f2&offers=`+opens+`&via=store');
 });
 </script></body></html>`)
 }

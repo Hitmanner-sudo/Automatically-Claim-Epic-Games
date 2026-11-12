@@ -65,7 +65,10 @@ const productJS = `(function () {
   var yes = find(/^yes, buy now$/i);
   out.confirm = yes ? button(yes) : null;
   out.eula = /end user license agreement/i.test(body) && !!document.querySelector('input#agree');
-  out.inPage = !!document.querySelector('iframe[title="Checkout"], iframe[src*="/checkout"], #webPurchaseContainer iframe');
+  // The web store shows its checkout inside the page, in a frame.
+  var inner = document.querySelector('#webPurchaseContainer iframe, iframe[title="Checkout"], iframe[src*="/purchase?"], iframe[src*="/checkout"]');
+  out.inPage = !!inner;
+  out.inPageSrc = inner ? (inner.src || '') : '';
   return out;
 })()`
 
@@ -86,6 +89,7 @@ type productState struct {
 	Confirm      *btn     `json:"confirm"`
 	EULA         bool     `json:"eula"`
 	InPage       bool     `json:"inPage"`
+	InPageSrc    string   `json:"inPageSrc"`
 }
 
 var (
@@ -202,7 +206,16 @@ func (s *Session) viaStorePage(ctx context.Context, o feed.Offer, w *orderWatch)
 			case ps.EULA:
 				return Result{Failed, "the game asks you to accept its licence agreement first; get it once by hand in the launcher"}, last
 			case ps.InPage:
-				return Result{Failed, "the checkout opened inside the store page, a layout this program does not handle yet"}, last
+				// The store shows its checkout inside the page, as the web
+				// store does. That checkout has an address of its own, and
+				// opened as a page it is handled like any other checkout
+				// (provided it is recognisably the checkout of this offer).
+				if !isCheckoutURL(ps.InPageSrc, s.opt.CheckoutBases) || !strings.Contains(ps.InPageSrc, o.OfferID) {
+					return Result{Failed, "the store page opened a checkout inside itself whose address is not recognisably this offer's (" + trimURL(ps.InPageSrc) + ")"}, last
+				}
+				s.opt.Logf("%s: the store page shows its checkout inside the page; opening that checkout on its own", o.Title)
+				res, last, _ := s.checkout(ctx, o, w, ps.InPageSrc, false)
+				return res, last
 			}
 			switch {
 			case ps.Confirm.clickable() && time.Since(lastGate) > 2*time.Second:

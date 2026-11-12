@@ -841,15 +841,28 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 
 	// The update is finished when the (restarted) launcher is back with its
 	// DevTools endpoint up.
+	// It has to stay up, too: a launcher that is about to restart for its
+	// update may answer for a moment before it goes away again, and ending
+	// it then would cut the update short.
 	base := cdp.Base(port)
-	deadline := time.Now().Add(10 * time.Minute)
+	started := time.Now()
+	deadline := started.Add(10 * time.Minute)
+	const steady = 10 * time.Second
+	var upSince time.Time
 	ok := false
 	for time.Now().Before(deadline) && ctx.Err() == nil {
 		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		_, verr := cdp.Version(cctx, base)
 		cancel()
-		if verr == nil {
+		switch {
+		case verr != nil:
+			upSince = time.Time{}
+		case upSince.IsZero():
+			upSince = time.Now()
+		case time.Since(upSince) >= steady:
 			ok = true
+		}
+		if ok {
 			break
 		}
 		select {
@@ -857,15 +870,6 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 		case cmd := <-userStart:
 			return handOver(cmd)
 		case <-time.After(400 * time.Millisecond):
-		}
-	}
-	if ok {
-		// Let it settle (it writes its state right after starting).
-		select {
-		case <-ctx.Done():
-		case cmd := <-userStart:
-			return handOver(cmd)
-		case <-time.After(6 * time.Second):
 		}
 	}
 	select {
@@ -884,10 +888,11 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 	if !ok {
 		return errors.New("the launcher did not come back from its update within 10 minutes")
 	}
+	took := time.Since(started).Round(time.Second)
 	if hiddenCount > 0 {
-		logf("the launcher finished updating itself (it tried to show a window %d time(s); each was hidden again within a few hundredths of a second)", hiddenCount)
+		logf("the launcher finished updating itself after %v (it tried to show a window %d time(s); each was hidden again within a few hundredths of a second)", took, hiddenCount)
 	} else {
-		logf("the launcher finished updating itself (no window was shown)")
+		logf("the launcher finished updating itself after %v (no window was shown)", took)
 	}
 	return nil
 }

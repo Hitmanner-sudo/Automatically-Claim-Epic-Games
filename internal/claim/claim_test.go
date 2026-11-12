@@ -35,10 +35,33 @@ func sharedBrowser(t *testing.T) string {
 	return browserBase
 }
 
-// keepAlive stops cdptest from tying the browser's lifetime to the first test.
+// keepAlive stops cdptest from tying the browser's lifetime to the first
+// test: what it would clean up after that test is done when the whole
+// package has run (see TestMain).
 type keepAlive struct{ testing.TB }
 
-func (k *keepAlive) Cleanup(func()) {}
+var (
+	browserCleanupMu sync.Mutex
+	browserCleanups  []func()
+)
+
+func (k *keepAlive) Cleanup(f func()) {
+	browserCleanupMu.Lock()
+	browserCleanups = append(browserCleanups, f)
+	browserCleanupMu.Unlock()
+}
+
+// TestMain shuts the shared browser down at the end, so that test runs do
+// not leave browsers behind.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	browserCleanupMu.Lock()
+	for i := len(browserCleanups) - 1; i >= 0; i-- {
+		browserCleanups[i]()
+	}
+	browserCleanupMu.Unlock()
+	os.Exit(code)
+}
 
 func testOffer() feed.Offer {
 	return feed.Offer{
@@ -1313,5 +1336,64 @@ func TestOrderButtonIsPressedOnce(t *testing.T) {
 	wantOutcome(t, r, Claimed, 1)
 	if n := r.store.hitCount("place"); n != 1 {
 		t.Errorf("the order button was pressed %d times", n)
+	}
+}
+
+func TestStorePageWithItsCheckoutInsideThePage(t *testing.T) {
+	// The web store's way: "Get" shows the checkout in a frame inside the
+	// store page. Its address is opened as a page of its own and handled
+	// like any other checkout.
+	base := sharedBrowser(t)
+	before := pageIDs(base)
+	defer closeNewTabs(t, base, before)
+	store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), DirectBlocked: true, ProductInPage: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	s, err := Open(ctx, base, storePageOptions(t, base, store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	res := s.Claim(ctx, testOffer())
+	if res.Outcome != Claimed {
+		t.Fatalf("result = %v", res)
+	}
+	if n := store.orderCount(); n != 1 {
+		t.Fatalf("orders = %d", n)
+	}
+	if n := store.hitCount("place"); n != 1 {
+		t.Fatalf("the order button was pressed %d times", n)
+	}
+
+	// The same with a price: nothing is ordered.
+	before2 := pageIDs(base)
+	defer closeNewTabs(t, base, before2)
+	paid := newMockStore(t, scenario{SignedIn: true, DomTotal: "$19.99", PreviewTotal: 1999, ConfirmTotal: intp(1999), DirectBlocked: true, ProductInPage: true})
+	s2, err := Open(ctx, base, storePageOptions(t, base, paid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if res := s2.Claim(ctx, testOffer()); res.Outcome != NotFree {
+		t.Fatalf("paid: result = %v", res)
+	}
+	if n := paid.orderCount(); n != 0 {
+		t.Fatalf("paid: orders = %d", n)
+	}
+
+	// A frame that is not this offer's checkout is left alone.
+	before3 := pageIDs(base)
+	defer closeNewTabs(t, base, before3)
+	other := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), DirectBlocked: true, ProductInPage: true, ProductOpens: "1-ns-other"})
+	s3, err := Open(ctx, base, storePageOptions(t, base, other))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s3.Close()
+	if res := s3.Claim(ctx, testOffer()); res.Outcome != Failed || !strings.Contains(res.Detail, "not recognisably") {
+		t.Fatalf("other offer: result = %v", res)
+	}
+	if n := other.orderCount(); n != 0 {
+		t.Fatalf("other offer: orders = %d", n)
 	}
 }
