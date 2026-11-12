@@ -317,6 +317,14 @@ func TestThrottledAccount(t *testing.T) {
 func TestDryRunPlacesNoOrder(t *testing.T) {
 	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0)}, func(o *Options) { o.DryRun = true })
 	wantOutcome(t, r, DryRun, 0)
+	// It rehearses the approach (pointer onto the button, last look) but
+	// presses nothing.
+	if !strings.Contains(r.res.Detail, "last look before a press passed") {
+		t.Errorf("detail = %q", r.res.Detail)
+	}
+	if n := r.store.hitCount("place"); n != 0 {
+		t.Errorf("the dry run pressed the button %d time(s)", n)
+	}
 }
 
 func TestFeedPriceMustBeZero(t *testing.T) {

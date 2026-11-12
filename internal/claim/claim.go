@@ -491,13 +491,14 @@ func (s *Session) disown(ev cdp.Event) {
 	s.mu.Unlock()
 }
 
-// adopted reports whether a target is already supervised as some page's
-// frame or worker.
+// adopted reports whether a target is already taken care of as some page's
+// frame or worker. (A frame that could not be supervised that way is not:
+// it is then tried over a connection of its own.)
 func (s *Session) adopted(targetID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, k := range s.kids {
-		if k.targetID == targetID {
+		if k.targetID == targetID && (k.supervised || k.fenced || strings.Contains(k.kind, "worker")) {
 			return true
 		}
 	}
@@ -511,8 +512,12 @@ func (s *Session) adopted(targetID string) bool {
 func (s *Session) unsupervised() (frames, workers []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	direct := map[string]bool{}
+	for _, t := range s.tabs {
+		direct[t.id] = true
+	}
 	for _, k := range s.kids {
-		if k.supervised || k.fenced {
+		if k.supervised || k.fenced || direct[k.targetID] {
 			continue
 		}
 		what := k.kind + " " + k.url
@@ -1274,6 +1279,12 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 				deadline = time.Now().Add(s.opt.CheckoutWait)
 			}
 		}
+		// Once the button is there, whatever runs next to the checkout is
+		// kept under supervision, before the page is read (so that the
+		// press follows the price check at once).
+		if sawButton {
+			s.superviseFrames(ctx, nil)
+		}
 		st, ierr := s.inspect(ctx)
 		if ierr == nil {
 			last = st
@@ -1391,7 +1402,6 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 	w.setPreClick(pre)
 	// Everything that runs next to the checkout must be under the same
 	// supervision before anything is pressed.
-	s.superviseFrames(ctx, nil)
 	frames, workers := s.unsupervised()
 	if len(workers) > 0 {
 		s.opt.Logf("%s: note: the checkout runs %d worker(s) whose requests cannot be looked into separately (%s)", o.Title, len(workers), strings.Join(workers, ", "))
@@ -1406,7 +1416,13 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 	s.opt.Logf("%s: checkout ready, price check = %v [%s]; button %q%s", o.Title, pre, strings.Join(evidence, "; "), last.Place.Text, how)
 
 	if s.opt.DryRun {
-		return Result{DryRun, fmt.Sprintf("checkout reached and \"%s\" is ready; price check = %v; order not placed (dry run)", last.Place.Text, pre)}, last, false
+		// Rehearse everything short of the press: the pointer is moved onto
+		// the button and the last look is taken.
+		rehearsal := "the pointer was moved onto the button and the last look before a press passed"
+		if err := s.approach(ctx, last.Place, w); err != nil {
+			rehearsal = "but a real run would not have pressed: " + err.Error()
+		}
+		return Result{DryRun, fmt.Sprintf("checkout reached and \"%s\" is ready; price check = %v; %s; order not placed (dry run)", last.Place.Text, pre, rehearsal)}, last, false
 	}
 
 	// ---- place the order
@@ -1594,6 +1610,29 @@ func (s *Session) stillThere(ctx context.Context, b *btn, w *orderWatch) error {
 		return fmt.Errorf("%w: the button moved or changed just before the press", errCalledOff)
 	}
 	return nil
+}
+
+// approach does everything click does up to the press, and leaves it at
+// that: the pointer ends on the button, nothing is pressed. It returns what
+// the last look found.
+func (s *Session) approach(ctx context.Context, b *btn, w *orderWatch) error {
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	errStop := errors.New("rehearsal")
+	err := s.page.ClickIf(cctx, b.X, b.Y, func() error {
+		if err := s.stillThere(cctx, b, w); err != nil {
+			return err
+		}
+		return errStop
+	})
+	if errors.Is(err, errStop) {
+		return nil
+	}
+	if err == nil {
+		// Cannot happen: the guard never lets the press through.
+		return errors.New("the rehearsal pressed the button")
+	}
+	return err
 }
 
 // click presses a button the way a person would, falling back to a
