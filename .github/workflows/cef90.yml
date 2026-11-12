@@ -54,7 +54,10 @@ jobs:
           $base = "http://127.0.0.1:$port"
           $code = 1
           try {
-            Start-Process -FilePath $exe -ArgumentList "-cefdebug=$port", '-silent'
+            # Started in the open (not "-silent"): the launcher creates its
+            # pages only when its window is shown, and here there is nobody
+            # to hide it from.
+            Start-Process -FilePath $exe -ArgumentList "-cefdebug=$port"
             $deadline = (Get-Date).AddMinutes(7)
             $pages = @(); $last = ''
             while ((Get-Date) -lt $deadline) {
