@@ -22,6 +22,12 @@ import (
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/win"
 )
 
+// unsupportedNote explains why Epic's new-generation launcher cannot be
+// used. Tested against its preview 0.115 on a real Windows machine: it
+// ignores the browser-debugging switch and exits when started on a desktop
+// that is not displayed.
+const unsupportedNote = "the new-generation Epic Games Launcher (preview) is installed, which does not offer what this program needs; it works with the classic launcher from Epic's regular installer"
+
 // Runner implements daemon.Claimer.
 type Runner struct {
 	LauncherPath        string
@@ -119,6 +125,10 @@ func (r *Runner) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]
 			return results, fmt.Errorf("%w (%v)", daemon.ErrNotInstalled, err)
 		}
 		return results, err
+	}
+
+	if inst.Gen != launcher.Legacy {
+		return results, fmt.Errorf("%w: %s", daemon.ErrUnsupported, unsupportedNote)
 	}
 
 	// Never get in the user's way.
@@ -334,6 +344,10 @@ func (r *Runner) TrialLaunch(ctx context.Context) LaunchReport {
 		return rep
 	}
 	rep.Install = inst
+	if inst.Gen != launcher.Legacy {
+		rep.Err = unsupportedNote
+		return rep
+	}
 	act := launcher.Inspect()
 	restore := false
 	if act.Running {

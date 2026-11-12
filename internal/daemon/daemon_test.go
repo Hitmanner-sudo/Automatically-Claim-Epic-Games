@@ -226,6 +226,7 @@ func TestSessionProblems(t *testing.T) {
 	}{
 		{"not signed in", claim.ErrNotSignedIn, 6 * time.Hour, 0},
 		{"launcher missing", ErrNotInstalled, 12 * time.Hour, 0},
+		{"unsupported launcher", fmt.Errorf("%w: preview", ErrUnsupported), 12 * time.Hour, 0},
 		{"user opened launcher", ErrYielded, 30 * time.Minute, 0},
 		{"wrapped sign-in", fmt.Errorf("session: %w", claim.ErrNotSignedIn), 6 * time.Hour, 0},
 		{"something else", errors.New("DevTools endpoint did not come up"), 20 * time.Minute, 1},

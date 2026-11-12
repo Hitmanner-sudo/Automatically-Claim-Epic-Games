@@ -19,7 +19,7 @@ Windows may warn about an unknown publisher the first time, because the file is 
 ## What it does
 
 - Reads Epic's public free-games list about once an hour, and again a few minutes after the next giveaway is due to start.
-- When something is free and not yet claimed, it starts the launcher on a separate Windows desktop that is never displayed, opens Epic's checkout inside it, confirms that the price is zero, and places the order.
+- When something is free and not yet claimed, it starts the launcher on a separate Windows desktop that is never displayed, opens Epic's checkout inside it, confirms that the price is zero, and places the order. If the checkout cannot be opened directly, it goes the way you would: the game's store page, **Get**, and the launcher's own checkout window.
 - Closes the hidden launcher again. The whole thing takes about a minute.
 - Writes what it did to a log file. Nothing else.
 
@@ -91,14 +91,14 @@ Tested on real Windows machines (GitHub's Windows runners) with a real Epic Game
 - recognising that a launcher is signed out;
 - shutting everything down again with nothing left running.
 
-Tested in a real browser against a stand-in for Epic's store (40+ scenarios): placing a free order, EU consent dialog, both the older and the 2026 checkout layout, already-owned games, region locks, CAPTCHAs, signed-out sessions, and every case in which a price above zero appears anywhere, none of which may result in an order.
+Tested in a real browser against a stand-in for Epic's store (about 50 scenarios): placing a free order directly and through the store page, a checkout window opened by the launcher itself, the EU consent dialog, both the older and the 2026 checkout layout, holiday mystery games, already-owned games, region locks, CAPTCHAs, signed-out sessions, and every case in which a price above zero appears anywhere, none of which may result in an order.
 
 **Not yet tested:** the last step on a real, signed-in account, that is, Epic's actual checkout inside a signed-in launcher. That needs a real account and could not be done from where this was built. The program is written to fail safely there: if the checkout does not look the way it expects, it places no order, saves what it saw under `diagnostics\`, and tries again later. If your first giveaway is not claimed, the log and that folder say why.
 
 ## Things to know
 
 - Automating a store may be against Epic's terms of service. Use this at your own discretion.
-- It works with the classic Epic Games Launcher. Epic's new-generation launcher (a preview since late 2026) is detected and attempted, but that path is untested.
+- It needs the **classic** Epic Games Launcher, the one Epic's regular installer installs. Epic's new-generation launcher (an opt-in preview since late 2026) cannot be driven this way: tested against preview 0.115, it ignores the debugging switch and exits when started hidden. If that launcher is installed, the program says so in its log and does nothing.
 - While a claim runs, the launcher's browser accepts local debugging connections on a random port, reachable only from your own PC. The port closes when the hidden launcher exits, about a minute later.
 - Antivirus programs are sometimes suspicious of small unsigned programs that start other programs invisibly. That is what this one does, on purpose, and all of its source is in this repository.
 

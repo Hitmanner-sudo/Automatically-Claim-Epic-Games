@@ -29,6 +29,9 @@ var ErrYielded = errors.New("the launcher was opened by the user; stepping aside
 // ErrNotInstalled means the launcher could not be found.
 var ErrNotInstalled = errors.New("the Epic Games Launcher is not installed")
 
+// ErrUnsupported means a launcher was found that this program cannot drive.
+var ErrUnsupported = errors.New("this Epic Games Launcher cannot be driven")
+
 // Feed fetches the free-games list.
 type Feed interface {
 	Fetch(ctx context.Context, country, locale string, now time.Time) (feed.Snapshot, error)
@@ -242,7 +245,7 @@ func (d *Daemon) claim(ctx context.Context, due []feed.Offer) time.Time {
 	sessionWait, sessionNote, countAttempt := time.Duration(0), "", false
 	switch {
 	case err == nil:
-	case errors.Is(err, ErrNotInstalled):
+	case errors.Is(err, ErrNotInstalled), errors.Is(err, ErrUnsupported):
 		sessionWait, sessionNote = missingRetry, err.Error()
 		d.notice("missing", "%v; will look again in %v", err, missingRetry)
 	case errors.Is(err, claim.ErrNotSignedIn):
