@@ -32,7 +32,11 @@ const productJS = `(function () {
   var body = document.body ? text(document.body) : '';
   out.login = /(^|\.)epicgames\.com$/.test(location.hostname) && /^\/id\/(login|register)/.test(location.pathname || '') ||
     !!document.querySelector('form input[type="password"], input#email[name="email"]');
-  out.captcha = /one more step|complete (a|the) security check/i.test(body);
+  out.captcha = false;
+  var cf = false;
+  try { cf = typeof window._cf_chl_opt !== 'undefined'; } catch (errCf) {}
+  out.browserCheck = cf || !!document.querySelector('.cf_challenge_container, h1[data-t="challengeTitle"], #challenge-form') ||
+    /just a moment|one more step|complete (a|the) security check/i.test(document.title + ' ' + body.slice(0, 400));
   var frames = document.querySelectorAll('iframe');
   for (var k = 0; k < frames.length; k++) {
     var f = frames[k];
@@ -63,20 +67,21 @@ const productJS = `(function () {
 })()`
 
 type productState struct {
-	URL         string   `json:"url"`
-	Title       string   `json:"title"`
-	Ready       string   `json:"ready"`
-	Buttons     []string `json:"buttons"`
-	Login       bool     `json:"login"`
-	Captcha     bool     `json:"captcha"`
-	CTA         *btn     `json:"cta"`
-	Owned       bool     `json:"owned"`
-	NeedsBase   bool     `json:"needsBase"`
-	Unavailable bool     `json:"unavailable"`
-	Gate        *btn     `json:"gate"`
-	Confirm     *btn     `json:"confirm"`
-	EULA        bool     `json:"eula"`
-	InPage      bool     `json:"inPage"`
+	URL          string   `json:"url"`
+	Title        string   `json:"title"`
+	Ready        string   `json:"ready"`
+	Buttons      []string `json:"buttons"`
+	Login        bool     `json:"login"`
+	Captcha      bool     `json:"captcha"`
+	BrowserCheck bool     `json:"browserCheck"`
+	CTA          *btn     `json:"cta"`
+	Owned        bool     `json:"owned"`
+	NeedsBase    bool     `json:"needsBase"`
+	Unavailable  bool     `json:"unavailable"`
+	Gate         *btn     `json:"gate"`
+	Confirm      *btn     `json:"confirm"`
+	EULA         bool     `json:"eula"`
+	InPage       bool     `json:"inPage"`
 }
 
 var (
@@ -161,6 +166,15 @@ func (s *Session) viaStorePage(ctx context.Context, o feed.Offer, w *orderWatch)
 				return Result{NotSignedIn, "the store page asks to sign in"}, last
 			case ps.Captcha:
 				return Result{Captcha, "Epic asked for a human check on the store page"}, last
+			case ps.BrowserCheck:
+				// Passes by itself, or the deadline below ends the wait.
+				if sleep(ctx, 2*time.Second) != nil {
+					return Result{Failed, "interrupted"}, last
+				}
+				if time.Now().After(deadline) {
+					return Result{Captcha, "Epic's site kept showing its browser check instead of the store page"}, last
+				}
+				continue
 			case ps.Owned:
 				return Result{Owned, "the store page shows it is in the library"}, last
 			case ps.NeedsBase:

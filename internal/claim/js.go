@@ -37,7 +37,12 @@ const inspectJS = `(function () {
   var path = location.pathname || '';
   out.login = /(^|\.)epicgames\.com$/.test(location.hostname) && /^\/id\/(login|register)/.test(path) ||
     !!document.querySelector('form input[type="password"], input#email[name="email"]');
-  out.browserCheck = /just a moment|verify you are human|checking your browser|attention required/i.test(document.title + ' ' + body.slice(0, 400));
+  // The "One more step / Please complete a security check" page is a
+  // Cloudflare check that normally passes by itself and reloads the page.
+  var cf = false;
+  try { cf = typeof window._cf_chl_opt !== 'undefined'; } catch (errCf) {}
+  out.browserCheck = cf || !!document.querySelector('.cf_challenge_container, h1[data-t="challengeTitle"], #challenge-error-text, #challenge-form, #challenge-running') ||
+    /just a moment|verify you are human|checking your browser|attention required|one more step|complete (a|the) security check/i.test(document.title + ' ' + body.slice(0, 400));
 
   var app = document.querySelector('#purchase-app');
   out.app = !!app || /\/(purchase|checkout)(\/|$)/.test(path);
@@ -74,8 +79,21 @@ const inspectJS = `(function () {
     if (prim.length === 1) { place = prim[0]; out.guessed = true; }
     else if (prim.length === 0 && rest.length === 1) { place = rest[0]; out.guessed = true; }
   }
+  // A real mouse click only lands if the button is inside the visible part
+  // of the page and nothing lies on top of it.
+  function reachable(el) {
+    var r = el.getBoundingClientRect();
+    if (r.top < 0 || r.bottom > (innerHeight || 0) || r.left < 0 || r.right > (innerWidth || 0)) {
+      try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (errScroll) {}
+      r = el.getBoundingClientRect();
+    }
+    var at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return !!at && (at === el || el.contains(at) || at.contains(el));
+  }
   out.place = place ? button(place) : null;
+  if (out.place) out.place.hit = reachable(place);
   out.consent = consent && consent !== place ? button(consent) : null;
+  if (out.consent) out.consent.hit = reachable(consent);
   out.buttons = [];
   for (var bi = 0; bi < buttons.length && out.buttons.length < 10; bi++) out.buttons.push(text(buttons[bi]).slice(0, 40));
 
@@ -88,7 +106,7 @@ const inspectJS = `(function () {
     var id = (f.src || '') + ' ' + (f.id || '') + ' ' + (f.title || '') + ' ' + (f.parentElement ? (f.parentElement.id || '') + ' ' + cls(f.parentElement) : '');
     if (/hcaptcha|h_captcha|recaptcha|arkoselabs|funcaptcha|talon/i.test(id) && shown(f, 120)) out.captcha = true;
   }
-  if (/one more step|complete (a|the) security check|select all (images|squares)/i.test(body)) out.captcha = true;
+  if (/select all (images|squares)/i.test(body)) out.captcha = true;
   out.throttled = /unable to download any more free games|wait 24 hours before trying to redeem/i.test(body);
 
   out.pin = !!scope.querySelector('.payment-pin-code, [class*="pin-code"]');
@@ -168,9 +186,15 @@ type btn struct {
 	Text     string  `json:"text"`
 	Disabled bool    `json:"disabled"`
 	Loading  bool    `json:"loading"`
+	// Hit is false when a click at the button's centre would land on
+	// something else (it is covered, or outside the visible page). Pages
+	// that do not report it are taken at their word.
+	Hit *bool `json:"hit"`
 }
 
-func (b *btn) clickable() bool { return b != nil && !b.Disabled && !b.Loading && b.W >= 8 && b.H >= 8 }
+func (b *btn) clickable() bool {
+	return b != nil && !b.Disabled && !b.Loading && b.W >= 8 && b.H >= 8 && (b.Hit == nil || *b.Hit)
+}
 
 // offersValidationHash identifies the store's own "getOffersValidation"
 // query (the one its cart uses to tell what an account already owns).

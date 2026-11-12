@@ -897,3 +897,69 @@ func TestIsCheckoutURL(t *testing.T) {
 		}
 	}
 }
+
+// ---- Epic's browser check ("One more step")
+
+func TestBrowserCheckIsWaitedOut(t *testing.T) {
+	// The check passes by itself after a few seconds; nothing is clicked
+	// meanwhile, and the claim then goes ahead.
+	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), ChallengeFor: 4 * time.Second}, func(o *Options) {
+		o.CheckoutWait = 3 * time.Second // shorter than the check lasts
+		o.BrowserCheckWait = 30 * time.Second
+	})
+	wantOutcome(t, r, Claimed, 1)
+}
+
+func TestBrowserCheckThatNeverPassesBacksOff(t *testing.T) {
+	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), ChallengeFor: time.Hour}, func(o *Options) {
+		o.CheckoutWait = 2 * time.Second
+		o.BrowserCheckWait = 4 * time.Second
+	})
+	wantOutcome(t, r, Captcha, 0)
+	if !strings.Contains(r.res.Detail, "browser check") {
+		t.Errorf("detail = %q", r.res.Detail)
+	}
+}
+
+func TestSaysFreeDoesNotOutweighAPrice(t *testing.T) {
+	// The page carries Epic's "This is free" sentence, yet also shows an
+	// amount above zero: that is not proof of a zero total.
+	r := runScenario(t, scenario{SignedIn: true, NewLayout: true, NewPrice: "$4.99"}, nil)
+	wantOutcome(t, r, Failed, 0)
+}
+
+func TestCoveredButtonIsNotClicked(t *testing.T) {
+	// Something lies on top of the order button: a mouse click would land
+	// on the cover, so none is made.
+	base := sharedBrowser(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<!doctype html><title>x</title><body style="margin:0"><div id="purchase-app">
+<div class="payment-price payment-price--total">Total $0.00</div>
+<button class="payment-btn payment-order-confirm__btn" style="position:absolute;left:100px;top:100px;width:200px;height:40px" onclick="window.pressed=true">Place Order</button>
+<div id="cover" style="position:absolute;left:0;top:0;width:600px;height:400px;background:#000;opacity:0.9" onclick="window.coverHit=true"></div>
+</div></body>`))
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	s, err := Open(ctx, base, Options{CheckoutBases: []string{srv.URL}, LoginBase: srv.URL, SettleWait: 50 * time.Millisecond, CheckoutWait: 4 * time.Second, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	res := s.Claim(ctx, testOffer())
+	if res.Outcome != Failed {
+		t.Fatalf("result = %v", res)
+	}
+	var state struct {
+		Pressed  bool `json:"pressed"`
+		CoverHit bool `json:"coverHit"`
+	}
+	if err := s.page.Eval(ctx, `({pressed: !!window.pressed, coverHit: !!window.coverHit})`, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.Pressed || state.CoverHit {
+		t.Fatalf("something was clicked: %+v", state)
+	}
+}

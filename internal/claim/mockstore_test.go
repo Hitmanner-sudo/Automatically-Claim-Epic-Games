@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // scenario configures the stand-in for Epic's store used by the tests. It
@@ -45,6 +46,10 @@ type scenario struct {
 	DirectBlocked bool   `json:"directBlocked"`
 	ProductLabel  string `json:"productLabel"` // the store page's main button (default "Get")
 	ProductGate   bool   `json:"productGate"`  // a "Continue" notice covers the store page first
+	// ChallengeFor makes the checkout answer with a Cloudflare-style
+	// "One more step" page for this long before the real page is served
+	// (the challenge page reloads itself, as the real one does).
+	ChallengeFor time.Duration `json:"-"`
 	// OnDirect is called when the checkout address is opened directly.
 	OnDirect func(offers string) `json:"-"`
 }
@@ -63,6 +68,7 @@ type mockStore struct {
 	cookie   string
 	// lastOffers is the offers parameter of the last checkout opened.
 	lastOffers string
+	firstHit   time.Time
 }
 
 var mockSeq int
@@ -197,6 +203,20 @@ const errorPage = `<!doctype html><html><head><title>Payment by Epic Games</titl
 
 func (m *mockStore) handleCheckout(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	m.mu.Lock()
+	if m.firstHit.IsZero() {
+		m.firstHit = time.Now()
+	}
+	challenged := m.sc.ChallengeFor > 0 && time.Since(m.firstHit) < m.sc.ChallengeFor
+	m.mu.Unlock()
+	if challenged {
+		w.Header().Set("cf-mitigated", "challenge")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `<!doctype html><html><head><title>One more step</title><meta http-equiv="refresh" content="1"></head><body>
+<div class="cf_challenge_container"><h1 data-t="challengeTitle">One more step</h1><p data-t="challengeSubtitle" class="cf_challenge_text">Please complete a security check to continue</p></div>
+<script>window._cf_chl_opt = { cType: 'managed' };</script></body></html>`)
+		return
+	}
 	if !m.hasSession(r) {
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = io.WriteString(w, errorPage)

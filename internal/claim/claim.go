@@ -90,6 +90,10 @@ type Options struct {
 	// checkout window.
 	OpenProduct func(ctx context.Context, o feed.Offer, try int) error
 
+	// BrowserCheckWait is how long a "checking your browser" page is given
+	// to pass by itself.
+	BrowserCheckWait time.Duration
+
 	UIWait       time.Duration // for the launcher's interface to come up
 	LoginGrace   time.Duration // how long a lone sign-in page is tolerated
 	SettleWait   time.Duration // how long to hold out for an Epic web page
@@ -125,6 +129,9 @@ func (o *Options) fill() {
 	}
 	if o.CheckoutWait == 0 {
 		o.CheckoutWait = 50 * time.Second
+	}
+	if o.BrowserCheckWait == 0 {
+		o.BrowserCheckWait = 150 * time.Second
 	}
 	if o.OrderWait == 0 {
 		o.OrderWait = 90 * time.Second
@@ -830,7 +837,7 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 	// ---- wait for the checkout to be ready
 	deadline := time.Now().Add(s.opt.CheckoutWait)
 	var errorSince, strangerSince, lastAdopt time.Time
-	adopted := false
+	adopted, sawBrowserCheck := false, false
 	for {
 		if ctx.Err() != nil {
 			return Result{Failed, "interrupted"}, last, false
@@ -868,7 +875,17 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 			case st.Captcha:
 				return Result{Captcha, "Epic asked for a human check before the order"}, last, false
 			}
-			if st.Place.clickable() {
+			if st.BrowserCheck && !sawBrowserCheck {
+				// Epic's site is checking the browser (a Cloudflare page).
+				// It usually passes by itself within a couple of minutes;
+				// nothing is clicked meanwhile.
+				sawBrowserCheck = true
+				s.opt.Logf("%s: Epic's site is running its browser check; waiting for it to pass", o.Title)
+				if d := time.Now().Add(s.opt.BrowserCheckWait); d.After(deadline) {
+					deadline = d
+				}
+			}
+			if st.Place.clickable() && !st.BrowserCheck {
 				break
 			}
 			if st.AppError != "" && st.Place == nil {
@@ -896,7 +913,8 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 		}
 		if time.Now().After(deadline) {
 			if last.BrowserCheck {
-				return Result{Failed, "Epic's site showed a browser check instead of the checkout"}, last, mayFallThrough
+				// Backs off like a CAPTCHA: asking again soon would not help.
+				return Result{Captcha, "Epic's site kept showing its browser check instead of the checkout"}, last, false
 			}
 			if ierr != nil {
 				return Result{Failed, "the checkout page could not be read: " + ierr.Error()}, last, mayFallThrough
@@ -948,8 +966,10 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 	if shown == Free {
 		evidence = append(evidence, fmt.Sprintf("the only price on the page is %q", last.Prices[0]))
 	}
+	// Epic's sentence "This is free" counts only while no amount above zero
+	// appears anywhere on the page.
 	stated := Unknown
-	if last.SaysFree {
+	if last.SaysFree && (len(last.Prices) == 0 || shown == Free) {
 		stated = Free
 		evidence = append(evidence, "the page says it is free")
 	}
