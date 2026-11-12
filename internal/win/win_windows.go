@@ -8,11 +8,13 @@ package win
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -207,31 +209,84 @@ type Process struct {
 	job windows.Handle
 }
 
-// Start runs exe with args. If desktop is non-empty the process (and its
-// children) are placed on that desktop.
-func Start(exe string, args []string, dir, desktop string) (*Process, error) {
+// envBlock builds a Windows environment block: this process's environment
+// with the given "NAME=value" entries added (replacing same-named ones).
+// It returns nil when there is nothing to add, meaning "inherit as is".
+func envBlock(extra []string) *uint16 {
+	if len(extra) == 0 {
+		return nil
+	}
+	override := map[string]bool{}
+	for _, kv := range extra {
+		if name, _, ok := strings.Cut(kv, "="); ok {
+			override[strings.ToUpper(name)] = true
+		}
+	}
+	var all []string
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if name != "" && override[strings.ToUpper(name)] {
+			continue
+		}
+		all = append(all, kv)
+	}
+	all = append(all, extra...)
+	var block []uint16
+	for _, kv := range all {
+		block = append(block, utf16.Encode([]rune(kv))...)
+		block = append(block, 0)
+	}
+	block = append(block, 0)
+	return &block[0]
+}
+
+// create starts a process suspended, puts it in job, and lets it run.
+func create(exe string, args []string, dir, desktop string, env []string, job windows.Handle) (windows.ProcessInformation, error) {
+	var pi windows.ProcessInformation
 	exePtr, err := windows.UTF16PtrFromString(exe)
 	if err != nil {
-		return nil, err
+		return pi, err
 	}
 	cmdPtr, err := windows.UTF16PtrFromString(windows.ComposeCommandLine(append([]string{exe}, args...)))
 	if err != nil {
-		return nil, err
+		return pi, err
 	}
 	var dirPtr *uint16
 	if dir != "" {
 		if dirPtr, err = windows.UTF16PtrFromString(dir); err != nil {
-			return nil, err
+			return pi, err
 		}
 	}
 	si := windows.StartupInfo{}
 	si.Cb = uint32(unsafe.Sizeof(si))
 	if desktop != "" {
 		if si.Desktop, err = windows.UTF16PtrFromString(desktop); err != nil {
-			return nil, err
+			return pi, err
 		}
 	}
+	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_UNICODE_ENVIRONMENT | windows.CREATE_NEW_PROCESS_GROUP)
+	if err := windows.CreateProcess(exePtr, cmdPtr, nil, nil, false, flags, envBlock(env), dirPtr, &si, &pi); err != nil {
+		if errors.Is(err, windows.ERROR_ELEVATION_REQUIRED) {
+			return pi, fmt.Errorf("start %s: it requires administrator rights, which this program does not have", filepath.Base(exe))
+		}
+		return pi, fmt.Errorf("start %s: %w", filepath.Base(exe), err)
+	}
+	// Suspended until it is in the job, so no child can escape it.
+	if err := windows.AssignProcessToJobObject(job, pi.Process); err != nil {
+		_ = windows.TerminateProcess(pi.Process, 1)
+		_ = windows.CloseHandle(pi.Thread)
+		_ = windows.CloseHandle(pi.Process)
+		return pi, fmt.Errorf("AssignProcessToJobObject: %w", err)
+	}
+	_, _ = windows.ResumeThread(pi.Thread)
+	_ = windows.CloseHandle(pi.Thread)
+	return pi, nil
+}
 
+// Start runs exe with args. If desktop is non-empty the process (and its
+// children) are placed on that desktop. env holds extra "NAME=value"
+// environment entries.
+func Start(exe string, args []string, dir, desktop string, env []string) (*Process, error) {
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("CreateJobObject: %w", err)
@@ -242,32 +297,34 @@ func Start(exe string, args []string, dir, desktop string) (*Process, error) {
 		_ = windows.CloseHandle(job)
 		return nil, fmt.Errorf("SetInformationJobObject: %w", err)
 	}
-
-	var pi windows.ProcessInformation
-	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_UNICODE_ENVIRONMENT | windows.CREATE_NEW_PROCESS_GROUP)
-	if err := windows.CreateProcess(exePtr, cmdPtr, nil, nil, false, flags, nil, dirPtr, &si, &pi); err != nil {
+	pi, err := create(exe, args, dir, desktop, env, job)
+	if err != nil {
 		_ = windows.CloseHandle(job)
-		if errors.Is(err, windows.ERROR_ELEVATION_REQUIRED) {
-			return nil, fmt.Errorf("start %s: it requires administrator rights, which this program does not have", filepath.Base(exe))
-		}
-		return nil, fmt.Errorf("start %s: %w", filepath.Base(exe), err)
+		return nil, err
 	}
-	// Suspended until it is in the job, so no child can escape it.
-	if err := windows.AssignProcessToJobObject(job, pi.Process); err != nil {
-		_ = windows.TerminateProcess(pi.Process, 1)
-		_ = windows.CloseHandle(pi.Thread)
-		_ = windows.CloseHandle(pi.Process)
-		_ = windows.CloseHandle(job)
-		return nil, fmt.Errorf("AssignProcessToJobObject: %w", err)
-	}
-	_, _ = windows.ResumeThread(pi.Thread)
-	_ = windows.CloseHandle(pi.Thread)
 	return &Process{PID: pi.ProcessId, h: pi.Process, job: job}, nil
+}
+
+// Spawn starts another process inside the same job (so it is cleaned up
+// together with the first) and returns its id.
+func (p *Process) Spawn(exe string, args []string, dir, desktop string, env []string) (uint32, error) {
+	if p == nil || p.job == 0 {
+		return 0, errors.New("process tree is closed")
+	}
+	pi, err := create(exe, args, dir, desktop, env, p.job)
+	if err != nil {
+		return 0, err
+	}
+	_ = windows.CloseHandle(pi.Process)
+	return pi.ProcessId, nil
 }
 
 // PIDs returns the ids of every live process in the tree.
 func (p *Process) PIDs() map[uint32]bool {
 	out := map[uint32]bool{}
+	if p == nil || p.job == 0 {
+		return out
+	}
 	// JOBOBJECT_BASIC_PROCESS_ID_LIST: two DWORDs followed by ULONG_PTR ids.
 	const max = 1024
 	type list struct {
@@ -308,7 +365,9 @@ func (p *Process) WaitExit(timeout time.Duration) bool {
 
 // Kill terminates the whole tree.
 func (p *Process) Kill() {
-	_ = windows.TerminateJobObject(p.job, 1)
+	if p != nil && p.job != 0 {
+		_ = windows.TerminateJobObject(p.job, 1)
+	}
 }
 
 // Close kills whatever is left and releases the handles.
@@ -544,4 +603,69 @@ func CommandLine(pid uint32) string {
 		size = need
 	}
 	return ""
+}
+
+// Uptime is how long Windows has been running.
+func Uptime() time.Duration { return windows.DurationSinceBoot() }
+
+// StopSignal is a named, system-wide "please exit" flag shared by the
+// background process and the commands that control it.
+type StopSignal struct{ h windows.Handle }
+
+// NewStopSignal creates (or opens) the flag in the cleared state.
+func NewStopSignal(name string) (*StopSignal, error) {
+	n, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return nil, err
+	}
+	h, err := windows.CreateEvent(nil, 1, 0, n)
+	if h == 0 {
+		return nil, fmt.Errorf("CreateEvent: %w", err)
+	}
+	_ = windows.ResetEvent(h)
+	return &StopSignal{h: h}, nil
+}
+
+// Wait blocks until the flag is raised.
+func (s *StopSignal) Wait() {
+	_, _ = windows.WaitForSingleObject(s.h, windows.INFINITE)
+}
+
+// Close releases the handle.
+func (s *StopSignal) Close() { _ = windows.CloseHandle(s.h) }
+
+// RaiseStopSignal raises the flag if a process is listening for it. It
+// reports whether there was one.
+func RaiseStopSignal(name string) bool {
+	n, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return false
+	}
+	h, err := windows.OpenEvent(windows.EVENT_MODIFY_STATE, false, n)
+	if err != nil || h == 0 {
+		return false
+	}
+	defer windows.CloseHandle(h)
+	return windows.SetEvent(h) == nil
+}
+
+// ConsoleOut returns a writer for command-line output. A program built for
+// the Windows GUI subsystem has no console of its own: output goes to the
+// handle it was given (a pipe or file, when redirected), else to the console
+// of the program that started it, else nowhere.
+func ConsoleOut() *os.File {
+	if h, err := windows.GetStdHandle(windows.STD_OUTPUT_HANDLE); err == nil && h != 0 && h != windows.InvalidHandle {
+		if t, err := windows.GetFileType(h); err == nil && t != windows.FILE_TYPE_UNKNOWN {
+			return os.Stdout
+		}
+	}
+	if !AttachParentConsole() {
+		return nil
+	}
+	name, _ := windows.UTF16PtrFromString("CONOUT$")
+	h, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, 0, 0)
+	if err != nil {
+		return nil
+	}
+	return os.NewFile(uintptr(h), "CONOUT$")
 }

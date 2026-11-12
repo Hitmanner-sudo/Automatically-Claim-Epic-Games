@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -72,8 +73,12 @@ type Options struct {
 	// Logf receives progress lines.
 	Logf func(format string, args ...any)
 
-	// StoreBase and LoginBase are Epic's web origins; overridden by tests.
-	StoreBase string
+	// CheckoutBases are the addresses under which Epic serves its checkout,
+	// tried in order. The first is the one the launcher itself uses; the
+	// second is one the launcher attaches its own sign-in to; the last is
+	// the public web store. Overridden by tests.
+	CheckoutBases []string
+	// LoginBase is Epic's sign-in site; overridden by tests.
 	LoginBase string
 
 	UIWait       time.Duration // for the launcher's interface to come up
@@ -84,13 +89,21 @@ type Options struct {
 }
 
 func (o *Options) fill() {
-	if o.StoreBase == "" {
-		o.StoreBase = "https://store.epicgames.com"
+	if len(o.CheckoutBases) == 0 {
+		o.CheckoutBases = []string{
+			"https://launcher.store.epicgames.com",
+			"https://www.epicgames.com/store",
+			"https://store.epicgames.com",
+		}
 	}
+	bases := make([]string, 0, len(o.CheckoutBases))
+	for _, b := range o.CheckoutBases {
+		bases = append(bases, strings.TrimRight(b, "/"))
+	}
+	o.CheckoutBases = bases
 	if o.LoginBase == "" {
 		o.LoginBase = "https://www.epicgames.com"
 	}
-	o.StoreBase = strings.TrimRight(o.StoreBase, "/")
 	o.LoginBase = strings.TrimRight(o.LoginBase, "/")
 	if o.UIWait == 0 {
 		o.UIWait = 4 * time.Minute
@@ -102,7 +115,7 @@ func (o *Options) fill() {
 		o.SettleWait = 45 * time.Second
 	}
 	if o.CheckoutWait == 0 {
-		o.CheckoutWait = 75 * time.Second
+		o.CheckoutWait = 50 * time.Second
 	}
 	if o.OrderWait == 0 {
 		o.OrderWait = 90 * time.Second
@@ -130,9 +143,39 @@ func isLoginURL(raw string) bool {
 	return strings.HasPrefix(u.Path, "/id/login") || strings.HasPrefix(u.Path, "/id/register") || u.Path == "/id" || u.Path == "/id/"
 }
 
+// isStoreHost reports whether a host (with optional port) is one of Epic's
+// store sites: the public one, the launcher's own, or a configured checkout
+// origin. A checkout address with a path (such as www.epicgames.com/store)
+// does not make its whole host a store site.
+func isStoreHost(hostport string, bases []string) bool {
+	name := strings.ToLower(hostport)
+	if h, _, err := net.SplitHostPort(name); err == nil {
+		name = h
+	}
+	if name == "store.epicgames.com" || strings.HasSuffix(name, ".store.epicgames.com") {
+		return true
+	}
+	for _, b := range bases {
+		if u, err := url.Parse(b); err == nil && strings.Trim(u.Path, "/") == "" && strings.EqualFold(u.Host, hostport) {
+			return true
+		}
+	}
+	return false
+}
+
+// storeOrigin returns the origin of a page if it belongs to Epic's store,
+// or "" otherwise. Only such pages may query the store's API.
+func storeOrigin(pageURL string, bases []string) string {
+	u, err := url.Parse(pageURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || !isStoreHost(u.Host, bases) {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
 // targetScore ranks a debuggable target as a place to run the checkout in.
 // Negative means unusable.
-func targetScore(t cdp.Target, storeBase string) int {
+func targetScore(t cdp.Target, bases []string) int {
 	if t.Type != "page" || t.WebSocketDebuggerURL == "" {
 		return -1
 	}
@@ -144,7 +187,7 @@ func targetScore(t cdp.Target, storeBase string) int {
 		return 0
 	}
 	host := strings.ToLower(u.Hostname())
-	if sb, err := url.Parse(storeBase); err == nil && strings.EqualFold(sb.Host, u.Host) {
+	if isStoreHost(u.Host, bases) {
 		return 3
 	}
 	if host == "epicgames.com" || strings.HasSuffix(host, ".epicgames.com") {
@@ -161,7 +204,7 @@ type survey struct {
 	Pages     int
 }
 
-func surveyTargets(ts []cdp.Target, storeBase string) survey {
+func surveyTargets(ts []cdp.Target, bases []string) survey {
 	s := survey{BestScore: -1}
 	for _, t := range ts {
 		if t.Type != "page" {
@@ -171,7 +214,7 @@ func surveyTargets(ts []cdp.Target, storeBase string) survey {
 		if isLoginURL(t.URL) {
 			s.Login = true
 		}
-		if sc := targetScore(t, storeBase); sc > s.BestScore {
+		if sc := targetScore(t, bases); sc > s.BestScore {
 			s.Best, s.BestScore = t, sc
 		}
 	}
@@ -220,7 +263,7 @@ func Open(ctx context.Context, base string, opt Options) (*Session, error) {
 		cancel()
 		now := time.Now()
 		if err == nil {
-			sv := surveyTargets(targets, opt.StoreBase)
+			sv := surveyTargets(targets, opt.CheckoutBases)
 			switch {
 			case sv.BestScore >= 2:
 				chosen = sv.Best
@@ -400,9 +443,9 @@ func (s *Session) inspect(ctx context.Context) (pageState, error) {
 	return st, err
 }
 
-// CheckoutURL is the address of Epic's checkout for one offer.
-func (s *Session) CheckoutURL(o feed.Offer) string {
-	return s.opt.StoreBase + "/purchase?highlightColor=0078f2&offers=" + url.QueryEscape(o.PurchaseToken()) + "&orderId&purchaseToken&showNavigation=true"
+// checkoutURL is the address of Epic's checkout for one offer under base.
+func checkoutURL(base string, o feed.Offer) string {
+	return base + "/purchase?highlightColor=0078f2&offers=" + url.QueryEscape(o.PurchaseToken()) + "&orderId&purchaseToken&showNavigation=true"
 }
 
 // signInHopURL goes through Epic's sign-in page, which, when the browser
@@ -411,7 +454,7 @@ func (s *Session) CheckoutURL(o feed.Offer) string {
 func (s *Session) signInHopURL(o feed.Offer) string {
 	q := url.Values{}
 	q.Set("noHostRedirect", "true")
-	q.Set("redirectUrl", s.CheckoutURL(o))
+	q.Set("redirectUrl", checkoutURL(s.opt.CheckoutBases[len(s.opt.CheckoutBases)-1], o))
 	q.Set("client_id", storeClientID)
 	return s.opt.LoginBase + "/id/login?" + q.Encode()
 }
@@ -427,7 +470,8 @@ const (
 )
 
 func (s *Session) ownership(ctx context.Context, st pageState, o feed.Offer) ownership {
-	if !strings.HasPrefix(st.URL, s.opt.StoreBase+"/") {
+	origin := storeOrigin(st.URL, s.opt.CheckoutBases)
+	if origin == "" {
 		return ownUnknown // only the store's own pages may ask its API
 	}
 	var res struct {
@@ -436,7 +480,7 @@ func (s *Session) ownership(ctx context.Context, st pageState, o feed.Offer) own
 	}
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	if err := s.page.Eval(cctx, ownershipJS(s.opt.StoreBase, o.Namespace, o.OfferID), &res); err != nil || res.Status != 200 {
+	if err := s.page.Eval(cctx, ownershipJS(origin, o.Namespace, o.OfferID), &res); err != nil || res.Status != 200 {
 		return ownUnknown
 	}
 	return parseOwnership([]byte(res.Body))
@@ -484,9 +528,20 @@ func (s *Session) Claim(ctx context.Context, o feed.Offer) Result {
 	s.setWatch(w)
 	defer s.setWatch(nil)
 
-	res, last, hop := s.checkout(ctx, o, w, s.CheckoutURL(o), true)
-	if hop && ctx.Err() == nil {
-		s.opt.Logf("%s: checkout did not open directly; retrying through Epic's sign-in hand-over", o.Title)
+	var res Result
+	var last pageState
+	next := true
+	for i, base := range s.opt.CheckoutBases {
+		if !next || ctx.Err() != nil {
+			break
+		}
+		if i > 0 {
+			s.opt.Logf("%s: checkout did not open at %s (%s); trying %s", o.Title, s.opt.CheckoutBases[i-1], res.Detail, base)
+		}
+		res, last, next = s.checkout(ctx, o, w, checkoutURL(base, o), true)
+	}
+	if next && ctx.Err() == nil {
+		s.opt.Logf("%s: checkout did not open directly (%s); retrying through Epic's sign-in hand-over", o.Title, res.Detail)
 		res, last, _ = s.checkout(ctx, o, w, s.signInHopURL(o), false)
 	}
 	if res.Outcome != Claimed && res.Outcome != Owned {
@@ -513,9 +568,11 @@ func classifyError(msg string) (Outcome, bool) {
 	return "", false
 }
 
-// checkout runs one attempt at the given checkout address. wantHop reports
-// that the page looked signed out and the sign-in hand-over should be tried.
-func (s *Session) checkout(ctx context.Context, o feed.Offer, w *orderWatch, address string, mayHop bool) (res Result, last pageState, wantHop bool) {
+// checkout runs one attempt at the given checkout address. tryNext reports
+// that no working checkout came up there (signed out, an error page, or no
+// checkout at all) and that another address should be tried; res then says
+// why. It is only ever true when mayFallThrough is.
+func (s *Session) checkout(ctx context.Context, o feed.Offer, w *orderWatch, address string, mayFallThrough bool) (res Result, last pageState, tryNext bool) {
 	nctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	err := s.page.Navigate(nctx, address)
 	cancel()
@@ -527,7 +584,7 @@ func (s *Session) checkout(ctx context.Context, o feed.Offer, w *orderWatch, add
 
 	// ---- wait for the checkout to be ready
 	deadline := time.Now().Add(s.opt.CheckoutWait)
-	var errorSince time.Time
+	var errorSince, strangerSince time.Time
 	for {
 		if ctx.Err() != nil {
 			return Result{Failed, "interrupted"}, last, false
@@ -537,10 +594,7 @@ func (s *Session) checkout(ctx context.Context, o feed.Offer, w *orderWatch, add
 			last = st
 			switch {
 			case st.Login:
-				if mayHop {
-					return Result{}, last, true
-				}
-				return Result{NotSignedIn, "Epic's web sign-in page came up instead of the checkout"}, last, false
+				return Result{NotSignedIn, "Epic's web sign-in page came up instead of the checkout"}, last, mayFallThrough
 			case st.Owned || w.ownedHint():
 				// "Owned" ends all further attempts, so a second opinion is
 				// taken from the store when it will give one.
@@ -563,23 +617,32 @@ func (s *Session) checkout(ctx context.Context, o feed.Offer, w *orderWatch, add
 					errorSince = time.Now()
 				}
 				if time.Since(errorSince) > 6*time.Second {
-					if mayHop {
-						return Result{}, last, true
-					}
-					return Result{Failed, "the checkout shows an error: " + st.AppError}, last, false
+					return Result{Failed, "the checkout shows an error: " + st.AppError}, last, mayFallThrough
 				}
 			} else {
 				errorSince = time.Time{}
 			}
+			// A fully loaded page that is not a checkout at all (a "not
+			// found" page, the store's front page after a redirect, ...).
+			if st.Ready == "complete" && !st.App && !st.BrowserCheck {
+				if strangerSince.IsZero() {
+					strangerSince = time.Now()
+				}
+				if mayFallThrough && time.Since(strangerSince) > 12*time.Second {
+					return Result{Failed, "no checkout at " + trimURL(st.URL)}, last, true
+				}
+			} else {
+				strangerSince = time.Time{}
+			}
 		}
 		if time.Now().After(deadline) {
 			if last.BrowserCheck {
-				return Result{Failed, "Epic's site showed a browser check instead of the checkout"}, last, false
+				return Result{Failed, "Epic's site showed a browser check instead of the checkout"}, last, mayFallThrough
 			}
 			if ierr != nil {
-				return Result{Failed, "the checkout page could not be read: " + ierr.Error()}, last, false
+				return Result{Failed, "the checkout page could not be read: " + ierr.Error()}, last, mayFallThrough
 			}
-			return Result{Failed, "the checkout did not become ready (page: " + trimURL(last.URL) + ")"}, last, false
+			return Result{Failed, "the checkout did not become ready (page: " + trimURL(last.URL) + ")"}, last, mayFallThrough
 		}
 		if err := sleep(ctx, 500*time.Millisecond); err != nil {
 			return Result{Failed, "interrupted"}, last, false

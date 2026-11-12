@@ -58,7 +58,7 @@ func runScenario(t *testing.T, sc scenario, mod func(*Options)) run {
 	store := newMockStore(t, sc)
 	r := run{store: store, diag: t.TempDir()}
 	opt := Options{
-		StoreBase: store.URL(), LoginBase: store.URL(),
+		CheckoutBases: []string{store.URL()}, LoginBase: store.URL(),
 		DiagDir:    r.diag,
 		UIWait:     20 * time.Second,
 		SettleWait: 50 * time.Millisecond,
@@ -210,7 +210,7 @@ func TestFeedPriceMustBeZero(t *testing.T) {
 	store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0)})
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	s, err := Open(ctx, base, Options{StoreBase: store.URL(), LoginBase: store.URL(), SettleWait: 50 * time.Millisecond})
+	s, err := Open(ctx, base, Options{CheckoutBases: []string{store.URL()}, LoginBase: store.URL(), SettleWait: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +288,7 @@ func TestWorksWithoutOwnershipQuery(t *testing.T) {
 // ---- choosing the launcher page, sign-in detection
 
 func TestSurveyTargets(t *testing.T) {
-	const store = "https://store.epicgames.com"
+	store := []string{"https://launcher.store.epicgames.com", "https://www.epicgames.com/store", "https://store.epicgames.com"}
 	ws := "ws://x"
 	login := cdp.Target{Type: "page", URL: "https://www.epicgames.com/id/login?loginId=abc", WebSocketDebuggerURL: ws}
 	storePage := cdp.Target{Type: "page", URL: "https://store.epicgames.com/en-US/", WebSocketDebuggerURL: ws}
@@ -481,5 +481,94 @@ func TestOrderWatchRules(t *testing.T) {
 	}
 	if isOrderSubmit("GET", "https://x/purchase/confirm-order") {
 		t.Error("GET is never an order")
+	}
+}
+
+func TestStoreSiteRecognition(t *testing.T) {
+	bases := []string{"https://launcher.store.epicgames.com", "https://www.epicgames.com/store", "https://store.epicgames.com"}
+	ws := "ws://x"
+	launcherStore := cdp.Target{Type: "page", URL: "https://launcher.store.epicgames.com/store", WebSocketDebuggerURL: ws}
+	account := cdp.Target{Type: "page", URL: "https://www.epicgames.com/store/whatever", WebSocketDebuggerURL: ws}
+	other := cdp.Target{Type: "page", URL: "https://egs-download-manager.store.on.epicgames.com/home", WebSocketDebuggerURL: ws}
+	sv := surveyTargets([]cdp.Target{account, other, launcherStore}, bases)
+	if sv.Best.URL != launcherStore.URL || sv.BestScore != 3 {
+		t.Errorf("the launcher's own store page should win: %+v", sv)
+	}
+	if targetScore(account, bases) != 2 {
+		t.Errorf("www.epicgames.com is not a store site just because a checkout path lives there")
+	}
+	withMock := append(append([]string{}, bases...), "http://127.0.0.1:5555")
+	for u, want := range map[string]string{
+		"https://launcher.store.epicgames.com/purchase?offers=1": "https://launcher.store.epicgames.com",
+		"https://store.epicgames.com/en-US/p/x":                  "https://store.epicgames.com",
+		"https://www.epicgames.com/store/purchase":               "",
+		"https://evilstore.epicgames.com.example/x":              "",
+		"https://notstore.epicgames.com/x":                       "",
+		"https://xstore.epicgames.com/x":                         "",
+		"file:///C:/x.html":                                      "",
+		"http://127.0.0.1:5555/purchase":                         "http://127.0.0.1:5555",
+		"http://127.0.0.1:5556/purchase":                         "",
+	} {
+		if got := storeOrigin(u, withMock); got != want {
+			t.Errorf("storeOrigin(%q) = %q, want %q", u, got, want)
+		}
+	}
+}
+
+// ---- several checkout addresses
+
+func TestFallsThroughToAWorkingCheckoutAddress(t *testing.T) {
+	base := sharedBrowser(t)
+	// First address: a site with no checkout at all. Second: signed out
+	// (error page). Third: works.
+	nothing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("<!doctype html><title>404</title><body><h1>Page not found</h1></body>"))
+	}))
+	defer nothing.Close()
+	signedOut := newMockStore(t, scenario{SignedIn: false, DomTotal: "$0.00", ConfirmTotal: intp(0)})
+	working := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0)})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	s, err := Open(ctx, base, Options{
+		CheckoutBases: []string{nothing.URL, signedOut.URL(), working.URL()},
+		LoginBase:     working.URL(),
+		SettleWait:    50 * time.Millisecond,
+		CheckoutWait:  30 * time.Second,
+		OrderWait:     14 * time.Second,
+		Logf:          t.Logf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	res := s.Claim(ctx, testOffer())
+	if res.Outcome != Claimed {
+		t.Fatalf("result = %v", res)
+	}
+	if signedOut.orderCount() != 0 || working.orderCount() != 1 {
+		t.Errorf("orders: signed-out store %d, working store %d", signedOut.orderCount(), working.orderCount())
+	}
+}
+
+func TestDefinitiveAnswerStopsTheSearch(t *testing.T) {
+	base := sharedBrowser(t)
+	// The first address answers "already owned"; the second must not be tried.
+	first := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), Owned: true})
+	second := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0)})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	s, err := Open(ctx, base, Options{CheckoutBases: []string{first.URL(), second.URL()}, LoginBase: first.URL(), SettleWait: 50 * time.Millisecond, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if res := s.Claim(ctx, testOffer()); res.Outcome != Owned {
+		t.Fatalf("result = %v", res)
+	}
+	if first.orderCount() != 0 || second.orderCount() != 0 {
+		t.Errorf("orders: %d, %d", first.orderCount(), second.orderCount())
 	}
 }

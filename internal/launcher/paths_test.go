@@ -79,3 +79,75 @@ func TestPathWithin(t *testing.T) {
 		t.Error("a folder does not contain itself; empty folder contains nothing")
 	}
 }
+
+func TestGenerationOf(t *testing.T) {
+	cases := map[string]Generation{
+		`C:\Program Files\Epic Games\Launcher\Portal\Binaries\Win64\EpicGamesLauncher.exe`:       Legacy,
+		`C:\Program Files (x86)\Epic Games\Launcher\Portal\Binaries\Win32\EpicGamesLauncher.exe`: Legacy,
+		`D:/Games/Epic/Launcher/Portal/Binaries/Win64/EpicGamesLauncher.exe`:                     Legacy,
+		`C:\Users\me\AppData\Local\Epic Games\Launcher\EpicGamesLauncher.exe`:                    Preview,
+	}
+	for path, want := range cases {
+		if got := generationOf(path); got != want {
+			t.Errorf("generationOf(%q) = %v, want %v", path, got, want)
+		}
+	}
+}
+
+func TestDebugArgs(t *testing.T) {
+	args, env, flag := debugArgs(Legacy, 51234)
+	if len(args) != 2 || args[0] != "-cefdebug=51234" || args[1] != "-silent" || env != nil || flag != "-cefdebug=51234" {
+		t.Errorf("legacy: %v %v %q", args, env, flag)
+	}
+	args, env, flag = debugArgs(Preview, 51234)
+	if len(args) != 0 || len(env) != 1 || env[0] != "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=51234" || flag != "" {
+		t.Errorf("preview: %v %v %q", args, env, flag)
+	}
+	for n, want := range map[int]string{0: "0", 7: "7", 65534: "65534", -12: "-12"} {
+		if got := itoa(n); got != want {
+			t.Errorf("itoa(%d) = %q", n, got)
+		}
+	}
+}
+
+func TestUserArgs(t *testing.T) {
+	cases := []struct {
+		cmd  string
+		want []string
+	}{
+		{`"C:\Program Files\Epic Games\Launcher\Portal\Binaries\Win64\EpicGamesLauncher.exe"`, nil},
+		{`"C:\Program Files\Epic Games\Launcher\Portal\Binaries\Win64\EpicGamesLauncher.exe" com.epicgames.launcher://apps/Fortnite?action=launch&silent=true`,
+			[]string{"com.epicgames.launcher://apps/Fortnite?action=launch&silent=true"}},
+		{`"C:\x\EpicGamesLauncher.exe" "com.epicgames.launcher://store/product/a b"`, []string{"com.epicgames.launcher://store/product/a b"}},
+		{`"C:\x\EpicGamesLauncher.exe" -silent -launchcontext=boot`, []string{"-silent", "-launchcontext=boot"}},
+		{`C:\x\EpicGamesLauncher.exe -opengl -SkipBuildPatchPrereq -com.epicgames.launcher://apps/abc?action=launch`, []string{"-com.epicgames.launcher://apps/abc?action=launch"}},
+		// Internal switches of a re-executed launcher are not repeated.
+		{`"C:\x\EpicGamesLauncher.exe" "C:\x\EpicGamesLauncher.exe" -cefdebug=9222 -AllowSoftwareRendering -SaveToUserDir -Messaging -ForcedRestart`, nil},
+		{``, nil},
+	}
+	for _, c := range cases {
+		got := userArgs(c.cmd)
+		if len(got) != len(c.want) {
+			t.Errorf("userArgs(%q) = %q, want %q", c.cmd, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("userArgs(%q) = %q, want %q", c.cmd, got, c.want)
+			}
+		}
+	}
+}
+
+func TestSplitCommandLine(t *testing.T) {
+	got := splitCommandLine(`"C:\Program Files\x.exe"  a "b c" d""e "say ""hi"""`)
+	want := []string{`C:\Program Files\x.exe`, "a", "b c", "de", `say "hi"`}
+	if len(got) != len(want) {
+		t.Fatalf("got %q", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	}
+}

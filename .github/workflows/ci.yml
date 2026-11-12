@@ -1,0 +1,102 @@
+name: Build and test
+
+on:
+  push:
+    paths-ignore:
+      - '**.md'
+      - 'ci/egl-probe.ps1'
+      - '.github/workflows/egl-probe.yml'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit and browser tests (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet (Linux and Windows)
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          GOOS=windows go vet ./...
+      - name: Test
+        # The checkout driver is exercised in a real Chrome against a
+        # stand-in for Epic's store.
+        run: go test ./... -count=1 -race
+
+  windows:
+    name: Build and try on Windows with the real launcher
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: go test ./... -count=1
+      - name: Build
+        shell: pwsh
+        run: |
+          $v = "0.1.$env:GITHUB_RUN_NUMBER"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          go build -trimpath -ldflags "-H=windowsgui -s -w -X main.version=$v" -o dist/EpicAutoClaim.exe ./cmd/epicautoclaim
+          # Same program with a console, for the checks below.
+          go build -trimpath -ldflags "-X main.version=$v" -o "$env:RUNNER_TEMP/eac-console.exe" ./cmd/epicautoclaim
+          Get-Item dist/EpicAutoClaim.exe | Format-List Name, Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EpicAutoClaim
+          path: dist/EpicAutoClaim.exe
+          if-no-files-found: error
+      - name: Install the Epic Games Launcher
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $msi = "$env:RUNNER_TEMP\EpicInstaller.msi"
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/installer/download/EpicGamesLauncherInstaller.msi' -OutFile $msi
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -PassThru
+          if (-not $p.WaitForExit(600000)) { throw 'installer timed out' }
+          "msiexec exit code $($p.ExitCode)"
+      - name: Free-games list
+        shell: pwsh
+        run: '& "$env:RUNNER_TEMP/eac-console.exe" check'
+      - name: Hidden launcher trial (fresh install - the launcher wants to update itself)
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP/eac-console.exe" doctor --launch
+          if ($LASTEXITCODE -ne 0) { throw "doctor failed with $LASTEXITCODE" }
+      - name: Hidden launcher trial (launcher up to date)
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP/eac-console.exe" doctor --launch
+          if ($LASTEXITCODE -ne 0) { throw "doctor failed with $LASTEXITCODE" }
+      - name: One real round (launcher is not signed in here, so nothing can be claimed)
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP/eac-console.exe" once
+          "exit code $LASTEXITCODE"
+          & "$env:RUNNER_TEMP/eac-console.exe" status
+      - name: Nothing left running
+        if: always()
+        shell: pwsh
+        run: |
+          Start-Sleep -Seconds 3
+          $left = Get-CimInstance Win32_Process | Where-Object { $_.Name -in 'EpicGamesLauncher.exe', 'EpicWebHelper.exe' }
+          $left | Select-Object ProcessId, Name, CommandLine | Format-List
+          if ($left) { throw "launcher processes were left behind" }
+      - name: Program log
+        if: always()
+        shell: pwsh
+        run: |
+          $log = "$env:LOCALAPPDATA\EpicAutoClaim\logs\EpicAutoClaim.log"
+          if (Test-Path $log) { Get-Content $log } else { 'no log file' }
+          Get-ChildItem "$env:LOCALAPPDATA\EpicAutoClaim" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName, Length | Format-Table -AutoSize

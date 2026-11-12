@@ -3,6 +3,7 @@
 package launcher
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -14,6 +15,7 @@ import (
 
 	"golang.org/x/sys/windows/registry"
 
+	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/cdp"
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/win"
 )
 
@@ -21,10 +23,11 @@ import (
 type Install struct {
 	Exe string // full path of EpicGamesLauncher.exe
 	Dir string // its folder, used as the working directory
+	Gen Generation
 }
 
 // ErrNotInstalled is returned when the launcher cannot be found.
-var ErrNotInstalled = errors.New("the Epic Games Launcher is not installed (EpicGamesLauncher.exe was not found)")
+var ErrNotInstalled = errors.New("the Epic Games Launcher was not found on this PC")
 
 func fileExists(p string) bool {
 	st, err := os.Stat(p)
@@ -44,12 +47,18 @@ func regString(root registry.Key, path, name string, access uint32) string {
 	return v
 }
 
-// uninstallRoots returns the install roots recorded by the launcher's
-// installer under the "Uninstall" registry keys.
-func uninstallRoots() []string {
+var bothViews = []uint32{registry.WOW64_64KEY, registry.WOW64_32KEY}
+
+// installRoots returns the folders the launcher's installer recorded.
+func installRoots() []string {
 	var out []string
+	for _, view := range bothViews {
+		if dir := regString(registry.LOCAL_MACHINE, `SOFTWARE\EpicGames\Unreal Engine`, "INSTALLDIR", view); dir != "" {
+			out = append(out, dir)
+		}
+	}
 	const base = `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`
-	for _, view := range []uint32{registry.WOW64_32KEY, registry.WOW64_64KEY} {
+	for _, view := range bothViews {
 		k, err := registry.OpenKey(registry.LOCAL_MACHINE, base, registry.ENUMERATE_SUB_KEYS|view)
 		if err != nil {
 			continue
@@ -69,19 +78,19 @@ func uninstallRoots() []string {
 }
 
 // Locate finds the launcher. override, when set, is the path from the
-// configuration file and must point at EpicGamesLauncher.exe.
+// settings file and must point at EpicGamesLauncher.exe.
 func Locate(override string) (Install, error) {
 	if override = strings.TrimSpace(override); override != "" {
 		if !isLauncherExe(override) || !fileExists(override) {
 			return Install{}, fmt.Errorf("launcherPath %q is not an existing %s", override, ExeName)
 		}
-		return Install{Exe: override, Dir: filepath.Dir(override)}, nil
+		return Install{Exe: override, Dir: filepath.Dir(override), Gen: generationOf(override)}, nil
 	}
 
 	var candidates []string
 	add := func(p string) {
 		if p != "" {
-			candidates = append(candidates, p)
+			candidates = append(candidates, strings.ReplaceAll(p, "/", `\`))
 		}
 	}
 
@@ -97,20 +106,30 @@ func Locate(override string) (Install, error) {
 	add(exeFromCommand(regString(registry.CLASSES_ROOT, `com.epicgames.launcher\shell\open\command`, "", 0)))
 	// 3. The "run when my computer starts" entry.
 	add(exeFromCommand(regString(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, "EpicGamesLauncher", 0)))
-	// 4. The installer's uninstall record.
-	for _, root := range uninstallRoots() {
-		candidates = append(candidates, exeUnder(root)...)
-	}
-	// 5. The default locations.
-	for _, env := range []string{"ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"} {
-		if base := os.Getenv(env); base != "" {
-			candidates = append(candidates, exeUnder(base+`\Epic Games`)...)
+	// 4. What Epic Online Services recorded.
+	add(regString(registry.CURRENT_USER, `Software\Epic Games\EOS`, "ModSdkCommand", 0))
+	// 5. The installer's records.
+	for _, root := range installRoots() {
+		for _, c := range exeUnder(root) {
+			add(c)
 		}
+	}
+	// 6. The default locations (64-bit folder since launcher 20, x86 before).
+	for _, env := range []string{"ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"} {
+		if base := os.Getenv(env); base != "" {
+			for _, c := range exeUnder(base + `\Epic Games`) {
+				add(c)
+			}
+		}
+	}
+	// 7. The new-generation launcher installs per user.
+	if local, err := win.LocalAppData(); err == nil {
+		add(local + `\Epic Games\Launcher\` + ExeName)
 	}
 
 	for _, c := range candidates {
 		if isLauncherExe(c) && fileExists(c) {
-			return Install{Exe: c, Dir: filepath.Dir(c)}, nil
+			return Install{Exe: c, Dir: filepath.Dir(c), Gen: generationOf(c)}, nil
 		}
 	}
 	return Install{}, ErrNotInstalled
@@ -118,7 +137,7 @@ func Locate(override string) (Install, error) {
 
 // manifestDir is where the launcher records the games it has installed.
 func manifestDir() string {
-	for _, view := range []uint32{registry.WOW64_32KEY, registry.WOW64_64KEY} {
+	for _, view := range bothViews {
 		if p := regString(registry.LOCAL_MACHINE, `SOFTWARE\Epic Games\EpicGamesLauncher`, "AppDataPath", view); p != "" {
 			return filepath.Join(p, "Manifests")
 		}
@@ -143,14 +162,15 @@ type Activity struct {
 
 // helperNames are the launcher's own child processes.
 var helperNames = map[string]bool{
-	"epicwebhelper.exe":       true,
-	"unrealcefsubprocess.exe": true,
+	"epicwebhelper.exe":                     true,
+	"unrealcefsubprocess.exe":               true,
+	"eosoverlayrenderer-win64-shipping.exe": true,
+	"msedgewebview2.exe":                    true,
 }
 
 // Inspect reports whether the launcher is running and whether the user (or
-// a download) is using it. exclude lists processes to ignore: the hidden
-// instance this program itself started.
-func Inspect(exclude map[uint32]bool) Activity {
+// a download) is using it.
+func Inspect() Activity {
 	var a Activity
 	procs, err := win.Processes()
 	if err != nil {
@@ -158,10 +178,16 @@ func Inspect(exclude map[uint32]bool) Activity {
 		return Activity{Running: true, Busy: true, Reason: "could not list processes: " + err.Error()}
 	}
 	tree := map[uint32]bool{}
+	var transfer []uint32
 	for _, p := range procs {
-		if !exclude[p.PID] && strings.EqualFold(p.Name, ExeName) {
+		if strings.EqualFold(p.Name, ExeName) {
 			a.PIDs = append(a.PIDs, p.PID)
 			tree[p.PID] = true
+			transfer = append(transfer, p.PID)
+		}
+		// Since launcher 20 downloads run in this service-side helper.
+		if strings.EqualFold(p.Name, "EpicOnlineServicesHost.exe") {
+			transfer = append(transfer, p.PID)
 		}
 	}
 	if len(a.PIDs) == 0 {
@@ -169,7 +195,7 @@ func Inspect(exclude map[uint32]bool) Activity {
 	}
 	a.Running = true
 	for _, p := range procs {
-		if !exclude[p.PID] && tree[p.PPID] && helperNames[strings.ToLower(p.Name)] {
+		if tree[p.PPID] && helperNames[strings.ToLower(p.Name)] {
 			tree[p.PID] = true
 		}
 	}
@@ -202,9 +228,10 @@ func Inspect(exclude map[uint32]bool) Activity {
 		}
 	}
 
-	// Heavy disk/network traffic means a download or install is in progress.
+	// Heavy disk/network traffic means a download, install or cloud-save
+	// sync is in progress.
 	before := map[uint32]uint64{}
-	for pid := range tree {
+	for _, pid := range transfer {
 		if n, ok := win.IOBytes(pid); ok {
 			before[pid] = n
 		}
@@ -217,17 +244,16 @@ func Inspect(exclude map[uint32]bool) Activity {
 		}
 	}
 	if delta > 6<<20 {
-		a.Busy, a.Reason = true, fmt.Sprintf("the launcher is transferring data (%d MB in 3s): a download or install seems to be in progress", delta>>20)
+		a.Busy, a.Reason = true, fmt.Sprintf("the launcher is transferring data (%d MB in 3 s): a download, install or save-sync seems to be in progress", delta>>20)
 	}
 	return a
 }
 
-// StopUserInstance ends the launcher the user left running in the tray, so
-// that a private hidden instance can take its place for a moment.
-func StopUserInstance(a Activity) {
+// killLaunchers ends the given launcher processes and their browser helpers.
+func killLaunchers(pids []uint32) {
 	procs, _ := win.Processes()
 	tree := map[uint32]bool{}
-	for _, pid := range a.PIDs {
+	for _, pid := range pids {
 		tree[pid] = true
 	}
 	var helpers []uint32
@@ -236,19 +262,35 @@ func StopUserInstance(a Activity) {
 			helpers = append(helpers, p.PID)
 		}
 	}
-	for _, pid := range a.PIDs {
+	for _, pid := range pids {
 		_ = win.Terminate(pid)
 	}
 	for _, pid := range helpers {
 		_ = win.Terminate(pid)
 	}
+}
+
+func launcherRunning() bool {
+	procs, err := win.Processes()
+	if err != nil {
+		return true
+	}
+	for _, p := range procs {
+		if strings.EqualFold(p.Name, ExeName) {
+			return true
+		}
+	}
+	return false
+}
+
+// StopUserInstance ends the launcher the user left idle in the tray, so that
+// a private hidden instance can take its place for a moment.
+func StopUserInstance(a Activity) {
+	killLaunchers(a.PIDs)
 	// Give Windows a moment to release the launcher's files and its
 	// single-instance lock.
 	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if !Inspect(nil).Running {
-			break
-		}
+	for time.Now().Before(deadline) && launcherRunning() {
 		time.Sleep(300 * time.Millisecond)
 	}
 	time.Sleep(1500 * time.Millisecond)
@@ -258,113 +300,158 @@ func StopUserInstance(a Activity) {
 // program. With silent it goes straight to the tray, as it does at login.
 func StartForUser(inst Install, silent bool, extraArgs []string) error {
 	args := append([]string{}, extraArgs...)
-	if silent {
+	if silent && inst.Gen == Legacy {
 		args = append(args, "-silent")
 	}
 	return win.StartDetached(inst.Exe, args, inst.Dir)
 }
 
-// FreePort picks a free TCP port on localhost.
+// FreePort picks a free TCP port on localhost that the launcher's embedded
+// browser accepts for DevTools (1024..65534).
 func FreePort() (int, error) {
-	l, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
+	for i := 0; i < 20; i++ {
+		l, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			return 0, err
+		}
+		port := l.Addr().(*net.TCPAddr).Port
+		l.Close()
+		if port >= 1024 && port <= 65534 {
+			return port, nil
+		}
 	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port, nil
+	return 0, errors.New("no usable local port found")
 }
-
-// Hide modes.
-const (
-	// ModeDesktop runs the launcher on a private desktop that is never
-	// displayed. Nothing of it can appear on screen.
-	ModeDesktop = "desktop"
-	// ModeTray starts the launcher minimised to the tray ("-silent") on the
-	// normal desktop and hides any window it tries to show.
-	ModeTray = "tray"
-)
 
 const desktopName = "EpicAutoClaim"
 
 // Instance is a hidden launcher started by this program.
+//
+// It lives on a private Windows desktop that is never displayed: nothing it
+// draws can reach the screen, the taskbar or the tray, and it cannot take
+// the keyboard focus.
 type Instance struct {
 	Port int
-	Mode string
 
 	inst    Install
+	flag    string // the DevTools switch, unique to this instance
+	env     []string
 	proc    *win.Process
 	desktop *win.Desktop
 
-	guardStop chan struct{}
-	guardDone sync.WaitGroup
+	mu      sync.Mutex
+	flagged map[uint32]bool
 }
 
 // StartHidden starts the launcher invisibly with its embedded browser's
 // DevTools endpoint on the given localhost port.
-func StartHidden(inst Install, port int, mode string) (*Instance, error) {
-	in := &Instance{Port: port, Mode: mode, inst: inst}
-	args := []string{fmt.Sprintf("-cefdebug=%d", port)}
-	switch mode {
-	case ModeTray:
-		args = append(args, "-silent")
-		proc, err := win.Start(inst.Exe, args, inst.Dir, "")
-		if err != nil {
-			return nil, err
-		}
-		in.proc = proc
-		in.guardStop = make(chan struct{})
-		in.guardDone.Add(1)
-		go in.guard()
-	default:
-		in.Mode = ModeDesktop
-		d, err := win.NewDesktop(desktopName)
-		if err != nil {
-			return nil, err
-		}
-		proc, err := win.Start(inst.Exe, args, inst.Dir, d.Name)
-		if err != nil {
-			d.Close()
-			return nil, err
-		}
-		in.desktop, in.proc = d, proc
+func StartHidden(inst Install, port int) (*Instance, error) {
+	in := &Instance{Port: port, inst: inst, flagged: map[uint32]bool{}}
+	args, env, flag := debugArgs(inst.Gen, port)
+	in.flag, in.env = flag, env
+	d, err := win.NewDesktop(desktopName)
+	if err != nil {
+		return nil, err
 	}
+	proc, err := win.Start(inst.Exe, args, inst.Dir, d.Name, env)
+	if err != nil {
+		d.Close()
+		return nil, err
+	}
+	in.desktop, in.proc = d, proc
 	return in, nil
 }
 
-// guard keeps the tray-mode launcher off the screen: any window it shows is
-// hidden again at once.
-func (in *Instance) guard() {
-	defer in.guardDone.Done()
-	t := time.NewTicker(60 * time.Millisecond)
-	defer t.Stop()
-	for {
-		select {
-		case <-in.guardStop:
-			return
-		case <-t.C:
-			pids := in.proc.PIDs()
-			if len(pids) == 0 {
-				continue
-			}
-			for _, w := range win.Windows() {
-				if pids[w.PID] && w.Visible {
-					win.HideWindow(w.HWND)
-				}
-			}
-		}
+// Summon asks the hidden launcher to bring up its main interface, exactly
+// as a second start of the launcher does for a user whose launcher sits in
+// the tray. The window appears on the private desktop only.
+func (in *Instance) Summon() error {
+	if in.proc == nil {
+		return errors.New("hidden launcher is not running")
 	}
+	_, err := in.proc.Spawn(in.inst.Exe, nil, in.inst.Dir, in.desktop.Name, in.env)
+	return err
 }
 
-// PIDs are the processes of the hidden launcher.
-func (in *Instance) PIDs() map[uint32]bool { return in.proc.PIDs() }
+// isMine reports whether a launcher process belongs to this instance: it is
+// in the instance's job, or carries its unique DevTools switch (the launcher
+// re-executes itself at start-up, keeping its arguments).
+func (in *Instance) isMine(pid uint32, job map[uint32]bool) (mine, known bool) {
+	if job[pid] {
+		return true, true
+	}
+	in.mu.Lock()
+	v, ok := in.flagged[pid]
+	in.mu.Unlock()
+	if ok {
+		return v, true
+	}
+	cmd := win.CommandLine(pid)
+	if cmd == "" {
+		return false, false // gone already, or not readable: cannot tell
+	}
+	v = in.flag != "" && strings.Contains(cmd, in.flag)
+	if !v && strings.Contains(cmd, "-Commandlet=") {
+		// The launcher's own maintenance runs (self-update install) are
+		// neither this instance nor the user asking for the launcher.
+		return false, false
+	}
+	in.mu.Lock()
+	in.flagged[pid] = v
+	in.mu.Unlock()
+	return v, true
+}
 
-// Alive reports whether the hidden launcher is still running.
-func (in *Instance) Alive() bool { return in.proc.Alive() }
+// launchers splits the running launcher processes into this instance's own
+// and those started by someone else.
+func (in *Instance) launchers() (mine, foreign []win.ProcInfo) {
+	procs, err := win.Processes()
+	if err != nil || in.proc == nil {
+		return nil, nil
+	}
+	job := in.proc.PIDs()
+	for _, p := range procs {
+		if !strings.EqualFold(p.Name, ExeName) {
+			continue
+		}
+		m, known := in.isMine(p.PID, job)
+		switch {
+		case m:
+			mine = append(mine, p)
+		case known:
+			foreign = append(foreign, p)
+		}
+	}
+	return mine, foreign
+}
 
-// VisibleWindows returns launcher windows that are showing on the user's
-// desktop. It must always be empty; it exists so that this can be verified.
-func (in *Instance) VisibleWindows() []win.Window {
+// Alive reports whether the hidden launcher is running.
+func (in *Instance) Alive() bool {
+	mine, _ := in.launchers()
+	return len(mine) > 0
+}
+
+// Foreign returns launcher processes started by someone else while the
+// hidden instance runs: the user (or a game shortcut) asking for the
+// launcher. Such a start is silently absorbed by the hidden instance, so the
+// caller should step aside and start the launcher for the user.
+func (in *Instance) Foreign() []win.ProcInfo {
+	_, foreign := in.launchers()
+	return foreign
+}
+
+// OnUserDesktop returns windows of the hidden launcher that are showing on
+// the desktop the user sees. It must always be empty; it exists so that
+// this can be verified, and corrected if it ever is not.
+func (in *Instance) OnUserDesktop() []win.Window {
+	if in.proc == nil {
+		return nil
+	}
 	pids := in.proc.PIDs()
+	mine, _ := in.launchers()
+	for _, p := range mine {
+		pids[p.PID] = true
+	}
 	var out []win.Window
 	for _, w := range win.Windows() {
 		if pids[w.PID] && w.Visible {
@@ -374,46 +461,205 @@ func (in *Instance) VisibleWindows() []win.Window {
 	return out
 }
 
+// HiddenWindows lists the launcher's windows on the private desktop.
+func (in *Instance) HiddenWindows() []win.Window {
+	if in.desktop == nil {
+		return nil
+	}
+	return in.desktop.Windows()
+}
+
 // Stop shuts the hidden launcher down: first by asking its windows to close,
 // then, after the grace period, by ending its processes.
 func (in *Instance) Stop(grace time.Duration) {
 	if in == nil || in.proc == nil {
 		return
 	}
-	if in.guardStop != nil {
-		close(in.guardStop)
-		in.guardDone.Wait()
-		in.guardStop = nil
-	}
-	if in.desktop != nil && grace > 0 && in.proc.Alive() {
-		if n, err := in.desktop.RequestClose(in.proc.PIDs()); err == nil && n > 0 {
-			in.proc.WaitExit(grace)
+	mine, _ := in.launchers()
+	if grace > 0 && len(mine) > 0 {
+		pids := in.proc.PIDs()
+		for _, p := range mine {
+			pids[p.PID] = true
 		}
+		if n, err := in.desktop.RequestClose(pids); err == nil && n > 0 {
+			deadline := time.Now().Add(grace)
+			for time.Now().Before(deadline) && in.Alive() {
+				time.Sleep(250 * time.Millisecond)
+			}
+		}
+	}
+	// Whatever is left, including a re-executed launcher that slipped out
+	// of the job.
+	if mine, _ = in.launchers(); len(mine) > 0 {
+		pids := make([]uint32, 0, len(mine))
+		for _, p := range mine {
+			pids = append(pids, p.PID)
+		}
+		killLaunchers(pids)
 	}
 	in.proc.Kill()
 	in.proc.WaitExit(5 * time.Second)
 	in.proc.Close()
 	in.proc = nil
-	if in.desktop != nil {
-		in.desktop.Close()
-		in.desktop = nil
+	in.desktop.Close()
+	in.desktop = nil
+}
+
+// WaitDevTools waits for the hidden launcher's DevTools endpoint. exited is
+// true when the launcher went away instead (it closes itself when it wants
+// to install an update of its own).
+func (in *Instance) WaitDevTools(ctx context.Context, timeout time.Duration) (up, exited bool) {
+	base := cdp.Base(in.Port)
+	deadline := time.Now().Add(timeout)
+	var goneSince time.Time
+	for {
+		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		_, err := cdp.Version(cctx, base)
+		cancel()
+		if err == nil {
+			return true, false
+		}
+		if ctx.Err() != nil {
+			return false, false
+		}
+		if in.Alive() {
+			goneSince = time.Time{}
+		} else {
+			if goneSince.IsZero() {
+				goneSince = time.Now()
+			}
+			// The launcher re-executes itself while starting; only a
+			// lasting absence counts.
+			if time.Since(goneSince) > 8*time.Second {
+				return false, true
+			}
+		}
+		if time.Now().After(deadline) {
+			return false, false
+		}
+		select {
+		case <-ctx.Done():
+			return false, false
+		case <-time.After(400 * time.Millisecond):
+		}
 	}
 }
 
-// Foreign returns launcher processes that were started by someone else while
-// the hidden instance runs: the user (or a game shortcut) asking for the
-// launcher.
-func (in *Instance) Foreign() []win.ProcInfo {
-	procs, err := win.Processes()
-	if err != nil {
-		return nil
+// UpdateRun lets the launcher install its own pending update. That cannot
+// happen on the private desktop (the updater does not start there), so for
+// this one step the launcher runs on the normal desktop in its own
+// start-in-tray mode, in which it shows no window; any window it or its
+// updater shows regardless is hidden again at once.
+func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) error {
+	if inst.Gen != Legacy {
+		return errors.New("self-update handling is only known for the classic launcher")
 	}
-	mine := in.proc.PIDs()
-	var out []win.ProcInfo
-	for _, p := range procs {
-		if strings.EqualFold(p.Name, ExeName) && !mine[p.PID] {
-			out = append(out, p)
+	port, err := FreePort()
+	if err != nil {
+		return err
+	}
+	args, env, flag := debugArgs(inst.Gen, port)
+	proc, err := win.Start(inst.Exe, args, inst.Dir, "", env)
+	if err != nil {
+		return err
+	}
+	defer proc.Close()
+
+	stopGuard := make(chan struct{})
+	var guardDone sync.WaitGroup
+	guardDone.Add(1)
+	go func() {
+		defer guardDone.Done()
+		t := time.NewTicker(40 * time.Millisecond)
+		defer t.Stop()
+		names := map[uint32]bool{}
+		refresh := time.Time{}
+		for {
+			select {
+			case <-stopGuard:
+				return
+			case <-t.C:
+				if time.Since(refresh) > 500*time.Millisecond {
+					refresh = time.Now()
+					names = map[uint32]bool{}
+					if procs, err := win.Processes(); err == nil {
+						for _, p := range procs {
+							if strings.EqualFold(p.Name, ExeName) || strings.EqualFold(p.Name, "EpicGamesUpdater.exe") {
+								names[p.PID] = true
+							}
+						}
+					}
+				}
+				for _, w := range win.Windows() {
+					if names[w.PID] && w.Visible {
+						win.HideWindow(w.HWND)
+					}
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(stopGuard)
+		guardDone.Wait()
+	}()
+
+	// The update is finished when the (restarted) launcher is back with its
+	// DevTools endpoint up.
+	base := cdp.Base(port)
+	deadline := time.Now().Add(10 * time.Minute)
+	ok := false
+	for time.Now().Before(deadline) && ctx.Err() == nil {
+		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		_, verr := cdp.Version(cctx, base)
+		cancel()
+		if verr == nil {
+			ok = true
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
 		}
 	}
-	return out
+	if ok {
+		// Let it settle (it writes its state right after starting).
+		select {
+		case <-ctx.Done():
+		case <-time.After(6 * time.Second):
+		}
+	}
+
+	// End every launcher that carries this run's switch, wherever the
+	// updater started it from.
+	var mine []uint32
+	if procs, err := win.Processes(); err == nil {
+		for _, p := range procs {
+			if strings.EqualFold(p.Name, ExeName) && strings.Contains(win.CommandLine(p.PID), flag) {
+				mine = append(mine, p.PID)
+			}
+		}
+	}
+	killLaunchers(mine)
+	proc.Kill()
+	stop := time.Now().Add(10 * time.Second)
+	for time.Now().Before(stop) && launcherRunning() {
+		time.Sleep(300 * time.Millisecond)
+	}
+	time.Sleep(1500 * time.Millisecond)
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if !ok {
+		return errors.New("the launcher did not come back from its update within 10 minutes")
+	}
+	logf("the launcher finished updating itself")
+	return nil
+}
+
+// UserArgs extracts, from the command line of a launcher start made by the
+// user, the arguments worth repeating (in practice a com.epicgames.launcher://
+// link from a game shortcut).
+func UserArgs(commandLine string) []string {
+	return userArgs(commandLine)
 }
