@@ -1,0 +1,31 @@
+name: Launcher probe (Windows)
+
+# Installs the real Epic Games Launcher on a Windows runner and checks the
+# behaviours the claimer relies on (hidden start, DevTools endpoint).
+# No account is signed in.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ci/egl-probe.ps1'
+      - '.github/workflows/egl-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe the launcher
+        shell: pwsh
+        run: ./ci/egl-probe.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: egl-probe
+          path: ${{ runner.temp }}/egl-probe/*.log
+          if-no-files-found: ignore
