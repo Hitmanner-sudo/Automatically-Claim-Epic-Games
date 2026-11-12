@@ -40,6 +40,13 @@ type scenario struct {
 	NewPrice     string `json:"newPrice"`     // price shown by the new layout (default "$0.00")
 	NoFreeText   bool   `json:"noFreeText"`   // new layout without the "This is free" sentence
 	Throttled    bool   `json:"throttled"`    // "unable to download any more free games"
+	// DirectBlocked makes the checkout refuse to open unless it is reached
+	// from the store page (as when only the launcher's own flow works).
+	DirectBlocked bool   `json:"directBlocked"`
+	ProductLabel  string `json:"productLabel"` // the store page's main button (default "Get")
+	ProductGate   bool   `json:"productGate"`  // a "Continue" notice covers the store page first
+	// OnDirect is called when the checkout address is opened directly.
+	OnDirect func(offers string) `json:"-"`
 }
 
 func intp(i int) *int { return &i }
@@ -66,6 +73,7 @@ func newMockStore(t *testing.T, sc scenario) *mockStore {
 	m := &mockStore{t: t, sc: sc, owned: sc.Owned, cookie: fmt.Sprintf("sess%d", mockSeq)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/purchase", m.handleCheckout)
+	mux.HandleFunc("/store/product/", m.handleProduct)
 	mux.HandleFunc("/purchase/order-preview", m.handlePreview)
 	mux.HandleFunc("/purchase/confirm-order", m.handleConfirm)
 	mux.HandleFunc("/checkout/api/complete", m.handleConfirm)
@@ -197,6 +205,16 @@ func (m *mockStore) handleCheckout(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	m.lastOffers = r.URL.Query().Get("offers")
 	m.mu.Unlock()
+	if r.URL.Query().Get("via") != "store" {
+		if m.sc.OnDirect != nil {
+			m.sc.OnDirect(r.URL.Query().Get("offers"))
+		}
+		if m.sc.DirectBlocked {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, errorPage)
+			return
+		}
+	}
 	if !strings.HasPrefix(r.URL.Query().Get("offers"), "1-") {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = io.WriteString(w, errorPage)
@@ -343,3 +361,30 @@ btn.addEventListener('click', function (ev) {
   submit();
 });
 </script></body></html>`
+
+// handleProduct serves a game's store page: a main button that, like the
+// launcher's store, opens the checkout in a window of its own.
+func (m *mockStore) handleProduct(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	label := m.sc.ProductLabel
+	if label == "" {
+		label = "Get"
+	}
+	gate := ""
+	if m.sc.ProductGate {
+		gate = `<div id="gate" style="position:fixed;left:0;top:0;right:0;bottom:0;background:#000;z-index:5"><p>This game contains mature content recommended only for ages 18+</p><button id="gate-ok" style="width:160px;height:40px">Continue</button></div>
+<script>document.getElementById('gate-ok').onclick = function () { document.getElementById('gate').remove(); };</script>`
+	}
+	_, _ = io.WriteString(w, `<!doctype html><html><head><title>Flotsam | Store</title></head><body style="margin:0;background:#101014;color:#fff">
+<h1>Flotsam</h1>
+<aside><button data-testid="purchase-cta-button" id="cta" style="width:220px;height:48px">`+label+`</button>
+<button aria-label="Add to Cart" style="width:220px;height:48px">Add To Cart</button></aside>
+`+gate+`
+<script>
+window.presses = 0;
+document.getElementById('cta').addEventListener('click', function () {
+  window.presses++;
+  if (/^get$/i.test(this.textContent)) window.open('/purchase?highlightColor=0078f2&offers=1-ns-id&via=store');
+});
+</script></body></html>`)
+}

@@ -151,3 +151,17 @@ func TestSplitCommandLine(t *testing.T) {
 		}
 	}
 }
+
+func TestStoreLinks(t *testing.T) {
+	got := StoreLinks("p", "flotsam-266287")
+	if len(got) != 2 || got[0] != "com.epicgames.launcher://store/product/flotsam-266287" || got[1] != "com.epicgames.launcher://store/p/flotsam-266287" {
+		t.Errorf("game links = %q", got)
+	}
+	got = StoreLinks("bundles", "lisa-the-definitive-edition")
+	if len(got) != 2 || got[0] != "com.epicgames.launcher://store/bundles/lisa-the-definitive-edition" {
+		t.Errorf("bundle links = %q", got)
+	}
+	if StoreLinks("p", "") != nil {
+		t.Error("no slug, no links")
+	}
+}

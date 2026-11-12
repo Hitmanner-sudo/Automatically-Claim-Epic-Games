@@ -365,11 +365,15 @@ func StartHidden(inst Install, port int) (*Instance, error) {
 // Summon asks the hidden launcher to bring up its main interface, exactly
 // as a second start of the launcher does for a user whose launcher sits in
 // the tray. The window appears on the private desktop only.
-func (in *Instance) Summon() error {
+//
+// With a com.epicgames.launcher:// link as argument it also asks the
+// launcher to go to that place (a game's store page, for example), the way
+// a link clicked in a web browser does.
+func (in *Instance) Summon(link ...string) error {
 	if in.proc == nil {
 		return errors.New("hidden launcher is not running")
 	}
-	_, err := in.proc.Spawn(in.inst.Exe, nil, in.inst.Dir, in.desktop.Name, in.env)
+	_, err := in.proc.Spawn(in.inst.Exe, link, in.inst.Dir, in.desktop.Name, in.env)
 	return err
 }
 

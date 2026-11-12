@@ -210,3 +210,19 @@ func userArgs(commandLine string) []string {
 	}
 	return out
 }
+
+// StoreLinks returns the com.epicgames.launcher:// links that make the
+// launcher show a store page, most likely form first. pagePath is "p" for
+// games and "bundles" for bundles.
+func StoreLinks(pagePath, slug string) []string {
+	if slug == "" {
+		return nil
+	}
+	const scheme = "com.epicgames.launcher://store/"
+	if pagePath == "bundles" {
+		return []string{scheme + "bundles/" + slug, scheme + "product/" + slug}
+	}
+	// "product/<slug>" is the form Epic documents; "p/<slug>" mirrors the
+	// store's current web addresses.
+	return []string{scheme + "product/" + slug, scheme + "p/" + slug}
+}

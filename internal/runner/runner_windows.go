@@ -77,6 +77,14 @@ func (r *Runner) startHidden(ctx context.Context, inst launcher.Install) (*launc
 // openSession summons the launcher's interface and attaches to it.
 func (r *Runner) openSession(ctx context.Context, in *launcher.Instance, base string) (*claim.Session, error) {
 	opt := claim.Options{DryRun: r.DryRun, DiagDir: r.DiagDir, Logf: r.Logf}
+	// Fallback route: have the launcher show a game's store page itself.
+	opt.OpenProduct = func(ctx context.Context, o feed.Offer, try int) error {
+		links := launcher.StoreLinks(o.PagePath, o.Slug)
+		if len(links) == 0 {
+			return errors.New("the offer has no store page")
+		}
+		return in.Summon(links[try%len(links)])
+	}
 	var lastErr error
 	// The interface is created when the launcher is asked to show itself.
 	// Ask, wait a while, and ask again if nothing came up.

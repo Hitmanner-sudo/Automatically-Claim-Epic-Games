@@ -83,6 +83,13 @@ type Options struct {
 	// LoginBase is Epic's sign-in site; overridden by tests.
 	LoginBase string
 
+	// OpenProduct, when set, asks the launcher itself to show an offer's
+	// store page (try counts the attempts, starting at 0, so that different
+	// link forms can be tried). It enables the fallback of claiming the way
+	// a person does: on the store page, through the launcher's own
+	// checkout window.
+	OpenProduct func(ctx context.Context, o feed.Offer, try int) error
+
 	UIWait       time.Duration // for the launcher's interface to come up
 	LoginGrace   time.Duration // how long a lone sign-in page is tolerated
 	SettleWait   time.Duration // how long to hold out for an Epic web page
@@ -230,12 +237,149 @@ func surveyTargets(ts []cdp.Target, bases []string) survey {
 type Session struct {
 	base string
 	opt  Options
+	// page is the launcher page currently being driven: the one the session
+	// attached to first (home), or a checkout window the launcher opened.
 	page *cdp.Page
 
 	mu    sync.Mutex
 	watch *orderWatch
 
-	loopDone chan struct{}
+	home *tab
+	tabs []*tab // every attached page, home first
+}
+
+// tab is one attached launcher page with its own request supervision.
+type tab struct {
+	id   string
+	page *cdp.Page
+	done chan struct{}
+}
+
+// fetchPatterns select the requests that pass through this program before
+// they leave the browser (see orderWatch).
+func fetchPatterns() []map[string]any {
+	patterns := []map[string]any{}
+	for _, p := range []string{"*order*", "*Order*", "*checkout*", "*purchase*"} {
+		patterns = append(patterns,
+			map[string]any{"urlPattern": p, "requestStage": "Request"},
+			map[string]any{"urlPattern": p, "requestStage": "Response"},
+		)
+	}
+	return patterns
+}
+
+// attach connects to a launcher page and puts its order-related requests
+// under supervision. A page whose requests cannot be supervised is not used.
+func (s *Session) attach(ctx context.Context, t cdp.Target) (*tab, error) {
+	pctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	page, err := cdp.OpenPage(pctx, t)
+	if err != nil {
+		return nil, fmt.Errorf("attach to launcher page: %w", err)
+	}
+	nt := &tab{id: t.ID, page: page, done: make(chan struct{})}
+	go s.eventLoop(nt)
+	if err := page.Call(pctx, "Page.enable", nil, nil); err != nil {
+		_ = page.Close()
+		<-nt.done
+		return nil, fmt.Errorf("attach to launcher page: %w", err)
+	}
+	if err := page.Call(pctx, "Fetch.enable", map[string]any{"patterns": fetchPatterns()}, nil); err != nil {
+		_ = page.Close()
+		<-nt.done
+		return nil, fmt.Errorf("cannot supervise the checkout's network requests, so nothing will be ordered: %w", err)
+	}
+	s.mu.Lock()
+	s.tabs = append(s.tabs, nt)
+	s.mu.Unlock()
+	return nt, nil
+}
+
+func (s *Session) attached(id string) *tab {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, t := range s.tabs {
+		if t.id == id {
+			return t
+		}
+	}
+	return nil
+}
+
+// goHome drops every page adopted along the way and returns to the page the
+// session started on.
+func (s *Session) goHome() {
+	s.mu.Lock()
+	extra := append([]*tab(nil), s.tabs[1:]...)
+	s.tabs = s.tabs[:1]
+	s.mu.Unlock()
+	for _, t := range extra {
+		_ = t.page.Close()
+		<-t.done
+	}
+	s.page = s.home.page
+}
+
+// isCheckoutURL reports whether an address is one of Epic's checkout pages.
+func isCheckoutURL(raw string, bases []string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	epic := host == "epicgames.com" || strings.HasSuffix(host, ".epicgames.com") || isStoreHost(u.Host, bases)
+	if !epic {
+		for _, b := range bases {
+			if bu, err := url.Parse(b); err == nil && strings.EqualFold(bu.Host, u.Host) {
+				epic = true
+			}
+		}
+	}
+	path := strings.ToLower(u.Path)
+	return epic && (strings.Contains(path, "/purchase") || strings.Contains(path, "/checkout"))
+}
+
+// targetIDs lists the launcher's current pages.
+func (s *Session) targetIDs(ctx context.Context) map[string]bool {
+	out := map[string]bool{}
+	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if targets, err := cdp.Targets(tctx, s.base); err == nil {
+		for _, t := range targets {
+			out[t.ID] = true
+		}
+	}
+	return out
+}
+
+// adoptCheckout looks for a checkout window the launcher has opened by
+// itself (it does so when its store asks for a purchase) and, if there is
+// one for this offer, continues there. known holds the pages that existed
+// before; a page from an earlier attempt is only taken if it shows this
+// very offer.
+func (s *Session) adoptCheckout(ctx context.Context, o feed.Offer, known map[string]bool) bool {
+	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	targets, err := cdp.Targets(tctx, s.base)
+	cancel()
+	if err != nil {
+		return false
+	}
+	for _, t := range targets {
+		if t.Type != "page" || t.WebSocketDebuggerURL == "" || s.attached(t.ID) != nil || !isCheckoutURL(t.URL, s.opt.CheckoutBases) {
+			continue
+		}
+		if known[t.ID] && !strings.Contains(t.URL, o.OfferID) {
+			continue
+		}
+		nt, err := s.attach(ctx, t)
+		if err != nil {
+			s.opt.Logf("%s: a checkout window appeared but could not be used: %v", o.Title, err)
+			continue
+		}
+		s.page = nt.page
+		return true
+	}
+	return false
 }
 
 func sleep(ctx context.Context, d time.Duration) error {
@@ -310,41 +454,28 @@ func Open(ctx context.Context, base string, opt Options) (*Session, error) {
 	}
 
 	opt.Logf("driving launcher page %q (%s)", chosen.Title, trimURL(chosen.URL))
-	pctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	page, err := cdp.OpenPage(pctx, chosen)
+	s := &Session{base: base, opt: opt}
+	home, err := s.attach(ctx, chosen)
 	if err != nil {
-		return nil, fmt.Errorf("attach to launcher page: %w", err)
+		return nil, err
 	}
-	s := &Session{base: base, opt: opt, page: page, loopDone: make(chan struct{})}
-	go s.eventLoop()
-	if err := page.Call(pctx, "Page.enable", nil, nil); err != nil {
-		s.Close()
-		return nil, fmt.Errorf("attach to launcher page: %w", err)
-	}
-	// Every request that could be an order passes through this program
-	// first (see orderWatch), both on its way out and on its way back.
-	patterns := []map[string]any{}
-	for _, p := range []string{"*order*", "*Order*", "*checkout*"} {
-		patterns = append(patterns,
-			map[string]any{"urlPattern": p, "requestStage": "Request"},
-			map[string]any{"urlPattern": p, "requestStage": "Response"},
-		)
-	}
-	if err := page.Call(pctx, "Fetch.enable", map[string]any{"patterns": patterns}, nil); err != nil {
-		s.Close()
-		return nil, fmt.Errorf("cannot supervise the checkout's network requests, so nothing will be ordered: %w", err)
-	}
+	s.home, s.page = home, home.page
 	return s, nil
 }
 
-// Close detaches from the launcher page.
+// Close detaches from the launcher.
 func (s *Session) Close() {
-	if s == nil || s.page == nil {
+	if s == nil {
 		return
 	}
-	_ = s.page.Close()
-	<-s.loopDone
+	s.mu.Lock()
+	tabs := append([]*tab(nil), s.tabs...)
+	s.tabs = nil
+	s.mu.Unlock()
+	for _, t := range tabs {
+		_ = t.page.Close()
+		<-t.done
+	}
 }
 
 func (s *Session) currentWatch() *orderWatch {
@@ -373,13 +504,13 @@ type pausedRequest struct {
 
 // eventLoop answers every paused request. A request the browser has paused
 // stays paused until answered, so this must never block on anything else.
-func (s *Session) eventLoop() {
-	defer close(s.loopDone)
+func (s *Session) eventLoop(t *tab) {
+	defer close(t.done)
 	for {
 		select {
-		case <-s.page.Done():
+		case <-t.page.Done():
 			return
-		case ev := <-s.page.Events():
+		case ev := <-t.page.Events():
 			if ev.Method != "Fetch.requestPaused" {
 				continue
 			}
@@ -387,12 +518,12 @@ func (s *Session) eventLoop() {
 			if json.Unmarshal(ev.Params, &p) != nil || p.RequestID == "" {
 				continue
 			}
-			s.answer(p)
+			s.answer(t.page, p)
 		}
 	}
 }
 
-func (s *Session) answer(p pausedRequest) {
+func (s *Session) answer(page *cdp.Page, p pausedRequest) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	w := s.currentWatch()
@@ -406,13 +537,13 @@ func (s *Session) answer(p pausedRequest) {
 				Body          string `json:"body"`
 				Base64Encoded bool   `json:"base64Encoded"`
 			}
-			if err := s.page.Call(ctx, "Fetch.getResponseBody", id, &body); err == nil {
+			if err := page.Call(ctx, "Fetch.getResponseBody", id, &body); err == nil {
 				w.onResponse(p.Request.Method, p.Request.URL, *p.ResponseStatusCode, decodeBody(body.Body, body.Base64Encoded))
 			} else {
 				w.onResponse(p.Request.Method, p.Request.URL, *p.ResponseStatusCode, nil)
 			}
 		}
-		_ = s.page.Call(ctx, "Fetch.continueRequest", id, nil)
+		_ = page.Call(ctx, "Fetch.continueRequest", id, nil)
 		return
 	}
 
@@ -421,10 +552,10 @@ func (s *Session) answer(p pausedRequest) {
 		allow = w.onRequest(p.Request.Method, p.Request.URL, p.Request.PostData, p.Request.HasPostData)
 	}
 	if allow {
-		_ = s.page.Call(ctx, "Fetch.continueRequest", id, nil)
+		_ = page.Call(ctx, "Fetch.continueRequest", id, nil)
 		return
 	}
-	_ = s.page.Call(ctx, "Fetch.failRequest", map[string]any{"requestId": p.RequestID, "errorReason": "BlockedByClient"}, nil)
+	_ = page.Call(ctx, "Fetch.failRequest", map[string]any{"requestId": p.RequestID, "errorReason": "BlockedByClient"}, nil)
 }
 
 func trimURL(u string) string {
@@ -618,7 +749,12 @@ func (s *Session) Claim(ctx context.Context, o feed.Offer) Result {
 	w := newOrderWatch(s.opt.DryRun)
 	s.setWatch(w)
 	defer s.setWatch(nil)
+	// Whatever window the launcher opens for this offer is left behind
+	// afterwards; the next offer starts from the first page again.
+	defer s.goHome()
 
+	// 1. Open Epic's checkout for the offer directly, at each of the
+	//    addresses it is served under.
 	var res Result
 	var last pageState
 	next := true
@@ -629,11 +765,23 @@ func (s *Session) Claim(ctx context.Context, o feed.Offer) Result {
 		if i > 0 {
 			s.opt.Logf("%s: checkout did not open at %s (%s); trying %s", o.Title, s.opt.CheckoutBases[i-1], res.Detail, base)
 		}
+		s.goHome()
 		res, last, next = s.checkout(ctx, o, w, checkoutURL(base, o), true)
 	}
+	// 2. The same through Epic's sign-in page, which hands an existing web
+	//    session over to the store.
 	if next && ctx.Err() == nil {
 		s.opt.Logf("%s: checkout did not open directly (%s); retrying through Epic's sign-in hand-over", o.Title, res.Detail)
-		res, last, _ = s.checkout(ctx, o, w, s.signInHopURL(o), false)
+		s.goHome()
+		res, last, next = s.checkout(ctx, o, w, s.signInHopURL(o), true)
+	}
+	// 3. The way a person does it: the launcher shows the game's store
+	//    page, "Get" is pressed there, and the launcher opens its own
+	//    checkout window.
+	if next && ctx.Err() == nil && s.opt.OpenProduct != nil && o.Slug != "" {
+		s.opt.Logf("%s: no checkout could be opened directly (%s); going through the game's store page instead", o.Title, res.Detail)
+		s.goHome()
+		res, last = s.viaStorePage(ctx, o, w)
 	}
 	if res.Outcome != Claimed && res.Outcome != Owned {
 		s.saveDiagnostics(o, res, last, w)
@@ -664,6 +812,7 @@ func classifyError(msg string) (Outcome, bool) {
 // checkout at all) and that another address should be tried; res then says
 // why. It is only ever true when mayFallThrough is.
 func (s *Session) checkout(ctx context.Context, o feed.Offer, w *orderWatch, address string, mayFallThrough bool) (res Result, last pageState, tryNext bool) {
+	known := s.targetIDs(ctx)
 	nctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	err := s.page.Navigate(nctx, address)
 	cancel()
@@ -672,13 +821,30 @@ func (s *Session) checkout(ctx context.Context, o feed.Offer, w *orderWatch, add
 	}
 	// A navigation error is not conclusive (redirects can abort the first
 	// request); what the page ends up showing decides.
+	return s.order(ctx, o, w, mayFallThrough, known)
+}
 
+// order takes it from a checkout that is loading (in the current page, or
+// in a window the launcher opens for it) to a placed order.
+func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFallThrough bool, known map[string]bool) (res Result, last pageState, tryNext bool) {
 	// ---- wait for the checkout to be ready
 	deadline := time.Now().Add(s.opt.CheckoutWait)
-	var errorSince, strangerSince time.Time
+	var errorSince, strangerSince, lastAdopt time.Time
+	adopted := false
 	for {
 		if ctx.Err() != nil {
 			return Result{Failed, "interrupted"}, last, false
+		}
+		// The launcher may answer a checkout address by opening its own
+		// checkout window instead of loading it in place.
+		if !adopted && time.Since(lastAdopt) > 2*time.Second {
+			lastAdopt = time.Now()
+			if s.adoptCheckout(ctx, o, known) {
+				adopted = true
+				s.opt.Logf("%s: the launcher opened its own checkout window; continuing there", o.Title)
+				errorSince, strangerSince = time.Time{}, time.Time{}
+				deadline = time.Now().Add(s.opt.CheckoutWait)
+			}
 		}
 		st, ierr := s.inspect(ctx)
 		if ierr == nil {

@@ -701,3 +701,199 @@ func TestParsePageMapping(t *testing.T) {
 		}
 	}
 }
+
+// ---- windows the launcher opens by itself, and the store-page route
+
+// browserCall runs one browser-level DevTools command.
+func browserCall(t *testing.T, base, method string, params any) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	v, err := cdp.Version(ctx, base)
+	if err != nil {
+		t.Errorf("browser version: %v", err)
+		return
+	}
+	c, err := cdp.Dial(ctx, v.WebSocketDebuggerURL)
+	if err != nil {
+		t.Errorf("browser connection: %v", err)
+		return
+	}
+	defer c.Close()
+	if err := c.Call(ctx, method, params, nil); err != nil {
+		t.Errorf("%s: %v", method, err)
+	}
+}
+
+func pageIDs(base string) map[string]bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out := map[string]bool{}
+	targets, _ := cdp.Targets(ctx, base)
+	for _, tg := range targets {
+		if tg.Type == "page" {
+			out[tg.ID] = true
+		}
+	}
+	return out
+}
+
+// closeNewTabs removes the tabs a test opened, so later tests start from
+// the single page again.
+func closeNewTabs(t *testing.T, base string, before map[string]bool) {
+	for id := range pageIDs(base) {
+		if !before[id] {
+			browserCall(t, base, "Target.closeTarget", map[string]any{"targetId": id})
+		}
+	}
+}
+
+func TestFollowsACheckoutWindowTheLauncherOpens(t *testing.T) {
+	// The launcher answers a checkout address by opening its own checkout
+	// window instead of loading it in place: here, the direct address shows
+	// an error, and a new window with the working checkout appears.
+	base := sharedBrowser(t)
+	before := pageIDs(base)
+	defer closeNewTabs(t, base, before)
+	store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), DirectBlocked: true})
+	var once sync.Once
+	store.sc.OnDirect = func(offers string) {
+		once.Do(func() {
+			go browserCall(t, base, "Target.createTarget", map[string]any{"url": store.URL() + "/purchase?offers=" + offers + "&via=store"})
+		})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	s, err := Open(ctx, base, Options{CheckoutBases: []string{store.URL()}, LoginBase: store.URL(), SettleWait: 50 * time.Millisecond, CheckoutWait: 20 * time.Second, OrderWait: 14 * time.Second, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	res := s.Claim(ctx, testOffer())
+	if res.Outcome != Claimed {
+		t.Fatalf("result = %v", res)
+	}
+	if store.orderCount() != 1 {
+		t.Fatalf("orders = %d", store.orderCount())
+	}
+	// Afterwards the session is back on its first page, ready for the next offer.
+	if s.page != s.home.page || len(s.tabs) != 1 {
+		t.Fatalf("session did not return to its first page (%d tabs)", len(s.tabs))
+	}
+}
+
+func storePageOptions(t *testing.T, base string, store *mockStore) Options {
+	return Options{
+		CheckoutBases: []string{store.URL()}, LoginBase: store.URL(),
+		SettleWait: 50 * time.Millisecond, CheckoutWait: 20 * time.Second, OrderWait: 14 * time.Second,
+		Logf: t.Logf,
+		OpenProduct: func(ctx context.Context, o feed.Offer, try int) error {
+			if try == 0 {
+				return errors.New("the launcher did not understand the first link form")
+			}
+			browserCall(t, base, "Target.createTarget", map[string]any{"url": store.URL() + "/store/product/" + o.Slug})
+			return nil
+		},
+	}
+}
+
+func TestClaimsThroughTheStorePage(t *testing.T) {
+	// Neither the direct checkout nor the sign-in hand-over works; the
+	// launcher's own route does: store page (behind a "Continue" notice),
+	// "Get", and a checkout window the launcher opens.
+	base := sharedBrowser(t)
+	before := pageIDs(base)
+	defer closeNewTabs(t, base, before)
+	store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), DirectBlocked: true, ProductGate: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	s, err := Open(ctx, base, storePageOptions(t, base, store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	res := s.Claim(ctx, testOffer())
+	if res.Outcome != Claimed {
+		t.Fatalf("result = %v", res)
+	}
+	if store.orderCount() != 1 {
+		t.Fatalf("orders = %d", store.orderCount())
+	}
+}
+
+func TestStorePagePaidOrderIsStillRefused(t *testing.T) {
+	// The store-page route ends in the same checkout checks: a total above
+	// zero is never ordered.
+	base := sharedBrowser(t)
+	before := pageIDs(base)
+	defer closeNewTabs(t, base, before)
+	store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$19.99", PreviewTotal: 1999, ConfirmTotal: intp(1999), DirectBlocked: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	s, err := Open(ctx, base, storePageOptions(t, base, store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if res := s.Claim(ctx, testOffer()); res.Outcome != NotFree {
+		t.Fatalf("result = %v", res)
+	}
+	if store.orderCount() != 0 {
+		t.Fatalf("orders = %d", store.orderCount())
+	}
+}
+
+func TestStorePageStates(t *testing.T) {
+	base := sharedBrowser(t)
+	cases := []struct {
+		label  string
+		want   Outcome
+		detail string
+	}{
+		{"In Library", Owned, "in the library"},
+		{"Buy Now", Failed, "Buy Now"},
+		{"$19.99", Failed, "$19.99"},
+		{"Requires Base Game", Unavailable, "base game"},
+		{"Coming Soon", Unavailable, "unavailable"},
+	}
+	for _, c := range cases {
+		before := pageIDs(base)
+		store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), DirectBlocked: true, ProductLabel: c.label})
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+		s, err := Open(ctx, base, storePageOptions(t, base, store))
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		res := s.Claim(ctx, testOffer())
+		s.Close()
+		cancel()
+		closeNewTabs(t, base, before)
+		if res.Outcome != c.want || !strings.Contains(res.Detail, c.detail) {
+			t.Errorf("button %q: result = %v, want %v mentioning %q", c.label, res, c.want, c.detail)
+		}
+		if store.orderCount() != 0 {
+			t.Errorf("button %q: orders = %d", c.label, store.orderCount())
+		}
+	}
+}
+
+func TestIsCheckoutURL(t *testing.T) {
+	bases := []string{"https://launcher.store.epicgames.com", "https://www.epicgames.com/store", "https://store.epicgames.com", "http://127.0.0.1:5555"}
+	for u, want := range map[string]bool{
+		"https://launcher.store.epicgames.com/purchase?offers=1-a-b": true,
+		"https://store.epicgames.com/checkout?purchaseToken=x":       true,
+		"https://www.epicgames.com/store/purchase?offers=1-a-b":      true,
+		"https://payment-website-pci.ol.epicgames.com/purchase?x=1":  true,
+		"http://127.0.0.1:5555/purchase?offers=1-a-b":                true,
+		"https://launcher.store.epicgames.com/store":                 false,
+		"https://store.epicgames.com/en-US/p/flotsam":                false,
+		"https://evil.example/purchase?offers=1-a-b":                 false,
+		"http://127.0.0.1:6666/purchase":                             false,
+		"about:blank":                                                false,
+	} {
+		if got := isCheckoutURL(u, bases); got != want {
+			t.Errorf("isCheckoutURL(%q) = %v, want %v", u, got, want)
+		}
+	}
+}
