@@ -150,6 +150,9 @@ type app struct {
 	log    *logx.Logger
 	st     *state.Store
 	out    io.Writer
+	// again: a manual run that goes through the checkout also for games
+	// the account already has (see claim.Options.Again).
+	again bool
 }
 
 func country(cfg config.Config) string {
@@ -191,6 +194,7 @@ func (a *app) runner() *runner.Runner {
 		LauncherPath:        a.cfg.LauncherPath,
 		RestartIdleLauncher: a.cfg.RestartIdleLauncher,
 		DryRun:              a.cfg.DryRun,
+		Again:               a.again,
 		Logf:                a.log.Printf,
 	}
 	if a.cfg.KeepDiagnostics {
@@ -472,12 +476,7 @@ func cmdOnce(a *app, args []string) int {
 			return 2
 		}
 	}
-	if again && !dry {
-		// Going through games that are already dealt with is for looking,
-		// never for ordering.
-		fmt.Fprintf(a.out, "\"--again\" only goes with \"--dry-run\"; nothing was done.\n\n%s", usage)
-		return 2
-	}
+	a.again = again
 	trial := dry && !a.cfg.DryRun
 	if dry {
 		a.cfg.DryRun = true
@@ -559,7 +558,11 @@ func cmdOnce(a *app, args []string) int {
 		}
 		a.st = st
 		defer os.Remove(notes)
-		fmt.Fprintln(a.out, "Rehearsing with everything that is free right now, including what is already in the library; nothing is ordered and nothing is recorded.")
+		if a.cfg.DryRun {
+			fmt.Fprintln(a.out, "Rehearsing with everything that is free right now, including what is already in the library; nothing is ordered and nothing is recorded.")
+		} else {
+			fmt.Fprintln(a.out, "Going through everything that is free right now once more, for real, including what is already in the library.\nFor a game you already have, Epic refuses the order and says so: that answer is what this run is for, and nothing changes.\nA game you do not have yet is claimed as usual. Nothing is recorded.")
+		}
 	}
 
 	d := a.daemon()
@@ -599,6 +602,8 @@ func cmdOnce(a *app, args []string) int {
 		fmt.Fprintln(a.out, "\nStopped before the round was finished.")
 	case trial || dry:
 		fmt.Fprintln(a.out, "\nTrial finished; nothing was ordered.")
+	case again:
+		fmt.Fprintln(a.out, "\nDone. (\"owned: Epic says the account has this already\" below means the whole path works: the button was pressed, the order went out, and Epic answered.)")
 	default:
 		fmt.Fprintf(a.out, "\nDone. The background process would check again at %s.\n", next.Local().Format("Mon 2 Jan 15:04"))
 	}
@@ -1007,6 +1012,8 @@ const usage = `EpicAutoClaim - claims Epic's free games through your Epic Games 
   EpicAutoClaim.exe once         do one round now instead of waiting
   EpicAutoClaim.exe once --dry-run   same, but stop just before placing the order
   EpicAutoClaim.exe once --dry-run --again   rehearse also with games it has dealt with already
+  EpicAutoClaim.exe once --again     prove the whole path: order this week's games again for real
+                                 (Epic refuses what you already have; nothing changes)
   EpicAutoClaim.exe doctor       check the setup; add --launch to try the hidden launcher
   EpicAutoClaim.exe stop         stop the background process (Windows starts it again within the hour, or when you next sign in)
   EpicAutoClaim.exe uninstall    stop it and remove it from Windows' start-up and schedule

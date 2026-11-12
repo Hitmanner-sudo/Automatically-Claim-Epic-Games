@@ -74,6 +74,12 @@ var ErrNotSignedIn = errors.New("the Epic Games Launcher is not signed in (open 
 type Options struct {
 	// DryRun checks everything but does not place orders.
 	DryRun bool
+	// Again goes through the checkout also for an offer the account
+	// already has, instead of stopping at "already in the library". It is
+	// for proving the whole path on a PC: Epic refuses an order for
+	// something the account has (and says so), and nothing changes. Every
+	// safeguard about the price applies as always.
+	Again bool
 	// DiagDir, when set, receives a folder of evidence (screenshot, page,
 	// network notes) for every attempt that did not succeed.
 	DiagDir string
@@ -1529,6 +1535,9 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 	deadline := time.Now().Add(s.opt.CheckoutWait)
 	var errorSince, strangerSince, lastAdopt, checkSeen time.Time
 	adopted, sawBrowserCheck, ownChecked, sawButton := false, false, false, false
+	// ownedBefore: the store says the account has this already, and the
+	// run goes on regardless (Options.Again).
+	ownedBefore := false
 	var evidence []string
 	pre := Unknown
 	for {
@@ -1571,7 +1580,7 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 			switch {
 			case st.Login:
 				return Result{NotSignedIn, "Epic's web sign-in page came up instead of the checkout"}, last, mayFallThrough
-			case st.Owned || w.ownedHint():
+			case (st.Owned || w.ownedHint()) && !(s.opt.Again && st.Place.clickable()):
 				// "Owned" ends all further attempts, so a second opinion is
 				// taken from the store when it will give one.
 				if s.ownership(ctx, st, o) == ownNo {
@@ -1616,7 +1625,11 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 					ownChecked = true
 					switch s.ownership(ctx, st, o) {
 					case ownYes:
-						return Result{Owned, "already in the library"}, last, false
+						if !s.opt.Again {
+							return Result{Owned, "already in the library"}, last, false
+						}
+						ownedBefore = true
+						s.opt.Logf("%s: already in the library; going on all the same, as asked", o.Title)
 					case ownBlocked:
 						return Result{Later, "the store says this account cannot get the offer right now (a required base game is missing, or it conflicts with something owned)"}, last, false
 					}
@@ -1703,6 +1716,9 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 		if err := s.approach(ctx, last.Place, w); err != nil {
 			rehearsal = "but a real run would not have pressed: " + err.Error()
 		}
+		if ownedBefore {
+			rehearsal += " (the game is already in the library)"
+		}
 		return Result{DryRun, fmt.Sprintf("checkout reached and \"%s\" is ready; price check = %v; %s; order not placed (dry run)", last.Place.Text, pre, rehearsal)}, last, false
 	}
 
@@ -1713,6 +1729,9 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 	pressed := *last.Place
 	// Words of thanks that were on the page before the press prove nothing.
 	thanksBefore := last.Success
+	if ownedBefore {
+		s.opt.Logf("%s: pressing %q although the game is in the library: Epic is expected to refuse the order, which is what this run is for", o.Title, last.Place.Text)
+	}
 	// From here on, whatever is sent to where orders are taken is treated
 	// as an order (see orderWatch.onRequest).
 	w.markPressed(pre)
@@ -1849,7 +1868,9 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 				}
 			}
 		}
-		if time.Since(lastOwnCheck) > 4*time.Second {
+		// (Not when the game was in the library before the press: the
+		// library would say "claimed" whatever Epic answers.)
+		if !ownedBefore && time.Since(lastOwnCheck) > 4*time.Second {
 			lastOwnCheck = time.Now()
 			if s.ownership(ctx, last, o) == ownYes {
 				return Result{Claimed, "now in the library"}, last, false

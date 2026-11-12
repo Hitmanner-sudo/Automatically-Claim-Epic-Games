@@ -33,8 +33,10 @@ type Runner struct {
 	LauncherPath        string
 	RestartIdleLauncher bool
 	DryRun              bool
-	DiagDir             string
-	Logf                func(format string, args ...any)
+	// Again: see claim.Options.Again.
+	Again   bool
+	DiagDir string
+	Logf    func(format string, args ...any)
 
 	mu sync.Mutex // one session at a time
 }
@@ -263,7 +265,7 @@ func (r *Runner) bringUp(ctx context.Context, inst launcher.Install, sn *seen) (
 
 // openSession summons the launcher's interface and attaches to it.
 func (r *Runner) openSession(ctx context.Context, in *launcher.Instance, base string) (*claim.Session, error) {
-	opt := claim.Options{DryRun: r.DryRun, DiagDir: r.DiagDir, Logf: r.Logf}
+	opt := claim.Options{DryRun: r.DryRun, Again: r.Again, DiagDir: r.DiagDir, Logf: r.Logf}
 	// Fallback route: have the launcher show a game's store page itself.
 	opt.OpenProduct = func(ctx context.Context, o feed.Offer, try int) error {
 		links := launcher.StoreLinks(o.PagePath, o.Slug)

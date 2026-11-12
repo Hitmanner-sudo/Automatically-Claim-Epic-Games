@@ -53,10 +53,23 @@ jobs:
         run: |
           $v = "0.1.$env:GITHUB_RUN_NUMBER"
           New-Item -ItemType Directory -Force dist | Out-Null
+          # What the file says about itself to Windows (name, version,
+          # manifest): made first, picked up by the linker.
+          go run ./internal/winres/mkres -version $v -o cmd/epicautoclaim/rsrc_windows_amd64.syso
+          if ($LASTEXITCODE -ne 0) { throw 'the resource object could not be made' }
           go build -trimpath -ldflags "-H=windowsgui -s -w -X main.version=$v" -o dist/EpicAutoClaim.exe ./cmd/epicautoclaim
           # Same program with a console, for the checks below.
           go build -trimpath -ldflags "-X main.version=$v" -o "$env:RUNNER_TEMP/eac-console.exe" ./cmd/epicautoclaim
           Get-Item dist/EpicAutoClaim.exe | Format-List Name, Length
+          # Windows itself must be able to read it back.
+          $vi = (Get-Item dist/EpicAutoClaim.exe).VersionInfo
+          $vi | Format-List ProductName, FileDescription, CompanyName, FileVersion, ProductVersion, OriginalFilename, InternalName, LegalCopyright, Comments, Language
+          if ($vi.ProductName -ne 'EpicAutoClaim' -or $vi.FileDescription -ne 'EpicAutoClaim' -or $vi.OriginalFilename -ne 'EpicAutoClaim.exe') { throw "Windows does not read the name of the program from it" }
+          if ($vi.ProductVersion -ne $v -or $vi.FileVersion -ne "$v.0") { throw "Windows reads version $($vi.ProductVersion) / $($vi.FileVersion) from it, want $v" }
+          if ($vi.LegalCopyright -notlike '*Not affiliated*') { throw 'the note that it is unofficial is missing' }
+          # ...and to start it with the manifest it carries.
+          $said = & "$env:RUNNER_TEMP/eac-console.exe" version
+          if ($LASTEXITCODE -ne 0 -or "$said".Trim() -ne $v) { throw "the program did not start and say its version: '$said'" }
       - uses: actions/upload-artifact@v4
         with:
           name: EpicAutoClaim

@@ -77,12 +77,13 @@ From a terminal in that folder:
 | `EpicAutoClaim.exe once` | Does one round now instead of waiting (Ctrl+C stops it cleanly) |
 | `EpicAutoClaim.exe once --dry-run` | Same, but stops just before placing the order |
 | `EpicAutoClaim.exe once --dry-run --again` | The same rehearsal, also for games it has dealt with already; records nothing |
+| `EpicAutoClaim.exe once --again` | Proves the whole path on your PC: orders this week's games again for real. For a game you already have, Epic refuses the order and says so, and nothing changes; records nothing |
 | `EpicAutoClaim.exe doctor --launch` | Starts the launcher hidden for a moment and reports what it found; claims nothing |
 | `EpicAutoClaim.exe stop` | Stops the background process; Windows starts it again within the hour, or when you next sign in |
 | `EpicAutoClaim.exe install` | Installs it, or brings the installation in line with the settings (same as a double-click, without the dialog) |
 | `EpicAutoClaim.exe uninstall` | Stops it and removes it from Windows' start-up programs and Task Scheduler |
 
-A good first test on your own PC is `EpicAutoClaim.exe doctor --launch` followed by `EpicAutoClaim.exe once --dry-run`.
+A good first test on your own PC is `EpicAutoClaim.exe doctor --launch` followed by `EpicAutoClaim.exe once --dry-run`. If this week's game is already in your library, `once --dry-run --again` and then `once --again` show the same thing: the second one ends with "owned: Epic says the account has this already", which means the button was pressed, the order went out and Epic answered.
 
 ## Settings
 

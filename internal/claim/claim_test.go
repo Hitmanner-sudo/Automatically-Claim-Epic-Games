@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -95,6 +96,7 @@ func runScenario(t *testing.T, sc scenario, mod func(*Options)) run {
 	base := sharedBrowser(t)
 	store := newMockStore(t, sc)
 	r := run{store: store, diag: t.TempDir()}
+	var logMu sync.Mutex
 	opt := Options{
 		CheckoutBases: []string{store.URL()}, LoginBase: store.URL(),
 		DiagDir:    r.diag,
@@ -106,6 +108,9 @@ func runScenario(t *testing.T, sc scenario, mod func(*Options)) run {
 		OrderWait:    patience(14 * time.Second),
 		Logf: func(f string, a ...any) {
 			t.Logf(f, a...)
+			logMu.Lock()
+			r.logs = append(r.logs, fmt.Sprintf(f, a...))
+			logMu.Unlock()
 		},
 	}
 	if mod != nil {
@@ -1519,6 +1524,68 @@ func TestPurchaseLimitAnswerMeansAlreadyOwned(t *testing.T) {
 	if !strings.Contains(r.res.Detail, "already") {
 		t.Errorf("detail = %q", r.res.Detail)
 	}
+}
+
+func TestGoingThroughTheCheckoutAgainForAGameAlreadyOwned(t *testing.T) {
+	// The whole path, proved on a game the account already has: Epic's
+	// checkout looks like any other for it, and the order is answered with
+	// "purchase_limit_error". Nothing changes on the account.
+	owned := scenario{SignedIn: true, NewLayout: true, Real2026: true, Owned: true,
+		ConfirmStatus: 404,
+		ConfirmRaw:    `{"errorCode":"errors.com.epicgames.ecommerce.orderprocessor.purchase_limit_error","errorMessage":"Sorry, you already own this item, or it's still being processed.","numericErrorCode":20203,"correlationId":"x"}`}
+
+	// Ordinarily it stops at "already in the library" and presses nothing.
+	r := runScenario(t, owned, nil)
+	wantOutcome(t, r, Owned, 0)
+	if n := r.store.hitCount("place"); n != 0 {
+		t.Fatalf("pressed %d time(s) for a game already owned", n)
+	}
+
+	// A rehearsal that goes on regardless: price check, pointer onto the
+	// button, last look; nothing pressed.
+	r = runScenario(t, owned, func(o *Options) { o.Again, o.DryRun = true, true })
+	wantOutcome(t, r, DryRun, 0)
+	if !strings.Contains(r.res.Detail, "last look before a press passed") || !strings.Contains(r.res.Detail, "already in the library") {
+		t.Errorf("detail = %q", r.res.Detail)
+	}
+	if n := r.store.hitCount("place"); n != 0 {
+		t.Fatalf("the rehearsal pressed %d time(s)", n)
+	}
+
+	// For real: the button is pressed once, the order goes out, Epic says
+	// the account has it. That is "owned", never "claimed" (the library
+	// listed the game before the press, so it proves nothing here).
+	r = runScenario(t, owned, func(o *Options) { o.Again = true })
+	wantOutcome(t, r, Owned, 1)
+	if n := r.store.hitCount("place"); n != 1 {
+		t.Fatalf("pressed %d time(s), want 1", n)
+	}
+	if !strings.Contains(r.res.Detail, "already") {
+		t.Errorf("detail = %q", r.res.Detail)
+	}
+	logged := false
+	for _, l := range r.logs {
+		logged = logged || strings.Contains(l, "Epic is expected to refuse the order")
+	}
+	if !logged {
+		t.Error("the log does not say why a button was pressed for a game already owned")
+	}
+
+	// A price is a price, owned or not: nothing is pressed.
+	paid := owned
+	paid.NewPrice, paid.NoFreeText, paid.PreviewTotal = "$19.99", true, 1999
+	r = runScenario(t, paid, func(o *Options) { o.Again = true })
+	wantOutcome(t, r, NotFree, 0)
+	if n := r.store.hitCount("place"); n != 0 {
+		t.Fatalf("pressed %d time(s) although the checkout showed a price", n)
+	}
+
+	// And if Epic takes the order after all (the library was wrong), that
+	// is a claim like any other.
+	accepted := owned
+	accepted.ConfirmStatus, accepted.ConfirmRaw = 0, ""
+	r = runScenario(t, accepted, func(o *Options) { o.Again = true })
+	wantOutcome(t, r, Claimed, 1)
 }
 
 // ---- what runs next to the checkout is supervised from its first moment
