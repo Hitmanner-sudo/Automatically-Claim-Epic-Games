@@ -6,6 +6,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math/rand/v2"
 	"sort"
@@ -215,10 +216,44 @@ func (d *Daemon) Due() time.Time {
 // check.
 var feedRetry = []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute, 20 * time.Minute, 30 * time.Minute, time.Hour, time.Hour, time.Hour}
 
+// lastList is the free-games list as last read, kept in the state file.
+type lastList struct {
+	ReadAt  time.Time    `json:"readAt"`
+	FreeNow []feed.Offer `json:"freeNow"`
+}
+
+func (d *Daemon) remember(snap feed.Snapshot, now time.Time) {
+	if raw, err := json.Marshal(lastList{ReadAt: now, FreeNow: snap.FreeNow}); err == nil {
+		_ = d.State.SetLastList(raw)
+	}
+}
+
+// remembered returns the giveaways of the list as last read that are still
+// running and not settled: what there is to go by while the list cannot be
+// read. (They were free when it was read, a giveaway runs until its stated
+// end, and the checkout has the last word on the price in any case.)
+func (d *Daemon) remembered(now time.Time) (offers []feed.Offer, readAt time.Time) {
+	var l lastList
+	if raw := d.State.LastList(); len(raw) == 0 || json.Unmarshal(raw, &l) != nil {
+		return nil, time.Time{}
+	}
+	for _, o := range l.FreeNow {
+		if o.Namespace == "" || o.OfferID == "" || o.DiscountPrice != 0 || !now.Before(o.End) {
+			continue
+		}
+		if e, ok := d.State.Get(o.Key()); ok && !e.Status.Done() {
+			offers = append(offers, o)
+		}
+	}
+	return offers, l.ReadAt
+}
+
 func (d *Daemon) round(ctx context.Context) (next time.Time, read bool) {
 	now := d.now()
 
 	snap, err := d.Feed.Fetch(ctx, d.Country, "en-US", now)
+	read = err == nil
+	var listRetry time.Time
 	if err != nil {
 		if ctx.Err() != nil {
 			return time.Time{}, false
@@ -228,25 +263,49 @@ func (d *Daemon) round(ctx context.Context) (next time.Time, read bool) {
 			sc.FeedFailures++
 			failures = sc.FeedFailures
 		})
-		regular := d.regular(now)
+		// Meanwhile, giveaways known from the last time the list was read
+		// can still be claimed.
+		known, readAt := d.remembered(now)
+		meanwhile := ""
+		if len(known) > 0 {
+			meanwhile = "; meanwhile going by the list as read on " + readAt.Local().Format("Mon 2 Jan 15:04") + " for what is still open"
+		}
+		listRetry = d.regular(now)
 		if failures > len(feedRetry) {
-			d.notice("feed-giving-up", "the free-games list could still not be read after %d tries; leaving it until the next regular check", failures)
-			return regular, false
+			d.notice("feed-giving-up", "the free-games list could still not be read after %d tries; leaving it until the next regular check%s", failures, meanwhile)
+		} else {
+			if at := now.Add(feedRetry[failures-1]); at.Before(listRetry) {
+				listRetry = at
+			}
+			d.notice("feed:"+err.Error(), "could not read the free-games list (%v); trying again in %v%s", err, listRetry.Sub(now).Round(time.Minute), meanwhile)
 		}
-		at := now.Add(feedRetry[failures-1])
-		if regular.Before(at) {
-			at = regular
+		if len(known) == 0 {
+			return listRetry, false
 		}
-		d.notice("feed:"+err.Error(), "could not read the free-games list (%v); trying again in %v", err, at.Sub(now).Round(time.Minute))
-		return at, false
+		snap = feed.Snapshot{FreeNow: known}
+	} else {
+		if d.State.Schedule().FeedFailures != 0 {
+			_ = d.State.SetSchedule(func(sc *state.Schedule) { sc.FeedFailures = 0 })
+		}
+		_ = d.State.Prune(now, 60*24*time.Hour)
+		d.remember(snap, now)
+		if snap.Country != "" && d.Country != "" && !strings.EqualFold(snap.Country, d.Country) && !(strings.EqualFold(d.Country, "UK") && snap.Country == "GB") {
+			d.notice("feed-country", "Epic has no free-games list for country %q; going by the one for %s (set \"country\" in config.json to your Epic account's country)", d.Country, snap.Country)
+		}
 	}
-	if d.State.Schedule().FeedFailures != 0 {
-		_ = d.State.SetSchedule(func(sc *state.Schedule) { sc.FeedFailures = 0 })
+	// With a PC clock that is far off, Epic's time decides what is running
+	// and what has ended; times to wake up at are turned back into the
+	// PC's own.
+	skew := snap.ClockSkew
+	if skew != 0 {
+		d.notice("clock", "this PC's clock differs from Epic's by %v; going by Epic's time to tell what is free", (-skew).Round(time.Minute))
 	}
-	_ = d.State.Prune(now, 60*24*time.Hour)
 
 	var due []feed.Offer
 	next = d.regular(now)
+	if !read {
+		next = listRetry
+	}
 	sooner := func(t time.Time) {
 		if t.Before(next) {
 			next = t
@@ -257,7 +316,7 @@ func (d *Daemon) round(ctx context.Context) (next time.Time, read bool) {
 		key := o.Key()
 		entry, known := d.State.Get(key)
 		if !known {
-			d.logf("free now: %s (until %s)", o.Title, o.End.Local().Format("Mon 2 Jan 15:04"))
+			d.logf("free now: %s (until %s)", o.Title, o.End.Add(-skew).Local().Format("Mon 2 Jan 15:04"))
 			_ = d.State.Update(key, func(e *state.Entry) {
 				e.Title, e.FirstSeen, e.Ends = o.Title, now, o.End
 			})
@@ -266,6 +325,9 @@ func (d *Daemon) round(ctx context.Context) (next time.Time, read bool) {
 		if entry.Status.Done() {
 			continue
 		}
+		// From here on the offer's end is in the PC's own time, which is
+		// what everything downstream compares it with.
+		o.End = o.End.Add(-skew)
 		if o.End.Sub(now) < endMargin {
 			continue
 		}
@@ -292,13 +354,13 @@ func (d *Daemon) round(ctx context.Context) (next time.Time, read bool) {
 	}
 	// Wake up shortly after the list is due to change (a new giveaway
 	// starting), with a few minutes' grace for Epic's servers to catch up.
-	if !snap.NextChange.IsZero() && snap.NextChange.After(now) {
-		sooner(snap.NextChange.Add(2*time.Minute + d.jitter(5*time.Minute)))
+	if change := snap.NextChange.Add(-skew); !snap.NextChange.IsZero() && change.After(now) {
+		sooner(change.Add(2*time.Minute + d.jitter(5*time.Minute)))
 	}
 	if earliest := now.Add(minSleep); next.Before(earliest) {
 		next = earliest
 	}
-	return next, true
+	return next, read
 }
 
 // claim runs one session for the due offers, records the outcomes and

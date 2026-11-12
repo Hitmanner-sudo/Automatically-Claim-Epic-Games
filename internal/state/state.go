@@ -60,6 +60,9 @@ type file struct {
 	Version  int               `json:"version"`
 	Schedule Schedule          `json:"schedule"`
 	Offers   map[string]*Entry `json:"offers"`
+	// LastList is the free-games list as last read (kept by the scheduler,
+	// in its own format), to go by when the list cannot be read.
+	LastList json.RawMessage `json:"lastList,omitempty"`
 }
 
 // Store is a JSON file of offer records. It is safe for concurrent use
@@ -110,6 +113,24 @@ func (s *Store) SetSchedule(fn func(sc *Schedule)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	fn(&s.data.Schedule)
+	return s.saveLocked()
+}
+
+// LastList returns what SetLastList stored (nil if nothing).
+func (s *Store) LastList() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.data.LastList...)
+}
+
+// SetLastList stores the free-games list as last read.
+func (s *Store) SetLastList(raw []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if string(raw) == string(s.data.LastList) {
+		return nil
+	}
+	s.data.LastList = append(json.RawMessage(nil), raw...)
 	return s.saveLocked()
 }
 

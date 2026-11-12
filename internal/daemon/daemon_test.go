@@ -31,7 +31,8 @@ type fakeClaimer struct {
 	calls   [][]string
 	results map[string]claim.Result
 	err     error
-	during  func() // runs while the "session" is under way
+	during  func()             // runs while the "session" is under way
+	inspect func([]feed.Offer) // sees the offers as they are passed in
 }
 
 func (c *fakeClaimer) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]claim.Result, error) {
@@ -44,6 +45,9 @@ func (c *fakeClaimer) ClaimAll(ctx context.Context, offers []feed.Offer) (map[st
 		}
 	}
 	c.calls = append(c.calls, titles)
+	if c.inspect != nil {
+		c.inspect(offers)
+	}
 	if c.during != nil {
 		c.during()
 	}
@@ -809,5 +813,98 @@ func TestAnAnswerAboutTheAccountCountsEvenWhenTheSessionWasCutShort(t *testing.T
 		if e := r.entry("b"); e.NextAttempt.Sub(r.now) != 25*time.Hour || e.Attempts != 0 {
 			t.Errorf("%s: the offer behind it waits %v (attempts %d), want 25h", name, e.NextAttempt.Sub(r.now), e.Attempts)
 		}
+	}
+}
+
+// ---- when the list cannot be read, and when the PC's clock is wrong
+
+func TestGoesByTheLastListWhenTheListCannotBeRead(t *testing.T) {
+	r := slotRig(t)
+	a := r.offer("a", 6*24*time.Hour) // will be retried from memory
+	b := r.offer("b", 30*time.Minute) // will have ended by then
+	c := r.offer("c", 6*24*time.Hour) // already claimed
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a, b, c}}
+	r.claim.results[a.Key()] = claim.Result{Outcome: claim.Failed, Detail: "the checkout did not become ready"}
+	r.claim.results[b.Key()] = claim.Result{Outcome: claim.Failed, Detail: "the checkout did not become ready"}
+	r.claim.results[c.Key()] = claim.Result{Outcome: claim.Claimed}
+	r.tick()
+	if len(r.claim.calls) != 1 {
+		t.Fatalf("sessions = %d", len(r.claim.calls))
+	}
+
+	// An hour later Epic's list cannot be read. The giveaway that failed
+	// earlier is due again and is still running: it is tried all the same.
+	r.now = r.now.Add(time.Hour)
+	r.feed.err = errors.New("no such host")
+	r.claim.results[a.Key()] = claim.Result{Outcome: claim.Claimed}
+	wait := r.tick()
+	if len(r.claim.calls) != 2 || len(r.claim.calls[1]) != 1 || r.claim.calls[1][0] != "Game a" {
+		t.Fatalf("sessions = %v", r.claim.calls)
+	}
+	if e := r.entry("a"); e.Status != state.Claimed {
+		t.Fatalf("status of a = %s", e.Status)
+	}
+	// The list itself is asked for again soon, not at the daily time.
+	if wait > 5*time.Minute {
+		t.Fatalf("list read again in %v", wait)
+	}
+	if !r.logged("going by the list as read on") {
+		t.Errorf("logs = %q", r.logs)
+	}
+	// The timetable does not count this as a successful look.
+	if sc := r.d.State.Schedule(); !sc.LastCheck.Equal(r.now.Add(-time.Hour)) {
+		t.Errorf("last successful read = %v", sc.LastCheck)
+	}
+	// With nothing left to go by, nothing is started.
+	r.now = r.now.Add(time.Hour)
+	r.tick()
+	if len(r.claim.calls) != 2 {
+		t.Fatalf("a session was started with nothing open: %v", r.claim.calls)
+	}
+}
+
+func TestGoesByEpicsClockWhenThePCsIsFarOff(t *testing.T) {
+	// The PC's clock is eight days ahead. By it, the giveaway below ended
+	// days ago; by Epic's clock (which the list reader reports the
+	// difference to) it runs for another two days.
+	r := slotRig(t)
+	skew := -8 * 24 * time.Hour
+	epicNow := r.now.Add(skew)
+	a := feed.Offer{Title: "Game a", Namespace: "ns", OfferID: "a", Start: epicNow.Add(-time.Hour), End: epicNow.Add(48 * time.Hour)}
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a}, ClockSkew: skew, NextChange: epicNow.Add(48 * time.Hour)}
+	var passed []feed.Offer
+	r.claim.inspect = func(offers []feed.Offer) { passed = append(passed, offers...) }
+	r.claim.results[a.Key()] = claim.Result{Outcome: claim.Claimed}
+	wait := r.tick()
+	if len(passed) != 1 {
+		t.Fatalf("the giveaway was not attempted: %v", r.claim.calls)
+	}
+	// What is passed on carries its end in the PC's own time, so that
+	// "how long is left" comes out right downstream.
+	if left := passed[0].End.Sub(r.now); left != 48*time.Hour {
+		t.Errorf("time left as seen downstream = %v", left)
+	}
+	if passed[0].Key() != a.Key() {
+		t.Errorf("the giveaway's identity changed: %s", passed[0].Key())
+	}
+	if e := r.entry("a"); e.Status != state.Claimed {
+		t.Errorf("status = %s", e.Status)
+	}
+	// The next look is at the daily time, by the PC's clock, not a week off.
+	if wait != 6*time.Hour+30*time.Minute {
+		t.Errorf("next look in %v", wait)
+	}
+	if !r.logged("clock differs from Epic's") {
+		t.Errorf("logs = %q", r.logs)
+	}
+}
+
+func TestSaysWhenAnotherCountrysListWasUsed(t *testing.T) {
+	r := slotRig(t)
+	r.d.Country = "XK"
+	r.feed.snap = feed.Snapshot{Country: "US"}
+	r.tick()
+	if !r.logged("no free-games list for country") {
+		t.Errorf("logs = %q", r.logs)
 	}
 }

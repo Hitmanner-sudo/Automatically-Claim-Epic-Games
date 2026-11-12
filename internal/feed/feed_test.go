@@ -186,9 +186,16 @@ func TestErrorDocumentIsNotAnEmptyList(t *testing.T) {
 	if _, err := Parse([]byte(`{}`), time.Now()); err == nil {
 		t.Fatal("a document without a catalogue is an error")
 	}
-	// A real, empty catalogue is fine.
-	if snap, err := Parse([]byte(`{"data":{"Catalog":{"searchStore":{"elements":[]}}}}`), time.Now()); err != nil || len(snap.FreeNow) != 0 {
-		t.Fatalf("empty catalogue: %v %v", snap, err)
+	// Epic always has something on offer: a list with nothing in it at all
+	// is a hiccup, and is read again rather than believed.
+	if _, err := Parse([]byte(`{"data":{"Catalog":{"searchStore":{"elements":[]}}}}`), time.Now()); err == nil {
+		t.Fatal("an empty list must not be read as \"nothing is free\"")
+	}
+	// A list of entries none of which is free right now is a different
+	// thing, and fine.
+	doc = `{"data":{"Catalog":{"searchStore":{"elements":[{"title":"Paid","id":"o1","namespace":"n1","promotions":null}]}}}}`
+	if snap, err := Parse([]byte(doc), time.Now()); err != nil || len(snap.FreeNow) != 0 {
+		t.Fatalf("nothing free: %v %v", snap, err)
 	}
 }
 
@@ -246,7 +253,97 @@ func TestFetchSendsCountryAndRejectsErrors(t *testing.T) {
 	if _, err := c.Fetch(context.Background(), "uk", "", mustTime(t, "2026-11-12T04:00:00Z")); err != nil || gotQuery != "allowCountries=GB&country=GB&locale=en-US" {
 		t.Fatalf("UK should be sent as GB: %v %s", err, gotQuery)
 	}
-	if _, err := c.Fetch(context.Background(), "ZZ", "", time.Now()); err == nil {
-		t.Fatal("expected an error for HTTP 403")
+	// Epic refuses a country it does not know. The list for the United
+	// States is read instead (the checkout decides what can be had), and
+	// the result says so.
+	snap, err = c.Fetch(context.Background(), "ZZ", "", mustTime(t, "2026-11-12T04:00:00Z"))
+	if err != nil || snap.Country != "US" || len(snap.FreeNow) != 2 {
+		t.Fatalf("fallback to the US list: %+v, %v", snap.Country, err)
+	}
+}
+
+func TestFetchKeepsTryingThroughHiccups(t *testing.T) {
+	var calls int
+	fail := 2
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		switch {
+		case calls <= fail && calls%2 == 1:
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		case calls <= fail:
+			// HTTP 200 with a list that is empty: also a hiccup.
+			_, _ = w.Write([]byte(`{"data":{"Catalog":{"searchStore":{"elements":[]}}}}`))
+		default:
+			_, _ = w.Write(loadReal(t))
+		}
+	}))
+	defer srv.Close()
+	c := &Client{Endpoint: srv.URL, Pause: time.Millisecond}
+	snap, err := c.Fetch(context.Background(), "US", "", mustTime(t, "2026-11-12T04:00:00Z"))
+	if err != nil || len(snap.FreeNow) != 2 || calls != 3 {
+		t.Fatalf("after two hiccups: %v, %d free, %d requests", err, len(snap.FreeNow), calls)
+	}
+
+	// It does give up in the end, and says why.
+	calls, fail = 0, 1000
+	if _, err := c.Fetch(context.Background(), "US", "", time.Now()); err == nil || calls != 3 {
+		t.Fatalf("a server that stays down: err %v after %d requests", err, calls)
+	}
+
+	// A refusal that will not change is not asked for again and again.
+	refusals := 0
+	deny := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refusals++
+		http.Error(w, "forbidden", http.StatusForbidden)
+	}))
+	defer deny.Close()
+	c = &Client{Endpoint: deny.URL, Pause: time.Millisecond}
+	if _, err := c.Fetch(context.Background(), "US", "", time.Now()); err == nil || refusals != 1 {
+		t.Fatalf("refusal: err %v after %d requests", err, refusals)
+	}
+	// ...and a wait that is cut short ends at once.
+	slow := &Client{Endpoint: "http://127.0.0.1:1", Pause: time.Hour}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if _, err := slow.Fetch(ctx, "US", "", time.Now()); err == nil || time.Since(started) > 5*time.Second {
+		t.Fatalf("cancelled fetch: err %v after %v", err, time.Since(started))
+	}
+}
+
+func TestEpicsClockIsUsedWhenThePCsIsFarOff(t *testing.T) {
+	// The real list, served at a moment when two games are free. The PC's
+	// clock says it is a week later (when, by that clock, neither would be).
+	served := mustTime(t, "2026-11-12T04:00:00Z")
+	age := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Date", served.UTC().Format(http.TimeFormat))
+		if age != "" {
+			w.Header().Set("Age", age)
+		}
+		_, _ = w.Write(loadReal(t))
+	}))
+	defer srv.Close()
+	c := &Client{Endpoint: srv.URL, Pause: time.Millisecond}
+
+	pc := served.Add(8 * 24 * time.Hour)
+	snap, err := c.Fetch(context.Background(), "US", "", pc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.FreeNow) != 2 || snap.ClockSkew != -8*24*time.Hour {
+		t.Fatalf("with a PC clock a week ahead: %d free, skew %v", len(snap.FreeNow), snap.ClockSkew)
+	}
+	// A small difference means nothing (an answer from a cache carries a
+	// time that is a little old), and the PC's clock is used.
+	snap, err = c.Fetch(context.Background(), "US", "", served.Add(3*time.Minute))
+	if err != nil || snap.ClockSkew != 0 {
+		t.Fatalf("small difference: skew %v, %v", snap.ClockSkew, err)
+	}
+	// An answer that sat in a cache for a while says so; that time counts.
+	age = "900"
+	snap, err = c.Fetch(context.Background(), "US", "", served.Add(14*time.Minute))
+	if err != nil || snap.ClockSkew != 0 {
+		t.Fatalf("cached answer: skew %v, %v", snap.ClockSkew, err)
 	}
 }

@@ -89,6 +89,13 @@ type Snapshot struct {
 	// offers is expected to change (a promotion starting or ending). Zero if
 	// the feed does not say.
 	NextChange time.Time
+	// ClockSkew is how far Epic's clock is ahead of this PC's (negative:
+	// behind) when the difference is large enough to matter. What is free
+	// is then judged by Epic's time, not the PC's. Zero otherwise.
+	ClockSkew time.Duration
+	// Country is the country the list was read for. It differs from the
+	// one asked for when Epic would not answer for that one.
+	Country string
 }
 
 type rawFeed struct {
@@ -299,6 +306,11 @@ func Parse(data []byte, now time.Time) (Snapshot, error) {
 		}
 		return Snapshot{}, fmt.Errorf("free-games feed: %s (is the country code right?)", msg)
 	}
+	// Epic always has something on offer. A list with nothing in it at all
+	// is a hiccup on their side, not news.
+	if len(raw.Data.Catalog.SearchStore.Elements) == 0 {
+		return Snapshot{}, errors.New("free-games feed: the list came back empty")
+	}
 	now = now.UTC()
 	var snap Snapshot
 	seenNow := map[string]bool{}
@@ -375,6 +387,35 @@ type Client struct {
 	Endpoint string // overridable for tests
 	// UserAgent is sent with requests. Keep it generic.
 	UserAgent string
+	// Rounds is how many times the hosts are gone through before giving
+	// up (default 3), and Pause the wait before the second round (default
+	// 2 s; it triples for each further one).
+	Rounds int
+	Pause  time.Duration
+}
+
+// maxSkew is how far the PC's clock may differ from Epic's before Epic's
+// is used instead. (An answer served from a cache can carry a time that is
+// a few minutes old, so small differences mean nothing.)
+const maxSkew = 10 * time.Minute
+
+// permanentError marks an answer that asking again will not change (the
+// server understood the request and refused it).
+type permanentError struct{ error }
+
+func (e permanentError) Unwrap() error { return e.error }
+
+// serverTime reads the time of the answer from its headers: when it was
+// generated, plus how long a cache has been holding it.
+func serverTime(h http.Header) time.Time {
+	t, err := http.ParseTime(h.Get("Date"))
+	if err != nil {
+		return time.Time{}
+	}
+	if age, err := time.ParseDuration(strings.TrimSpace(h.Get("Age")) + "s"); err == nil && age > 0 && age < 24*time.Hour {
+		t = t.Add(age)
+	}
+	return t
 }
 
 // normalCountry maps what people type to the ISO code Epic expects.
@@ -389,10 +430,16 @@ func normalCountry(c string) string {
 	return c
 }
 
-func (c *Client) fetchFrom(ctx context.Context, endpoint, country, locale string) ([]byte, error) {
+func (c *Client) fetchFrom(ctx context.Context, endpoint, country, locale string) ([]byte, time.Time, error) {
+	body, at, err := c.fetchOnce(ctx, endpoint, country, locale)
+	return body, at, err
+}
+
+func (c *Client) fetchOnce(ctx context.Context, endpoint, country, locale string) ([]byte, time.Time, error) {
+	var none time.Time
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		return nil, err
+		return nil, none, err
 	}
 	q := u.Query()
 	q.Set("locale", locale)
@@ -402,7 +449,7 @@ func (c *Client) fetchFrom(ctx context.Context, endpoint, country, locale string
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, err
+		return nil, none, err
 	}
 	ua := c.UserAgent
 	if ua == "" {
@@ -416,46 +463,109 @@ func (c *Client) fetchFrom(ctx context.Context, endpoint, country, locale string
 	}
 	res, err := hc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch free-games feed: %w", err)
+		return nil, none, fmt.Errorf("fetch free-games feed: %w", err)
 	}
 	defer res.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(res.Body, 8<<20))
 	if err != nil {
-		return nil, fmt.Errorf("read free-games feed: %w", err)
+		return nil, none, fmt.Errorf("read free-games feed: %w", err)
 	}
 	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("free-games feed returned HTTP %d", res.StatusCode)
+		err := fmt.Errorf("free-games feed returned HTTP %d", res.StatusCode)
+		// "Too many requests" and timeouts pass; other refusals do not.
+		if res.StatusCode >= 400 && res.StatusCode < 500 && res.StatusCode != http.StatusRequestTimeout && res.StatusCode != http.StatusTooEarly && res.StatusCode != http.StatusTooManyRequests {
+			return nil, none, permanentError{err}
+		}
+		return nil, none, err
 	}
 	if len(body) == 0 {
-		return nil, errors.New("free-games feed returned an empty body")
+		return nil, none, errors.New("free-games feed returned an empty body")
 	}
-	return body, nil
+	return body, serverTime(res.Header), nil
 }
 
 // Fetch downloads and parses the feed for a country (ISO 3166-1 alpha-2).
+//
+// It does not give up easily: both of Epic's hosts are tried, several times
+// over with a pause in between (a PC that has just woken up is often not
+// online yet, and Epic's servers have their moments), and if Epic refuses
+// to answer for the country asked for, the list for the United States is
+// read instead. Whatever list comes back only says what to try: nothing is
+// ordered unless Epic's checkout itself shows a price of zero.
 func (c *Client) Fetch(ctx context.Context, country, locale string, now time.Time) (Snapshot, error) {
 	country = normalCountry(country)
 	if locale == "" {
 		locale = "en-US"
 	}
+	snap, err := c.fetchCountry(ctx, country, locale, now)
+	if err == nil || country == "US" || ctx.Err() != nil {
+		return snap, err
+	}
+	var refused permanentError
+	if !errors.As(err, &refused) {
+		return snap, err
+	}
+	if alt, altErr := c.fetchCountry(ctx, "US", locale, now); altErr == nil {
+		return alt, nil
+	}
+	return snap, err
+}
+
+func (c *Client) fetchCountry(ctx context.Context, country, locale string, now time.Time) (Snapshot, error) {
 	endpoints := []string{Endpoint, FallbackEndpoint}
 	if c.Endpoint != "" {
 		endpoints = []string{c.Endpoint}
 	}
+	rounds, pause := c.Rounds, c.Pause
+	if rounds <= 0 {
+		rounds = 3
+	}
+	if pause <= 0 {
+		pause = 2 * time.Second
+	}
 	var firstErr error
-	for _, ep := range endpoints {
-		body, err := c.fetchFrom(ctx, ep, country, locale)
-		if err == nil {
-			var snap Snapshot
-			if snap, err = Parse(body, now); err == nil {
-				return snap, nil
+	for round := 0; round < rounds; round++ {
+		if round > 0 {
+			t := time.NewTimer(pause)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return Snapshot{}, firstErr
+			case <-t.C:
+			}
+			pause *= 3
+		}
+		refusals := 0
+		for _, ep := range endpoints {
+			body, at, err := c.fetchFrom(ctx, ep, country, locale)
+			if err == nil {
+				// Judge by Epic's clock when the PC's is far off.
+				when, skew := now, time.Duration(0)
+				if d := at.Sub(now); !at.IsZero() && (d > maxSkew || d < -maxSkew) {
+					when, skew = at, d
+				}
+				var snap Snapshot
+				if snap, err = Parse(body, when); err == nil {
+					snap.ClockSkew, snap.Country = skew, country
+					return snap, nil
+				}
+				if strings.Contains(err.Error(), "country code") {
+					err = permanentError{err}
+				}
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+			var refused permanentError
+			if errors.As(err, &refused) {
+				refusals++
+			}
+			if ctx.Err() != nil {
+				return Snapshot{}, firstErr
 			}
 		}
-		if firstErr == nil {
-			firstErr = err
-		}
-		if ctx.Err() != nil {
-			break
+		if refusals == len(endpoints) {
+			break // asking again would get the same answer
 		}
 	}
 	return Snapshot{}, firstErr
