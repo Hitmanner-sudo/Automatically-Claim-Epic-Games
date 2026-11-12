@@ -10,7 +10,7 @@
 #
 # Nothing here signs in to an account.
 param(
-    [ValidateSet('silent', 'desktop', 'plain')]
+    [ValidateSet('silent', 'desktop', 'plain', 'preview')]
     [string]$Test = 'silent',
     [int]$Port = 9222,
     [int]$BootMinutes = 8
@@ -248,6 +248,133 @@ function Wait-Cdp([int]$p, [string]$exe, [string]$launchArgs, [int]$minutes, [sc
 Section 'environment'
 Write-Host "os=$([Environment]::OSVersion.VersionString) interactive=$([Environment]::UserInteractive) session=$((Get-Process -Id $PID).SessionId) user=$env:USERNAME ps=$($PSVersionTable.PSVersion)"
 try { Add-Type -AssemblyName System.Windows.Forms; Write-Host "screen=$([System.Windows.Forms.Screen]::PrimaryScreen.Bounds)" } catch { Write-Host "screen: $_" }
+
+# ---------------------------------------------------------------- preview launcher
+# Epic's new-generation launcher (WebView2-based, opt-in preview since late
+# 2026). Its embedded browser takes extra switches from an environment
+# variable instead of the classic launcher's -cefdebug.
+if ($Test -eq 'preview') {
+    Section 'preview: install'
+    $setup = Join-Path $OutDir 'EpicGamesLauncherSetup.exe'
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri 'https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/installer/download/EpicGamesLauncherSetup-x86_64.exe' -OutFile $setup
+    }
+    catch { Write-Host "download failed: $_"; Write-Host 'RESULT test=preview cdp_up=False (installer not available)'; exit 0 }
+    $vi = (Get-Item $setup).VersionInfo
+    Write-Host "downloaded $([int]((Get-Item $setup).Length / 1MB)) MB in $([int]$sw.Elapsed.TotalSeconds)s; ProductName=$($vi.ProductName) FileVersion=$($vi.FileVersion) Description=$($vi.FileDescription)"
+    $p = Start-Process $setup -ArgumentList '/S' -PassThru
+    if (-not $p.WaitForExit(240000)) {
+        Write-Host 'installer still running after 4 minutes with /S; windows it shows:'
+        [WinProbe]::List([IntPtr]::Zero) | Where-Object { $_ -match '\|VISIBLE\|' } | Select-Object -First 25 | ForEach-Object { Write-Host "  $_" }
+        try { $p.Kill() } catch {}
+    }
+    else { Write-Host "installer exit=$($p.ExitCode) after $([int]$sw.Elapsed.TotalSeconds)s" }
+    Start-Sleep -Seconds 5
+
+    function Get-PreviewProcs {
+        Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(EpicGamesLauncher|msedgewebview2|EpicWebHelper|EpicGamesUpdater)' } |
+            Select-Object ProcessId, ParentProcessId, Name, CommandLine, ExecutablePath
+    }
+    function Show-PreviewProcs([string]$why) {
+        $pp = @(Get-PreviewProcs)
+        Write-Host "[procs:$why] count=$($pp.Count)"
+        foreach ($x in $pp) {
+            $cl = "$($x.CommandLine)"
+            if ($x.Name -match 'msedgewebview2') {
+                $type = if ($cl -match '--type=([a-z-]+)') { $Matches[1] } else { 'browser' }
+                $dbg = if ($cl -match '(--remote-debugging-port=\d+)') { $Matches[1] } else { 'no-debug-port' }
+                $udd = if ($cl -match '--user-data-dir="?([^" ]+)') { $Matches[1] } else { '' }
+                Write-Host ("  pid={0} ppid={1} {2} type={3} {4} udd={5}" -f $x.ProcessId, $x.ParentProcessId, $x.Name, $type, $dbg, $udd)
+            }
+            else {
+                if ($cl.Length -gt 300) { $cl = $cl.Substring(0, 300) + '...' }
+                Write-Host ("  pid={0} ppid={1} {2} :: {3}" -f $x.ProcessId, $x.ParentProcessId, $x.Name, $cl)
+            }
+        }
+    }
+    function Show-PreviewWindows([string]$why, [IntPtr]$desk) {
+        $pids = @(Get-PreviewProcs | ForEach-Object { [string]$_.ProcessId })
+        $all = [WinProbe]::List($desk)
+        $mine = @($all | Where-Object { $pids -contains ($_ -split '\|')[0] })
+        $vis = @($mine | Where-Object { $_ -match '\|VISIBLE\|' })
+        Write-Host "[windows:$why] total-on-desktop=$($all.Count) launcher-owned=$($mine.Count) launcher-VISIBLE=$($vis.Count)"
+        foreach ($w in ($mine | Select-Object -First 30)) { Write-Host "  $w" }
+    }
+    function Stop-Preview {
+        foreach ($n in 'EpicGamesLauncher.exe', 'EpicGamesUpdater.exe') { & taskkill.exe /F /T /IM $n 2>$null | Out-Null }
+        Start-Sleep -Seconds 3
+    }
+
+    Section 'preview: what got installed'
+    Show-PreviewProcs 'after-install'
+    foreach ($d in "$env:LOCALAPPDATA\Epic Games", "$env:LOCALAPPDATA\EpicGamesLauncher", "$env:ProgramFiles\Epic Games", "${env:ProgramFiles(x86)}\Epic Games", "$env:APPDATA\com.epicgames.eglv2", "$env:LOCALAPPDATA\com.epicgames.eglv2") {
+        if (Test-Path $d) {
+            Write-Host "[$d]"
+            Get-ChildItem $d -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object -First 40 | ForEach-Object { Write-Host "    $($_.FullName.Substring($d.Length)) $(if (-not $_.PSIsContainer) { $_.Length })" }
+        }
+        else { Write-Host "[$d] (missing)" }
+    }
+    foreach ($k in 'HKCU:\Software\Classes\com.epicgames.launcher\shell\open\command', 'HKLM:\SOFTWARE\Classes\com.epicgames.launcher\shell\open\command', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run') {
+        if (Test-Path $k) {
+            Write-Host "[$k]"
+            $item = Get-ItemProperty -Path $k
+            foreach ($prop in $item.PSObject.Properties) { if ($prop.Name -notmatch '^PS') { Write-Host "    $($prop.Name) = $($prop.Value)" } }
+        }
+        else { Write-Host "[$k] (missing)" }
+    }
+    Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue | ForEach-Object {
+        $v = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+        if ("$($v.DisplayName)" -match 'Epic') { Write-Host "[uninstall HKCU] $($_.PSChildName) DisplayName=$($v.DisplayName) Version=$($v.DisplayVersion) InstallLocation=$($v.InstallLocation)" }
+    }
+    $exe2 = @("$env:LOCALAPPDATA\Epic Games\Launcher\EpicGamesLauncher.exe") + @(Get-ChildItem "$env:LOCALAPPDATA\Epic Games" -Recurse -Filter 'EpicGamesLauncher.exe' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }) |
+        Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if (-not $exe2) { Write-Host 'preview launcher exe not found'; Write-Host 'RESULT test=preview cdp_up=False (not installed)'; exit 0 }
+    $cwd2 = Split-Path $exe2
+    Write-Host "exe=$exe2 version=$((Get-Item $exe2).VersionInfo.FileVersion) product=$((Get-Item $exe2).VersionInfo.ProductName)"
+    Stop-Preview
+
+    Section "preview: hidden desktop + WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS (port $Port)"
+    $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=$Port"
+    $deskName = 'EglProbeDesk'
+    $hDesk = [WinProbe]::CreateDesktopW($deskName, [IntPtr]::Zero, [IntPtr]::Zero, 0, 0x10000000, [IntPtr]::Zero)
+    try { $newPid = [WinProbe]::StartOnDesktop($deskName, "`"$exe2`"", $cwd2); Write-Host "started pid=$newPid on desktop $deskName" } catch { Write-Host "launch FAILED: $_" }
+    $upP = $false
+    $last = ''
+    for ($i = 0; $i -lt 90; $i++) {
+        if (Get-Http "http://127.0.0.1:$Port/json/version") { $upP = $true; Write-Host "CDP endpoint is UP on $Port after $($i * 2)s"; break }
+        $sig = (@(Get-PreviewProcs) | ForEach-Object { "$($_.ProcessId):$($_.Name)" }) -join ','
+        if ($sig -ne $last) { Show-PreviewProcs "t+$($i * 2)s"; $last = $sig }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $upP) { Write-Host "CDP endpoint did NOT come up on $Port within 3 minutes" }
+    Start-Sleep -Seconds 15
+    Show-PreviewProcs 'running'
+    Show-PreviewWindows 'preview: DEFAULT desktop (want launcher-owned=0)' ([IntPtr]::Zero)
+    Show-PreviewWindows 'preview: HIDDEN desktop' $hDesk
+    if ($upP) { Test-Cdp $Port 'preview on hidden desktop' $false }
+
+    Section 'preview: second instance from the NORMAL desktop'
+    Start-Process -FilePath $exe2 -WorkingDirectory $cwd2
+    Start-Sleep -Seconds 12
+    Show-PreviewProcs 'after second instance'
+    Show-PreviewWindows 'preview: DEFAULT desktop after second instance' ([IntPtr]::Zero)
+    Show-PreviewWindows 'preview: HIDDEN desktop after second instance' $hDesk
+    Write-Host "cdp still up: $([bool](Get-Http "http://127.0.0.1:$Port/json/version"))"
+    if ($upP) {
+        $listRaw = Get-Http "http://127.0.0.1:$Port/json/list"
+        if ($listRaw) { foreach ($t in @($listRaw | ConvertFrom-Json)) { Write-Host ("  target type={0} title={1} url={2}" -f $t.type, $t.title, "$($t.url)".Substring(0, [Math]::Min(160, "$($t.url)".Length))) } }
+    }
+    Stop-Preview
+    [void][WinProbe]::CloseDesktop($hDesk)
+    Get-ChildItem "$env:LOCALAPPDATA\Epic Games" -Recurse -Filter '*.log' -ErrorAction SilentlyContinue | Select-Object -First 5 | ForEach-Object {
+        Write-Host "[log $($_.FullName)]"
+        Get-Content $_.FullName -Tail 25 -ErrorAction SilentlyContinue | ForEach-Object { $l = $_; if ($l.Length -gt 220) { $l = $l.Substring(0, 220) }; Write-Host "    $l" }
+    }
+    Section 'summary'
+    Write-Host "RESULT test=preview cdp_up=$upP"
+    exit 0
+}
 
 # ---------------------------------------------------------------- install
 Section 'install'
