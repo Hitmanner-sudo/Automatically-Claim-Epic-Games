@@ -107,6 +107,8 @@ Tested on real Windows machines (GitHub's Windows runners) with a real Epic Game
 
 Tested in a real browser against a stand-in for Epic's store (about 70 scenarios): placing a free order directly and through the store page, a checkout window opened by the launcher itself, a checkout shown inside the store page, the EU consent dialog, both the older and the 2026 checkout layout, holiday mystery games, already-owned games, region locks, CAPTCHAs, signed-out sessions, and every case found so far in which a price above zero appears anywhere (on the page, in Epic's order preview, in the order itself however it is written or encoded, sent through a service worker, a frame from another site or a worker, including ones that only come into being at the moment of the click, or re-sent by the page after the claim has ended), none of which may result in an order.
 
+The same scenarios are also run **inside the launcher's own built-in browser** (Chromium 90, the engine the program meets in real use) on a GitHub Windows machine: the stand-in store's pages are loaded in the real launcher's own web view. Every scenario in which something tries to get a paid order out passes there too. Seven scenarios are left out because that browser does not open tabs for an outsider. This is a workflow of its own (**Browser tests in the launcher's own browser**, started by hand from the Actions tab) because it takes half an hour.
+
 Tested on a real PC with a real, signed-in account (Windows 11, launcher 20.3.8, 12 November 2026):
 
 - the launcher was started hidden and came up in a few seconds, with no launcher window on the visible desktop;
@@ -114,7 +116,7 @@ Tested on a real PC with a real, signed-in account (Windows 11, launcher 20.3.8,
 - the real run then claimed a game: **order confirmed by Epic**, in 24 seconds from start to finish;
 - for the other game, which the account already had, Epic refused the order ("you already own this item"); the program now records that as "already owned".
 
-That run was made with build 0.1.18. The order safeguards were tightened further afterwards (see *What it will not do*), and the later builds pass every test above except that last one: they have not met Epic's real checkout yet. Windows Smart App Control on the test PC refused the one later build that was tried there (0.1.23), and that refusal was left alone. Until a later build has been rehearsed with `once --dry-run` on a signed-in PC, **0.1.18 is the build known to work from start to finish**.
+That run was made with build 0.1.18. The order safeguards were tightened further afterwards (see *What it will not do*), and the later builds pass every test above, the run inside the launcher's own browser included, except that last one: they have not met Epic's real checkout yet. Windows Smart App Control on the test PC refused the one later build that was tried there (0.1.23), and that refusal was left alone. Until a later build has been rehearsed with `once --dry-run` on a signed-in PC, **0.1.18 is the build known to work from start to finish**.
 
 What a single test cannot show is how Epic's pages will change. The program is written to fail safely when they do: if the checkout does not look the way it expects, it places no order, saves what it saw under `diagnostics\`, and tries again later. If a giveaway is not claimed, the log and that folder say why.
 

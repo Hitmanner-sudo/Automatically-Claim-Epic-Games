@@ -68,8 +68,11 @@ type scenario struct {
 	ProductOpens  string `json:"-"`             // offer the store page's button opens (default 1-ns-id)
 	ProductInPage bool   `json:"-"`             // "Get" shows the checkout in a frame inside the page, as the web store does
 	// ChallengeFor makes the checkout answer with a Cloudflare-style
-	// "One more step" page for this long before the real page is served
-	// (the challenge page reloads itself, as the real one does).
+	// "One more step" page for this long before the real page is served.
+	// The challenge page reloads itself every three seconds. (Not faster:
+	// in a slow browser a page that reloads every second never gets
+	// anywhere, each reload calling off the one before it. The real page
+	// does not do that.)
 	ChallengeFor time.Duration `json:"-"`
 	// OnDirect is called when the checkout address is opened directly.
 	OnDirect func(offers string) `json:"-"`
@@ -334,9 +337,9 @@ func (m *mockStore) handleCheckout(w http.ResponseWriter, r *http.Request) {
 	if challenged {
 		w.Header().Set("cf-mitigated", "challenge")
 		w.WriteHeader(http.StatusForbidden)
-		_, _ = io.WriteString(w, `<!doctype html><html><head><title>One more step</title><meta http-equiv="refresh" content="1"></head><body>
+		_, _ = io.WriteString(w, `<!doctype html><html><head><title>One more step</title><meta http-equiv="refresh" content="3"></head><body>
 <div class="cf_challenge_container"><h1 data-t="challengeTitle">One more step</h1><p data-t="challengeSubtitle" class="cf_challenge_text">Please complete a security check to continue</p></div>
-<script>window._cf_chl_opt = { cType: 'managed' }; setTimeout(function () { location.reload(); }, 1200);</script></body></html>`)
+<script>window._cf_chl_opt = { cType: 'managed' };</script></body></html>`)
 		return
 	}
 	if !m.hasSession(r) {
