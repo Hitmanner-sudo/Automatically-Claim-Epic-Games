@@ -1,9 +1,10 @@
-// Package sched has Windows run the program once a day, through the Task
+// Package sched has Windows keep the program running, through the Task
 // Scheduler, as the signed-in user and without administrator rights.
 //
-// A daily task is used rather than a start-up entry so that nothing happens
-// merely because the PC was turned on: Windows starts the program at a set
-// time of day, or, if the PC was off then, later the same day.
+// The program is started when the user signs in (a start-up entry does
+// that; a task that fires at sign-in needs administrator rights). The task
+// here is what brings it back if it is not running: Windows starts it every
+// hour, and a copy that finds another one running ends at once.
 package sched
 
 import (
@@ -15,7 +16,7 @@ import (
 	"unicode/utf16"
 )
 
-// Spec describes the daily task.
+// Spec describes the task.
 type Spec struct {
 	// Name of the task in the Task Scheduler's root folder.
 	Name string
@@ -27,36 +28,21 @@ type Spec struct {
 	// UserSID is the security identifier of the user the task runs as (the
 	// one creating it).
 	UserSID string
-	// Hour and Minute are the time of day. With UTC the time is a fixed
-	// moment for the whole world (it does not move with daylight saving
-	// time); otherwise it is this PC's wall-clock time.
-	Hour, Minute int
-	UTC          bool
-}
-
-// Slot names the time of day of a Spec in a short form ("16:30Z" or
-// "18:00").
-func (s Spec) Slot() string {
-	z := ""
-	if s.UTC {
-		z = "Z"
-	}
-	return fmt.Sprintf("%02d:%02d%s", s.Hour, s.Minute, z)
 }
 
 // layout is raised whenever the task definition below changes in a way
-// that an already registered task should pick up.
-const layout = 2
+// that an already registered task should pick up. (Layouts 1 and 2 were a
+// task for a set time of day.)
+const layout = 3
 
 // Marker is a short plain-ASCII string written into the task (as its
-// version) that says which time of day, program location and layout it was
-// registered for. A registered task whose definition contains the wanted
-// marker is up to date. (Comparing paths in the definition's text would not
-// do: the tool that prints it re-encodes them.)
+// version) that says which program location and layout it was registered
+// for. A registered task whose definition contains the wanted marker is up
+// to date. (Comparing paths in the definition's text would not do: the tool
+// that prints it re-encodes them.)
 func (s Spec) Marker() string {
 	sum := sha256.Sum256([]byte(strings.ToLower(s.Exe)))
-	slot := strings.Replace(s.Slot(), ":", "", 1)
-	return fmt.Sprintf("eac%d-%s-%s", layout, slot, hex.EncodeToString(sum[:4]))
+	return fmt.Sprintf("eac%d-%s", layout, hex.EncodeToString(sum[:4]))
 }
 
 func xmlText(s string) string {
@@ -71,25 +57,22 @@ func xmlText(s string) string {
 // when the PC goes on battery, is killed after three days, and is simply
 // skipped when the PC was off at its time.
 func (s Spec) XML() string {
-	boundary := fmt.Sprintf("2026-01-01T%02d:%02d:00", s.Hour, s.Minute)
-	if s.UTC {
-		boundary += "Z"
-	}
+	// Midnight by this PC's clock, and from there every hour.
+	const boundary = "2026-01-01T00:00:00"
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-16"?>` + "\r\n")
 	b.WriteString(`<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">` + "\r\n")
 	b.WriteString("  <RegistrationInfo>\r\n")
 	b.WriteString("    <Version>" + xmlText(s.Marker()) + "</Version>\r\n")
-	b.WriteString("    <Description>Looks for the Epic Games Store's free games once a day and claims them through the Epic Games Launcher, without showing anything. To remove it, run EpicAutoClaim.exe uninstall.</Description>\r\n")
+	b.WriteString("    <Description>Keeps EpicAutoClaim running: starts it every hour unless it is running already. EpicAutoClaim looks for the Epic Games Store's free games every hour and claims them through the Epic Games Launcher, without showing anything. To remove it, run EpicAutoClaim.exe uninstall.</Description>\r\n")
 	b.WriteString("  </RegistrationInfo>\r\n")
 	b.WriteString("  <Triggers>\r\n")
 	b.WriteString("    <CalendarTrigger>\r\n")
-	// Besides its daily time the task is started again every hour. The
-	// program then only looks at its own timetable and ends at once unless
-	// a round is due, so nothing is fetched or started because of this. It
-	// is what lets a retry that fell due while the PC was off (or after the
-	// program was ended by a shutdown) happen the same day instead of
-	// waiting for the next daily time.
+	// A trigger for every day whose task is started again every hour
+	// through that day: in effect, every hour for good. A copy of the
+	// program that is started while another one is running ends at once, so
+	// nothing is fetched or started because of this; it is what brings the
+	// program back within the hour if it was ended.
 	b.WriteString("      <Repetition>\r\n        <Interval>PT1H</Interval>\r\n        <Duration>P1D</Duration>\r\n        <StopAtDurationEnd>false</StopAtDurationEnd>\r\n      </Repetition>\r\n")
 	b.WriteString("      <StartBoundary>" + boundary + "</StartBoundary>\r\n")
 	b.WriteString("      <Enabled>true</Enabled>\r\n")

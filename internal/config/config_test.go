@@ -18,7 +18,7 @@ func TestDefaultsAndPartialFile(t *testing.T) {
 	if c != Default() {
 		t.Fatalf("missing file should give defaults, got %+v", c)
 	}
-	if !c.RestartIdleLauncher || c.DryRun || c.DailyAt != "" {
+	if !c.RestartIdleLauncher || c.DryRun || c.DailyAt != "" || c.CheckEveryMinutes != 60 {
 		t.Fatalf("defaults changed: %+v", c)
 	}
 
@@ -31,7 +31,7 @@ func TestDefaultsAndPartialFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Country != "DE" || !c.RestartIdleLauncher || !c.KeepDiagnostics || c.DailyAt != "" {
+	if c.Country != "DE" || !c.RestartIdleLauncher || !c.KeepDiagnostics || c.DailyAt != "" || c.CheckEveryMinutes != 60 {
 		t.Fatalf("partial file: %+v", c)
 	}
 }
@@ -46,6 +46,15 @@ func TestNormalizeAndBadInput(t *testing.T) {
 	c.Normalize()
 	if c.Country != "" || c.DailyAt != "" {
 		t.Fatalf("normalize: %+v", c)
+	}
+	// How often to look: every hour unless told otherwise, never more often
+	// than every quarter of an hour, never less often than once a day.
+	for in, want := range map[int]int{0: 60, -5: 60, 1: 15, 15: 15, 45: 45, 60: 60, 180: 180, 1440: 1440, 100000: 1440} {
+		c = Config{CheckEveryMinutes: in}
+		c.Normalize()
+		if c.CheckEveryMinutes != want {
+			t.Errorf("checkEveryMinutes %d -> %d, want %d", in, c.CheckEveryMinutes, want)
+		}
 	}
 	for in, want := range map[string]string{
 		"18:30": "18:30", "0:00": "00:00", "23:59": "23:59", "9:5": "", "24:00": "", "12:60": "",
@@ -149,7 +158,7 @@ func TestEnsureFileAndRoundTrip(t *testing.T) {
 	if err := EnsureFile(path); err != nil {
 		t.Fatal(err)
 	}
-	want := Config{Country: "US", DailyAt: "18:30", RestartIdleLauncher: false, DryRun: true, KeepDiagnostics: false, LauncherPath: `D:\Epic\EpicGamesLauncher.exe`}
+	want := Config{Country: "US", CheckEveryMinutes: 30, DailyAt: "18:30", RestartIdleLauncher: false, DryRun: true, KeepDiagnostics: false, LauncherPath: `D:\Epic\EpicGamesLauncher.exe`}
 	if err := Save(path, want); err != nil {
 		t.Fatal(err)
 	}
@@ -166,18 +175,34 @@ func TestEnsureFileAndRoundTrip(t *testing.T) {
 }
 
 func TestSettingsFromAnOlderVersionStillLoad(t *testing.T) {
-	// Earlier versions had "checkEveryMinutes". A file that still carries
-	// it loads without complaint; the value is no longer used.
+	// A file written by any earlier version loads without complaint: one
+	// with both ways of saying when to look, and one from the versions that
+	// only knew a time of day (they wrote it as empty by default, which now
+	// means "every hour").
 	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(`{"country": "gb", "checkEveryMinutes": 60, "restartIdleLauncher": false, "dailyAt": "7:30"}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"country": "gb", "checkEveryMinutes": 120, "restartIdleLauncher": false, "dailyAt": "7:30"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	c, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Country != "GB" || c.RestartIdleLauncher || c.DryRun || c.DailyAt != "07:30" {
+	if c.Country != "GB" || c.RestartIdleLauncher || c.DryRun || c.DailyAt != "07:30" || c.CheckEveryMinutes != 120 {
 		t.Fatalf("%+v", c)
+	}
+	if err := os.WriteFile(path, []byte(`{"country": "", "dailyAt": "", "launcherPath": "", "restartIdleLauncher": true, "dryRun": false, "keepDiagnostics": true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err = Load(path)
+	if err != nil || c != Default() || c.CheckEveryMinutes != 60 || c.DailyAt != "" {
+		t.Fatalf("a file from 0.1.x: %+v, %v", c, err)
+	}
+	// A value of the wrong kind is ignored (and said), not taken for zero.
+	if err := os.WriteFile(path, []byte(`{"checkEveryMinutes": "30"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c, err = Load(path); err == nil || c.CheckEveryMinutes != 60 || c.DryRun {
+		t.Fatalf("wrong kind: %+v, %v", c, err)
 	}
 }
 

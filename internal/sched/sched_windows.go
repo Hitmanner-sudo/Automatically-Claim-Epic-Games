@@ -65,7 +65,7 @@ func firstLine(s string) string {
 	return s
 }
 
-// Register creates the daily task, replacing one of the same name.
+// Register creates the task, replacing one of the same name.
 func Register(s Spec) error {
 	f, err := os.CreateTemp("", "EpicAutoClaim-task-*.xml")
 	if err != nil {
@@ -81,7 +81,7 @@ func Register(s Spec) error {
 		return werr
 	}
 	if _, err := schtasks("/Create", "/TN", s.Name, "/XML", path, "/F"); err != nil {
-		return fmt.Errorf("create the daily task: %w", err)
+		return fmt.Errorf("create the hourly task: %w", err)
 	}
 	return nil
 }

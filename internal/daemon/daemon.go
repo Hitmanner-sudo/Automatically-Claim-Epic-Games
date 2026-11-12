@@ -1,5 +1,5 @@
 // Package daemon is the scheduling part: it reads Epic's free-games list
-// once a day (and right after a new giveaway is due to start), decides when
+// every hour (and right after a new giveaway is due to start), decides when
 // to try claiming what, and remembers its timetable so that being started
 // again changes nothing about when it next looks.
 package daemon
@@ -54,10 +54,12 @@ type Daemon struct {
 	Logf    func(format string, args ...any)
 
 	Country string
-	// Slot gives the next regular (daily) check time after a moment; see
-	// DailySlot. When nil, CheckEvery is used as a plain interval instead.
-	Slot       func(after time.Time) time.Time
+	// CheckEvery is how often the list is read: every hour unless set.
 	CheckEvery time.Duration
+	// Slot, when set, replaces the interval by a timetable: it gives the
+	// next regular check time after a moment (see DailySlot, for once a
+	// day at a set time).
+	Slot func(after time.Time) time.Time
 
 	// Injectable for tests.
 	Now    func() time.Time
@@ -66,11 +68,6 @@ type Daemon struct {
 	lastBusy   string
 	lastNotice string
 }
-
-// DefaultSlotUTC is the default daily check time: half an hour after the
-// hour at which Epic changes its giveaways (16:00 UTC; 15:00 UTC while the
-// United States are on summer time).
-const DefaultSlotUTC = "16:30"
 
 // DailySlot returns a function that gives the next daily check time after a
 // moment: at hour:minute in loc, every day.
@@ -93,11 +90,23 @@ func (d *Daemon) regular(now time.Time) time.Time {
 	if d.Slot != nil {
 		return d.Slot(now).Add(d.jitter(10 * time.Minute))
 	}
-	every := d.CheckEvery
-	if every <= 0 {
-		every = 24 * time.Hour
-	}
+	every := d.every()
 	return now.Add(every - every/10 + d.jitter(every/5))
+}
+
+func (d *Daemon) every() time.Duration {
+	if d.CheckEvery > 0 {
+		return d.CheckEvery
+	}
+	return time.Hour
+}
+
+// horizon is further ahead than any round is ever planned.
+func (d *Daemon) horizon() time.Duration {
+	if d.Slot != nil {
+		return 26 * time.Hour
+	}
+	return 2*d.every() + 10*time.Minute
 }
 
 func (d *Daemon) now() time.Time {
@@ -195,14 +204,16 @@ func (d *Daemon) Tick(ctx context.Context) time.Time {
 
 // Due is when the next round is due according to what was written down the
 // last time. A restart of the program, or of the PC, therefore does not by
-// itself cause a round: only a program that has never run looks at once.
+// itself cause a round: a program that has never run looks at once, and so
+// does one that finds its time has passed (the PC was off for the night);
+// one that was started again within the hour waits for its time.
 func (d *Daemon) Due() time.Time {
 	now := d.now()
 	sc := d.State.Schedule()
 	switch {
 	case sc.NextDue.IsZero():
 		return now
-	case sc.NextDue.Sub(now) > 26*time.Hour:
+	case sc.NextDue.Sub(now) > d.horizon():
 		// Further away than any round is ever planned: the clock must have
 		// been wrong when it was written down. Look now; that round writes
 		// a sound timetable again.
@@ -548,10 +559,6 @@ type RunOptions struct {
 	// just signed in to Windows: the PC is busy then, and nothing should
 	// happen merely because it was turned on. Nil means never hold off.
 	Settle func() time.Duration
-	// ExitWhenIdleFor makes Run return, instead of waiting, when the next
-	// round is further away than this. (Windows starts the program again on
-	// its daily schedule.) Zero means stay and wait.
-	ExitWhenIdleFor time.Duration
 	// Waiting is called with true before a wait between rounds and with
 	// false when it is over, so that the program can make itself small
 	// meanwhile. May be nil.
@@ -559,14 +566,10 @@ type RunOptions struct {
 }
 
 // Run does the rounds that are due, one after the other, until the context
-// ends or (with ExitWhenIdleFor) until nothing is due for a while.
+// ends.
 func (d *Daemon) Run(ctx context.Context, opt RunOptions) {
 	next := d.Due()
 	for {
-		if wait := next.Sub(d.now()); opt.ExitWhenIdleFor > 0 && wait > opt.ExitWhenIdleFor {
-			d.logf("nothing to do before %s; leaving it to the daily schedule", next.Local().Format("Mon 2 Jan 15:04"))
-			return
-		}
 		if wait := next.Sub(d.now()); wait > 5*time.Second && opt.Waiting != nil {
 			opt.Waiting(true)
 			ok := sleepUntil(ctx, next, d.now)

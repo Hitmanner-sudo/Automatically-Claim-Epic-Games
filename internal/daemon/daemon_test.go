@@ -677,20 +677,77 @@ func TestARestartDoesNotCauseACheck(t *testing.T) {
 		t.Fatalf("after a restart the next check is due %v, want still %v", again.Due(), next)
 	}
 	calls := r.feed.calls.Load()
-	// Started by Windows' daily schedule with nothing due for hours: it
-	// returns at once and has not looked at anything.
+	// Running, it waits for that time and has not looked at anything
+	// merely because it was started.
+	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { again.Run(context.Background(), RunOptions{ExitWhenIdleFor: 2 * time.Hour}); close(done) }()
+	go func() { again.Run(ctx, RunOptions{}); close(done) }()
+	time.Sleep(300 * time.Millisecond)
+	cancel()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return although nothing was due")
+		t.Fatal("Run did not stop with its context")
 	}
 	if r.feed.calls.Load() != calls {
 		t.Fatal("the list was read merely because the program was started")
 	}
-	if !r.logged("nothing to do before") {
-		t.Errorf("logs = %q", r.logs)
+}
+
+func TestLooksEveryHourAndStraightAwayAfterANightOff(t *testing.T) {
+	r := newRig(t) // every hour; the rig's clock stands at 10:00 UTC
+	a := r.offer("a", 6*24*time.Hour)
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a}}
+	r.claim.results[a.Key()] = claim.Result{Outcome: claim.Claimed}
+
+	// About an hour between looks: a little under to a little over, so
+	// that not every PC asks Epic at the same minute.
+	for _, j := range []time.Duration{0, 6 * time.Minute, 12*time.Minute - time.Second} {
+		r.d.Jitter = func(max time.Duration) time.Duration {
+			if j > max {
+				return max
+			}
+			return j
+		}
+		if wait := r.tick(); wait < 54*time.Minute || wait > 66*time.Minute {
+			t.Fatalf("next look in %v, want about an hour", wait)
+		}
+	}
+	r.d.Jitter = func(time.Duration) time.Duration { return 0 }
+	next := r.d.Tick(context.Background())
+
+	// Started again twenty minutes later (the PC was restarted): it keeps
+	// to the time it had.
+	r.now = r.now.Add(20 * time.Minute)
+	if !r.d.Due().Equal(next) {
+		t.Fatalf("after a restart within the hour: due %v, want still %v", r.d.Due(), next)
+	}
+	// Started the next morning: that time is long past, so it looks now.
+	r.now = r.now.Add(14 * time.Hour)
+	if due := r.d.Due(); due.After(r.now) {
+		t.Fatalf("after a night off: due in %v, want at once", due.Sub(r.now))
+	}
+	// A time further ahead than it ever plans (the clock was wrong when it
+	// was written down) is not waited for.
+	_ = r.d.State.SetSchedule(func(sc *state.Schedule) { sc.NextDue = r.now.Add(3 * time.Hour) })
+	if due := r.d.Due(); !due.Equal(r.now) {
+		t.Fatalf("a time three hours ahead was trusted: due in %v", due.Sub(r.now))
+	}
+	_ = r.d.State.SetSchedule(func(sc *state.Schedule) { sc.NextDue = r.now.Add(65 * time.Minute) })
+	if due := r.d.Due(); !due.Equal(r.now.Add(65 * time.Minute)) {
+		t.Fatalf("a time within the hour was not trusted: due in %v", due.Sub(r.now))
+	}
+	// A new giveaway is looked at minutes after it starts, not only at the
+	// next hourly look; and never is the list asked for twice in a row.
+	r.feed.snap.NextChange = r.now.Add(10 * time.Minute)
+	if wait := r.tick(); wait != 12*time.Minute {
+		t.Fatalf("next look in %v, want just after the giveaway starts", wait)
+	}
+	// With no interval given it is every hour, too.
+	r.d.CheckEvery = 0
+	r.feed.snap.NextChange = time.Time{}
+	if wait := r.tick(); wait != 54*time.Minute {
+		t.Fatalf("default interval: next look in %v", wait)
 	}
 }
 
@@ -785,24 +842,6 @@ func TestRunWaitsOutTheMinutesAfterSignIn(t *testing.T) {
 	}
 	if waited := time.Since(started); waited < 150*time.Millisecond {
 		t.Fatalf("the round ran after %v, before the hold-off was over", waited)
-	}
-}
-
-func TestRunStaysForWorkThatIsDueSoonAndLeavesWhenItIsNot(t *testing.T) {
-	// Due now, and afterwards nothing until tomorrow: one round, then Run
-	// returns by itself.
-	r := newRig(t)
-	r.d.Now = time.Now
-	r.d.Slot = func(after time.Time) time.Time { return after.Add(24 * time.Hour) }
-	done := make(chan struct{})
-	go func() { r.d.Run(context.Background(), RunOptions{ExitWhenIdleFor: 2 * time.Hour}); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return after its round")
-	}
-	if n := r.feed.calls.Load(); n != 1 {
-		t.Fatalf("rounds = %d", n)
 	}
 }
 

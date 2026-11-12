@@ -90,42 +90,65 @@ jobs:
           & "$env:RUNNER_TEMP/eac-console.exe" once
           if ($LASTEXITCODE -ne 0) { throw "once failed with $LASTEXITCODE" }
           & "$env:RUNNER_TEMP/eac-console.exe" status
-      - name: Install as a daily Windows task, start it through the Task Scheduler, uninstall
+      - name: Install (starts at sign-in, hourly task brings it back), measure it idle, uninstall
         shell: pwsh
         run: |
           $exe = "$env:LOCALAPPDATA\EpicAutoClaim\EpicAutoClaim.exe"
           & "$env:RUNNER_TEMP/eac-console.exe" install
           if ($LASTEXITCODE -ne 0) { throw "install failed with $LASTEXITCODE" }
           if (-not (Test-Path $exe)) { throw 'the program was not copied to its folder' }
+          "--- started at sign-in: the entry among Windows' start-up programs"
+          $run = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue).EpicAutoClaim
+          $run
+          if ($run -ne "`"$exe`" run --login") { throw "unexpected start-up entry: $run" }
           $task = (schtasks /Query /FO CSV | ConvertFrom-Csv | Where-Object { $_.TaskName -like '\EpicAutoClaim-*' } | Select-Object -First 1).TaskName
-          if (-not $task) { throw 'the daily task was not created' }
+          if (-not $task) { throw 'the hourly task was not created' }
           "--- the task as Windows holds it"
           schtasks /Query /TN $task /XML
           $xml = [xml](schtasks /Query /TN $task /XML | Out-String)
           $s = $xml.Task.Settings
-          if ($s.StartWhenAvailable -ne 'true' -or $s.DisallowStartIfOnBatteries -ne 'false' -or $s.StopIfGoingOnBatteries -ne 'false' -or $s.ExecutionTimeLimit -ne 'PT0S') { throw 'the task lost a setting on the way in' }
-          if (-not $xml.Task.Triggers.CalendarTrigger.ScheduleByDay) { throw 'the task has no daily trigger' }
+          if ($s.StartWhenAvailable -ne 'true' -or $s.DisallowStartIfOnBatteries -ne 'false' -or $s.StopIfGoingOnBatteries -ne 'false' -or $s.ExecutionTimeLimit -ne 'PT0S') { throw 'the task lost a setting' }
+          if ($s.MultipleInstancesPolicy -ne 'IgnoreNew') { throw "the task would run copies side by side: $($s.MultipleInstancesPolicy)" }
+          if (-not $xml.Task.Triggers.CalendarTrigger.ScheduleByDay) { throw 'the task has no trigger for every day' }
           if ($xml.Task.Triggers.CalendarTrigger.Repetition.Interval -ne 'PT1H') { throw 'the task is not started again every hour' }
           if ($s.Priority -ne '5') { throw "the task runs at priority $($s.Priority), not 5" }
-          if ($xml.Task.RegistrationInfo.Version -notlike 'eac*') { throw "the task carries no marker: $($xml.Task.RegistrationInfo.Version)" }
+          if ($xml.Task.RegistrationInfo.Version -notlike 'eac3-*') { throw "the task carries no marker: $($xml.Task.RegistrationInfo.Version)" }
           if ($xml.Task.Actions.Exec.Command -ne $exe -or $xml.Task.Actions.Exec.Arguments -ne 'run --scheduled') { throw "unexpected action: $($xml.Task.Actions.Exec.Command) $($xml.Task.Actions.Exec.Arguments)" }
-          $run = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue
-          if ($run.EpicAutoClaim) { throw 'a start-up entry was written although the daily task exists' }
           "--- status"
           & $exe status
-          "--- stop, then have the Task Scheduler start it"
+          $bg = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'EpicAutoClaim.exe' -and $_.CommandLine -match ' run( |$)' })
+          if ($bg.Count -ne 1) { throw "expected one background process after installing, found $($bg.Count)" }
+          "--- what it costs while it waits (after half a minute of doing nothing)"
+          Start-Sleep -Seconds 30
+          Get-Process -Id $bg[0].ProcessId | Select-Object Id, @{n='WorkingSetMB';e={[math]::Round($_.WorkingSet64/1MB,1)}}, @{n='PrivateMB';e={[math]::Round($_.PrivateMemorySize64/1MB,1)}}, @{n='CPUseconds';e={[math]::Round($_.CPU,2)}}, PriorityClass, Threads | Format-List Id, WorkingSetMB, PrivateMB, CPUseconds, PriorityClass
+          "--- a second copy (what the hourly task starts) ends at once and changes nothing"
+          $p2 = Start-Process -FilePath $exe -ArgumentList 'run', '--scheduled' -PassThru
+          if (-not $p2.WaitForExit(15000)) { throw 'a second copy stayed although one was running' }
+          $bg2 = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'EpicAutoClaim.exe' -and $_.CommandLine -match ' run( |$)' })
+          if ($bg2.Count -ne 1 -or $bg2[0].ProcessId -ne $bg[0].ProcessId) { throw 'the background process is not the one that was running' }
+          "--- installing again (as after a change of settings) starts it afresh"
+          & $exe install
+          if ($LASTEXITCODE -ne 0) { throw "second install failed with $LASTEXITCODE" }
+          Start-Sleep -Seconds 2
+          $bg3 = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'EpicAutoClaim.exe' -and $_.CommandLine -match ' run( |$)' })
+          if ($bg3.Count -ne 1 -or $bg3[0].ProcessId -eq $bg[0].ProcessId) { throw "installing again did not restart the background process ($($bg3.Count) running)" }
+          "--- stop, then have the Task Scheduler bring it back"
           & $exe stop
           Start-Sleep -Seconds 2
+          if (Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'EpicAutoClaim.exe' }) { throw 'still running after stop' }
           schtasks /Run /TN $task
           "schtasks /Run exit code $LASTEXITCODE"
           Start-Sleep -Seconds 6
           schtasks /Query /TN $task /V /FO LIST | Select-String -Pattern 'Last Run Time|Last Result|Next Run Time|Status|Logon Mode'
           & $exe status
+          $bg4 = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'EpicAutoClaim.exe' -and $_.CommandLine -match ' run --scheduled' })
+          if ($bg4.Count -ne 1) { throw "the Task Scheduler did not bring the program back ($($bg4.Count) running)" }
           "--- uninstall"
           & $exe uninstall
           if ($LASTEXITCODE -ne 0) { throw "uninstall failed with $LASTEXITCODE" }
           schtasks /Query /TN $task 2>$null | Out-Null
-          if ($LASTEXITCODE -eq 0) { throw 'the daily task is still there after uninstall' }
+          if ($LASTEXITCODE -eq 0) { throw 'the task is still there after uninstall' }
+          if ((Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue).EpicAutoClaim) { throw 'the start-up entry is still there after uninstall' }
           Start-Sleep -Seconds 2
           $left = Get-CimInstance Win32_Process | Where-Object { $_.Name -in 'EpicAutoClaim.exe' }
           if ($left) { $left | Select-Object ProcessId, CommandLine | Format-List; throw 'the background process is still running after uninstall' }

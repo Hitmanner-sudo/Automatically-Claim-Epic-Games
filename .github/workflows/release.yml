@@ -35,13 +35,29 @@ jobs:
           if (-not $tag) { $tag = '${{ github.ref_name }}' }
           if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "version must look like v1.2.3, got '$tag'" }
           go build -trimpath -ldflags "-H=windowsgui -s -w -X main.version=$($tag.Substring(1))" -o EpicAutoClaim.exe ./cmd/epicautoclaim
-          (Get-FileHash EpicAutoClaim.exe -Algorithm SHA256).Hash + '  EpicAutoClaim.exe' | Out-File -Encoding ascii EpicAutoClaim.exe.sha256
+          $hash = (Get-FileHash EpicAutoClaim.exe -Algorithm SHA256).Hash
+          $size = [math]::Round((Get-Item EpicAutoClaim.exe).Length / 1MB, 1)
           "TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append
+          @"
+          **One file: ``EpicAutoClaim.exe`` ($size MB).** Download it and double-click it. That installs it (one dialog, the only window it ever shows). From then on it starts by itself when you sign in to Windows, looks at Epic's free-games list every hour, and claims each free game through your own Epic Games Launcher without showing anything.
+
+          Before the first run: the Epic Games Launcher must be installed and signed in with **Remember me** ticked.
+
+          To remove it: ``EpicAutoClaim.exe uninstall``.
+
+          Things to know:
+
+          - The file is not code-signed. Windows may ask before running it (**More info → Run anyway**). Where **Smart App Control** is switched on, Windows decides by itself whether an unsigned program may start and offers no "run anyway"; if it refuses this file, nothing is installed and nothing is broken. See the README.
+          - The order safeguards in this version are stricter than in the build that made the first real claims (0.1.18). They pass every test, including a run inside the launcher's own built-in browser, but this exact build has not yet met Epic's real checkout. ``EpicAutoClaim.exe once --dry-run`` rehearses everything except the order.
+
+          SHA-256 of ``EpicAutoClaim.exe``: ``$hash``
+          "@ -replace '(?m)^          ', '' | Out-File -Encoding utf8 release-notes.md
+          Get-Content release-notes.md
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
+          name: EpicAutoClaim ${{ env.TAG }}
           target_commitish: ${{ github.sha }}
-          generate_release_notes: true
-          files: |
-            EpicAutoClaim.exe
-            EpicAutoClaim.exe.sha256
+          body_path: release-notes.md
+          files: EpicAutoClaim.exe
+          fail_on_unmatched_files: true

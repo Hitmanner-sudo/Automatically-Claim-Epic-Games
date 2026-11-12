@@ -11,7 +11,7 @@ func TestXMLIsWellFormedAndCarriesTheSettingsThatMatter(t *testing.T) {
 	s := Spec{
 		Name: "EpicAutoClaim-1001", Exe: `C:\Users\Zoë & Co\AppData\Local\EpicAutoClaim\EpicAutoClaim.exe`,
 		Args: "run --scheduled", Dir: `C:\Users\Zoë & Co\AppData\Local\EpicAutoClaim`,
-		UserSID: "S-1-5-21-1111111111-2222222222-3333333333-1001", Hour: 16, Minute: 30, UTC: true,
+		UserSID: "S-1-5-21-1111111111-2222222222-3333333333-1001",
 	}
 	doc := s.XML()
 	// Parses as XML (the declaration says UTF-16; the string itself is
@@ -52,11 +52,12 @@ func TestXMLIsWellFormedAndCarriesTheSettingsThatMatter(t *testing.T) {
 	if err := xml.Unmarshal([]byte(body), &task); err != nil {
 		t.Fatalf("not well-formed: %v\n%s", err, doc)
 	}
-	if task.Version != "1.2" || task.Triggers.Calendar.StartBoundary != "2026-01-01T16:30:00Z" || task.Triggers.Calendar.Days != 1 {
+	// From midnight by the PC's own clock (no zone), every day.
+	if task.Version != "1.2" || task.Triggers.Calendar.StartBoundary != "2026-01-01T00:00:00" || task.Triggers.Calendar.Days != 1 {
 		t.Errorf("trigger: %+v", task.Triggers)
 	}
-	// Started again every hour through the day (it ends at once unless a
-	// round is due), and at ordinary priority.
+	// Started again every hour through the day (a copy that finds the
+	// program running ends at once), and at ordinary priority.
 	if task.Triggers.Calendar.Every != "PT1H" || task.Triggers.Calendar.For != "P1D" || task.Settings.Priority != 5 {
 		t.Errorf("repetition %q for %q, priority %d", task.Triggers.Calendar.Every, task.Triggers.Calendar.For, task.Settings.Priority)
 	}
@@ -65,7 +66,7 @@ func TestXMLIsWellFormedAndCarriesTheSettingsThatMatter(t *testing.T) {
 		t.Error("Repetition must come before StartBoundary")
 	}
 	// The marker is plain ASCII whatever the path, and changes with the
-	// time of day and with the program's location.
+	// program's location.
 	if task.Marker != s.Marker() || strings.ContainsAny(task.Marker, "&<> ") {
 		t.Errorf("marker = %q", task.Marker)
 	}
@@ -74,14 +75,15 @@ func TestXMLIsWellFormedAndCarriesTheSettingsThatMatter(t *testing.T) {
 			t.Errorf("marker is not ASCII: %q", task.Marker)
 		}
 	}
-	other := s
-	other.Hour = 17
 	moved := s
 	moved.Exe = `D:\Tools\EpicAutoClaim.exe`
-	local := s
-	local.UTC = false
-	if other.Marker() == s.Marker() || moved.Marker() == s.Marker() || local.Marker() == s.Marker() {
-		t.Errorf("markers do not tell tasks apart: %q %q %q %q", s.Marker(), other.Marker(), moved.Marker(), local.Marker())
+	if moved.Marker() == s.Marker() || !strings.HasPrefix(s.Marker(), "eac3-") {
+		t.Errorf("markers do not tell tasks apart: %q %q", s.Marker(), moved.Marker())
+	}
+	// A task registered by an earlier version (for a set time of day) is
+	// not taken for an up-to-date one.
+	if strings.Contains("eac2-1630Z-0a1b2c3d", s.Marker()) {
+		t.Error("an old task's marker must not match")
 	}
 	if task.Principal.UserID != s.UserSID || task.Principal.LogonType != "InteractiveToken" || task.Principal.RunLevel != "LeastPrivilege" {
 		t.Errorf("principal: %+v", task.Principal)
@@ -93,15 +95,6 @@ func TestXMLIsWellFormedAndCarriesTheSettingsThatMatter(t *testing.T) {
 	// Special characters in the path survive the round trip.
 	if task.Exec.Command != s.Exe || task.Exec.Args != s.Args || task.Exec.Dir != s.Dir {
 		t.Errorf("action: %+v", task.Exec)
-	}
-
-	// A local time of day carries no zone.
-	s.UTC, s.Hour, s.Minute = false, 7, 5
-	if !strings.Contains(s.XML(), "<StartBoundary>2026-01-01T07:05:00</StartBoundary>") {
-		t.Errorf("local boundary missing:\n%s", s.XML())
-	}
-	if s.Slot() != "07:05" || (Spec{Hour: 16, Minute: 30, UTC: true}).Slot() != "16:30Z" {
-		t.Errorf("slot names: %q", s.Slot())
 	}
 }
 

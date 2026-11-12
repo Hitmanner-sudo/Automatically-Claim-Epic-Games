@@ -18,9 +18,11 @@ type Config struct {
 	// Country is the two-letter country of the Epic account, used to ask
 	// Epic which games are free there. Empty means "use this PC's region".
 	Country string `json:"country"`
-	// DailyAt is the time of day ("HH:MM", this PC's local time) at which
-	// the program looks for free games, once a day. Empty means the
-	// default: shortly after the hour at which Epic changes its giveaways.
+	// CheckEveryMinutes is how often the program looks for free games:
+	// every 60 minutes unless set otherwise (15 to 1440, a day).
+	CheckEveryMinutes int `json:"checkEveryMinutes"`
+	// DailyAt, when set ("HH:MM", this PC's local time), has the program
+	// look once a day at that time instead of every so many minutes.
 	DailyAt string `json:"dailyAt"`
 	// LauncherPath overrides auto-detection of EpicGamesLauncher.exe.
 	LauncherPath string `json:"launcherPath"`
@@ -39,16 +41,35 @@ type Config struct {
 // Default returns the settings used when no file exists.
 func Default() Config {
 	return Config{
+		CheckEveryMinutes:   DefaultCheckMinutes,
 		RestartIdleLauncher: true,
 		KeepDiagnostics:     true,
 	}
 }
+
+// How often the free-games list is looked at: by default, and the bounds a
+// setting is kept within. (The list is the same for everyone and changes
+// once a week; asking more often than every quarter of an hour would only
+// be a nuisance to Epic.)
+const (
+	DefaultCheckMinutes = 60
+	MinCheckMinutes     = 15
+	MaxCheckMinutes     = 24 * 60
+)
 
 // Normalize brings out-of-range values back to something safe.
 func (c *Config) Normalize() {
 	c.Country = strings.ToUpper(strings.TrimSpace(c.Country))
 	if len(c.Country) != 2 || c.Country[0] < 'A' || c.Country[0] > 'Z' || c.Country[1] < 'A' || c.Country[1] > 'Z' {
 		c.Country = ""
+	}
+	switch {
+	case c.CheckEveryMinutes <= 0:
+		c.CheckEveryMinutes = DefaultCheckMinutes
+	case c.CheckEveryMinutes < MinCheckMinutes:
+		c.CheckEveryMinutes = MinCheckMinutes
+	case c.CheckEveryMinutes > MaxCheckMinutes:
+		c.CheckEveryMinutes = MaxCheckMinutes
 	}
 	if h, m, ok := ParseClock(c.DailyAt); ok {
 		c.DailyAt = fmt.Sprintf("%02d:%02d", h, m)

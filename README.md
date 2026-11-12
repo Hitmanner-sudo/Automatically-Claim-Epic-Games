@@ -2,27 +2,28 @@
 
 A small Windows program that claims the Epic Games Store's free games for you.
 
-Once a day it looks at Epic's free-games list, and when there is a giveaway you do not have yet it uses **your own Epic Games Launcher** (already installed and signed in) to add the game to your library. The launcher never appears on screen while this happens, and the program shows no notifications.
+It starts with Windows, looks at Epic's free-games list every hour, and when there is a giveaway you do not have yet it uses **your own Epic Games Launcher** (already installed and signed in) to add the game to your library. The launcher never appears on screen while this happens, and the program shows no notifications.
 
 > Unofficial. Not affiliated with or endorsed by Epic Games. See [Things to know](#things-to-know).
 
 ## Setup
 
 1. Install the Epic Games Launcher and sign in once with **Remember me** ticked. (If you already use the launcher, this is done.)
-2. Get `EpicAutoClaim.exe`. If this repository has a release, take the file from the **Releases** page. Otherwise, signed in to GitHub, open the **Actions** tab, the newest green **Build and test** run, and download the **EpicAutoClaim** artifact (a zip; extract the exe from it). Artifacts expire after about three months; running the **Release** workflow from the Actions tab publishes a release that does not. (Which build has been tried on a real account is said under *What has been tested*.)
+2. Get `EpicAutoClaim.exe` from the **Releases** page of this repository. It is the whole program: one file, nothing to unpack. (Which build has been tried on a real account is said under *What has been tested*.)
 3. Double-click `EpicAutoClaim.exe`.
 
-A single dialog confirms the installation. That is the only window the program ever shows. From then on Windows starts it once a day (it adds a task of its own to Windows' Task Scheduler; no administrator rights are needed) and it works on its own.
+A single dialog confirms the installation. That is the only window the program ever shows. From then on it starts by itself every time you sign in to Windows and works on its own. (It adds itself to the programs that start with Windows, and a task to Windows' Task Scheduler that starts it again within the hour should it ever be ended. No administrator rights are needed.)
 
 Windows may warn about an unknown publisher the first time, because the file is not code-signed. Choose **More info → Run anyway** if you trust this build.
 
 ## What it does
 
-- Looks **once a day**, at 16:30 UTC, which is shortly after Epic changes its giveaways (you can choose another time). If the PC was off at that time, it looks later the same day instead, but not in the first ten minutes after you sign in to Windows: nothing happens merely because the PC was turned on, and restarting the PC does not cause another look. (Windows does start the program once an hour, but all it does then is glance at its own timetable and end again, unless the daily look or a retry is due.)
-- Reads Epic's public free-games list, and does not give up on it easily: it tries both of Epic's servers several times over, reads the list again when it comes back empty or half-updated, goes by Epic's clock when the PC's is wrong, and, while the list cannot be read at all, still claims giveaways it already knows to be running. If nothing is new, that is all it does, and it ends until the next day.
+- **Starts when the PC does**: Windows runs it as you sign in, and it stays in the background. It waits two minutes first (the network and the launcher's own start are not ready before that).
+- Looks **every hour** (you can choose another interval, or a set time of day). It also looks a few minutes after the moment Epic has announced the next giveaway for, so with the PC on a new game is normally in your library minutes after it becomes free. It remembers when it last looked: a PC that was off overnight looks straight away, and restarting the PC twice in an hour does not make it ask twice.
+- Reads Epic's public free-games list, and does not give up on it easily: it tries both of Epic's servers several times over, reads the list again when it comes back empty or half-updated, goes by Epic's clock when the PC's is wrong, and, while the list cannot be read at all, still claims giveaways it already knows to be running. If nothing is new, that is all it does until the next hour.
 - When something is free and not yet claimed, it starts the launcher on a separate Windows desktop that is never displayed, opens Epic's checkout inside it, confirms that the price is zero, and places the order. If the checkout cannot be opened directly, it goes the way you would: the game's store page, **Get**, and the launcher's own checkout window.
 - Closes the hidden launcher again. The whole thing takes about a minute.
-- If a claim could not be made (see below), it stays in the background and tries again later the same day; what is still open after that is taken up at the next daily round.
+- If a claim could not be made (see below), it tries again later: after ten minutes if the launcher was in use, after longer and longer waits if something went wrong.
 - Writes what it did to a log file. Nothing else.
 
 ### When it waits
@@ -42,9 +43,10 @@ If you start the launcher yourself while a claim is in progress, the program sto
 
 It is built to be unnoticeable on the weakest PC that can run the Epic Games Launcher at all.
 
-- One file of under 8 MB. No installer, no service, no runtime to install, no tray icon, nothing in Windows' list of start-up apps.
-- Most of the time it is not running at all. Windows starts it once an hour; it reads two small files, sees that nothing is due, and is gone again in a fraction of a second, without touching the network.
-- When it does have to wait for something (the launcher being in use, a retry later the same day), it gives its memory back to Windows, drops to the lowest priority for the processor, the disk and memory (what Windows 11 calls efficiency mode), and looks at the clock once a minute.
+- One file of under 8 MB. No installer, no service, no runtime to install, no tray icon.
+- Between looks it sleeps: it gives its memory back to Windows, drops to the lowest priority for the processor, the disk and memory (what Windows 11 calls efficiency mode), and does nothing but look at the clock once a minute.
+- An hourly look is one small download from Epic (the list is about 30 kB) and a glance at what it already knows.
+- Once an hour Windows also starts a second copy, which sees the first one and is gone again in a fraction of a second. That is all the Task Scheduler task does, and it is what brings the program back if it was ever ended.
 - The only real work is the claim itself, about half a minute per giveaway, and nearly all of that is the Epic Games Launcher running hidden, not this program.
 - On disk it keeps a log capped at 1 MB (plus three old ones), a small state file, and the details of the last few attempts that did not succeed.
 
@@ -76,9 +78,9 @@ From a terminal in that folder:
 | `EpicAutoClaim.exe once --dry-run` | Same, but stops just before placing the order |
 | `EpicAutoClaim.exe once --dry-run --again` | The same rehearsal, also for games it has dealt with already; records nothing |
 | `EpicAutoClaim.exe doctor --launch` | Starts the launcher hidden for a moment and reports what it found; claims nothing |
-| `EpicAutoClaim.exe stop` | Stops the background process until Windows starts it again at its daily time |
+| `EpicAutoClaim.exe stop` | Stops the background process; Windows starts it again within the hour, or when you next sign in |
 | `EpicAutoClaim.exe install` | Installs it, or brings the installation in line with the settings (same as a double-click, without the dialog) |
-| `EpicAutoClaim.exe uninstall` | Stops it and removes its daily task from Windows |
+| `EpicAutoClaim.exe uninstall` | Stops it and removes it from Windows' start-up programs and Task Scheduler |
 
 A good first test on your own PC is `EpicAutoClaim.exe doctor --launch` followed by `EpicAutoClaim.exe once --dry-run`.
 
@@ -89,7 +91,8 @@ Edit `config.json`, then double-click the program again (or run `EpicAutoClaim.e
 | Setting | Default | Meaning |
 |---|---|---|
 | `country` | your Windows region | Two-letter country of your Epic account, used to ask which games are free there |
-| `dailyAt` | shortly after Epic's changeover | Time of day for the daily look, as `"HH:MM"` in your local time, e.g. `"18:30"` |
+| `checkEveryMinutes` | `60` | How often to look for free games, in minutes (15 to 1440) |
+| `dailyAt` | not set | If set, as `"HH:MM"` in your local time (e.g. `"18:30"`), look once a day at that time instead |
 | `restartIdleLauncher` | `true` | Allow closing a launcher that is idle in the tray for the duration of a claim |
 | `dryRun` | `false` | Go through everything except placing the order |
 | `keepDiagnostics` | `true` | Keep a screenshot and details of failed attempts on this PC |
@@ -134,7 +137,7 @@ What a single test cannot show is how Epic's pages will change. The program is w
 ## How it works
 
 1. `internal/feed` reads `freeGamesPromotions`, Epic's public list, and keeps offers whose promotion is active and whose price is zero.
-2. `internal/daemon` decides what is due, with back-off after failures, and writes its timetable down so that a restart changes nothing about it. `internal/sched` has Windows' Task Scheduler start the program once a day.
+2. `internal/daemon` decides what is due, with back-off after failures, and writes its timetable down so that a restart changes nothing about it. A start-up entry has Windows start the program at sign-in; `internal/sched` adds the Task Scheduler task that starts it again within the hour if it is not running.
 3. `internal/launcher` and `internal/win` find the launcher, check that you are not using it, and start it on a private desktop (`CreateDesktop`) in its start-in-tray mode with `-cefdebug=<port>`, which makes its embedded browser accept DevTools connections on localhost. The process tree lives in a job object, so it cannot outlive this program.
 4. `internal/claim` opens Epic's checkout in the launcher's own browser session through `internal/cdp`, reads the page, verifies the price, and clicks. Requests that could place an order are intercepted and inspected first (`watch.go`).
 5. `internal/runner` ties one such session together and steps aside if you start the launcher.
@@ -164,4 +167,4 @@ Not bad for something nobody typed.
 
 ## Removing it
 
-Run `EpicAutoClaim.exe uninstall` (it removes the daily task and stops the program), then delete the `%LOCALAPPDATA%\EpicAutoClaim` folder.
+Run `EpicAutoClaim.exe uninstall` (it removes the start-up entry and the task, and stops the program), then delete the `%LOCALAPPDATA%\EpicAutoClaim` folder.

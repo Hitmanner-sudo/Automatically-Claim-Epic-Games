@@ -58,9 +58,6 @@ type Schedule struct {
 	// time being: the regular check it was left to. From then on the
 	// retries start afresh.
 	FeedGaveUpUntil time.Time `json:"feedGaveUpUntil,omitzero"`
-	// IdleNoted is when the log last said that there was nothing to do
-	// (said at most once a day, though Windows starts the program hourly).
-	IdleNoted time.Time `json:"idleNoted,omitzero"`
 }
 
 type file struct {
