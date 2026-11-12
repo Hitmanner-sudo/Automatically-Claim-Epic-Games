@@ -226,9 +226,18 @@ func TestKeyDistinguishesRepeatGiveaways(t *testing.T) {
 	}
 }
 
+// servedAt0400 stamps a reply with the moment the tests pretend it is. A
+// test server would otherwise stamp it with the real time, and the client
+// (which sets its clock by Epic's when the two are far apart) would then
+// read the sample list, a week's giveaway, by today's date.
+func servedAt0400(w http.ResponseWriter) {
+	w.Header().Set("Date", "Thu, 12 Nov 2026 04:00:00 GMT")
+}
+
 func TestFetchSendsCountryAndRejectsErrors(t *testing.T) {
 	var gotQuery string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		servedAt0400(w)
 		gotQuery = r.URL.RawQuery
 		if r.URL.Query().Get("country") == "ZZ" {
 			http.Error(w, "nope", http.StatusForbidden)
@@ -266,6 +275,7 @@ func TestFetchKeepsTryingThroughHiccups(t *testing.T) {
 	var calls int
 	fail := 2
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		servedAt0400(w)
 		calls++
 		switch {
 		case calls <= fail && calls%2 == 1:
@@ -358,6 +368,7 @@ func TestBackendFailureIsNotTakenForAnUnknownCountry(t *testing.T) {
 	var asked []string
 	fail := 1
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		servedAt0400(w)
 		c := r.URL.Query().Get("country")
 		asked = append(asked, c)
 		switch {
