@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -71,6 +72,10 @@ func Start(t testing.TB) string {
 		t.Skipf("cannot start %s: %v", bin, err)
 	}
 	t.Cleanup(func() {
+		if runtime.GOOS == "windows" {
+			// Chrome's helper processes outlive a plain kill there.
+			_ = exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(cmd.Process.Pid)).Run()
+		}
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
 		for i := 0; i < 20; i++ {

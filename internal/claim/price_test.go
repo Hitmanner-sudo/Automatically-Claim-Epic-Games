@@ -73,3 +73,21 @@ func TestCombine(t *testing.T) {
 		t.Error("paid must outweigh everything")
 	}
 }
+
+func TestJudgePrices(t *testing.T) {
+	cases := []struct {
+		prices []string
+		want   Verdict
+	}{
+		{nil, Unknown},
+		{[]string{"$0.00"}, Free},
+		{[]string{"0,00 €", "0,00 €"}, Free},
+		{[]string{"$24.99", "$24.99", "$0.00"}, Unknown}, // full price and discount next to a zero total
+		{[]string{"$19.99"}, Unknown},
+	}
+	for _, c := range cases {
+		if got := JudgePrices(c.prices); got != c.want {
+			t.Errorf("JudgePrices(%q) = %v, want %v", c.prices, got, c.want)
+		}
+	}
+}

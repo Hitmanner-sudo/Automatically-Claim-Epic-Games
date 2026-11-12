@@ -1,0 +1,5 @@
+
+' A simple example to help debug also
+Function ShowMessageBox()
+	MsgBox Session.Property("CustomActionData")
+End Function

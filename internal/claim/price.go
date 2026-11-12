@@ -177,3 +177,20 @@ func Combine(vs ...Verdict) Verdict {
 	}
 	return out
 }
+
+// JudgePrices judges the list of every amount of money shown on a checkout
+// page. If each one is zero, the page shows nothing but a zero price, which
+// is what Epic's free checkout looks like. Anything else is inconclusive:
+// an ordinary checkout lists the full price and the discount next to the
+// total, so non-zero amounts alone do not mean the total is non-zero.
+func JudgePrices(prices []string) Verdict {
+	if len(prices) == 0 {
+		return Unknown
+	}
+	for _, p := range prices {
+		if JudgeTotalText(p) != Free {
+			return Unknown
+		}
+	}
+	return Free
+}

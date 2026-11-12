@@ -36,6 +36,10 @@ type scenario struct {
 	Region       bool   `json:"region"`       // checkout says unavailable in region
 	Pin          bool   `json:"pin"`          // parental PIN prompt
 	FormPost     bool   `json:"formPost"`     // order is sent as a form, not JSON
+	NewLayout    bool   `json:"newLayout"`    // Epic's 2026 free checkout: no "total" line, "Add to library"
+	NewPrice     string `json:"newPrice"`     // price shown by the new layout (default "$0.00")
+	NoFreeText   bool   `json:"noFreeText"`   // new layout without the "This is free" sentence
+	Throttled    bool   `json:"throttled"`    // "unable to download any more free games"
 }
 
 func intp(i int) *int { return &i }
@@ -62,10 +66,11 @@ func newMockStore(t *testing.T, sc scenario) *mockStore {
 	mux.HandleFunc("/purchase", m.handleCheckout)
 	mux.HandleFunc("/purchase/order-preview", m.handlePreview)
 	mux.HandleFunc("/purchase/confirm-order", m.handleConfirm)
+	mux.HandleFunc("/checkout/api/complete", m.handleConfirm)
 	mux.HandleFunc("/graphql", m.handleGraphQL)
 	mux.HandleFunc("/id/login", m.handleLogin)
 	mux.HandleFunc("/frame", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = io.WriteString(w, "<!doctype html><body>frame</body>")
 	})
 	m.srv = httptest.NewServer(mux)
@@ -104,7 +109,7 @@ func (m *mockStore) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, r.URL.Query().Get("redirectUrl"), http.StatusFound)
 		return
 	}
-	w.Header().Set("Content-Type", "text/html")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = io.WriteString(w, `<!doctype html><html><head><title>Sign in to Your Epic Games account | Epic Games</title></head><body>
 <h1>Sign in to Epic Games</h1><form><input id="email" name="email"><input id="password" type="password"><button type="submit">Continue</button></form></body></html>`)
 }
@@ -168,7 +173,7 @@ const errorPage = `<!doctype html><html><head><title>Payment by Epic Games</titl
 <input type="hidden" id="purchaseToken" value=""><script>window.__epic_web_purchase_dataPreload = {};</script></body></html>`
 
 func (m *mockStore) handleCheckout(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if !m.hasSession(r) {
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = io.WriteString(w, errorPage)
@@ -180,8 +185,51 @@ func (m *mockStore) handleCheckout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sc, _ := json.Marshal(m.sc)
-	_, _ = io.WriteString(w, strings.ReplaceAll(checkoutPage, "__SCENARIO__", string(sc)))
+	page := checkoutPage
+	if m.sc.NewLayout {
+		page = newCheckoutPage
+	}
+	_, _ = io.WriteString(w, strings.ReplaceAll(page, "__SCENARIO__", string(sc)))
 }
+
+// newCheckoutPage imitates the free checkout Epic introduced in 2026: no
+// payment-* classes, no "total" line, the button reads "Add to library" and
+// the confirmation reads "It's all yours".
+const newCheckoutPage = `<!doctype html><html><head><title>Checkout</title>
+<style>
+ body { margin: 0; font-family: sans-serif; background: #101014; color: #fff; }
+ section { width: 520px; margin: 40px auto; padding: 24px; background: #202024; }
+ button { width: 220px; height: 48px; }
+</style></head><body>
+<div id="root"><section role="dialog">
+  <h2>Checkout</h2>
+  <div class="_item_x1a">Flotsam</div>
+  <div class="_cost_k3d" id="cost"></div>
+  <p id="free-note"></p>
+  <button class="_btn_q9 _primary_aa" id="go" disabled>Add to library</button>
+  <p>By selecting 'Add to library', you certify that you are over 18 and an authorized user.</p>
+  <div id="extra"></div>
+</section></div>
+<iframe src="/frame" title="hCaptcha" style="display:none"></iframe>
+<script>
+var S = __SCENARIO__;
+window.clicks = [];
+var offers = new URLSearchParams(location.search).getAll('offers');
+var btn = document.getElementById('go');
+document.getElementById('cost').textContent = S.newPrice || '$0.00';
+if (!S.noFreeText) document.getElementById('free-note').textContent = 'This is free. Add it to your library to get started.';
+if (S.german) { btn.textContent = 'Zur Bibliothek hinzufügen'; document.getElementById('free-note').textContent = S.noFreeText ? '' : 'Dies ist kostenlos.'; }
+if (S.throttled) document.getElementById('extra').textContent = 'Your account is unable to download any more free games at this time. Please wait 24 hours before trying to redeem a free game again.';
+setTimeout(function () { btn.disabled = false; }, S.slowMs || 0);
+btn.addEventListener('click', function (ev) {
+  window.clicks.push({ what: 'place', trusted: ev.isTrusted });
+  fetch('/checkout/api/complete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ purchaseToken: 'tok', offers: offers }) })
+    .then(function (r) { return r.json(); }).then(function (c) {
+      if (c.error) document.getElementById('extra').innerHTML = '<div role="alert">' + c.message + '</div>';
+      else document.querySelector('section').innerHTML = '<h1>' + (S.german ? 'Alles deins' : "It's all yours") + '</h1><p>Download the Epic Games Launcher to play</p>';
+    });
+});
+</script></body></html>`
 
 const checkoutPage = `<!doctype html><html><head><title>Payment by Epic Games</title>
 <style>

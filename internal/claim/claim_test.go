@@ -195,9 +195,80 @@ func TestOrderWithoutStatedTotalNeedsEvidenceFromThePage(t *testing.T) {
 	wantOutcome(t, r, Claimed, 1)
 }
 
-func TestOrderStatingZeroIsEnoughEvidence(t *testing.T) {
+func TestNoButtonIsPressedWithoutEvidence(t *testing.T) {
+	// The order this page would send states a zero total, but nothing on
+	// the page itself confirms the price beforehand: the button is not
+	// pressed at all.
 	r := runScenario(t, scenario{SignedIn: true, DomTotal: "", NoPreview: true, ConfirmTotal: intp(0)}, nil)
+	wantOutcome(t, r, Failed, 0)
+	if !strings.Contains(r.res.Detail, "could not be confirmed") {
+		t.Errorf("detail = %q", r.res.Detail)
+	}
+}
+
+// ---- Epic's 2026 free checkout ("Add to library" / "It's all yours")
+
+func TestNewCheckoutLayout(t *testing.T) {
+	r := runScenario(t, scenario{SignedIn: true, NewLayout: true}, nil)
 	wantOutcome(t, r, Claimed, 1)
+}
+
+func TestNewCheckoutLayoutWithoutOwnershipQuery(t *testing.T) {
+	// Success is then read from the page ("It's all yours").
+	r := runScenario(t, scenario{SignedIn: true, NewLayout: true, GraphQLDown: true}, nil)
+	wantOutcome(t, r, Claimed, 1)
+	if !strings.Contains(r.res.Detail, "confirmation") {
+		t.Errorf("detail = %q", r.res.Detail)
+	}
+}
+
+func TestNewCheckoutLayoutInAnotherLanguage(t *testing.T) {
+	// No English sentence and no known label: the only price on the page
+	// is zero, and the page has a single button that is not a way out.
+	r := runScenario(t, scenario{SignedIn: true, NewLayout: true, German: true, NewPrice: "0,00 €", NoFreeText: true}, nil)
+	wantOutcome(t, r, Claimed, 1)
+}
+
+func TestUnrecognisedCheckoutIsReportedAsSuch(t *testing.T) {
+	// The old layout in a language whose labels are unknown, with the class
+	// names gone: two buttons, neither recognisable. It must be reported as
+	// an unrecognised checkout, not as "signed out", and nothing is pressed.
+	base := sharedBrowser(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<!doctype html><title>x</title><body><div id="purchase-app"><p>0,00 zł</p>
+<button style="width:200px;height:40px">Zamów teraz</button> <button style="width:200px;height:40px">Dodaj kod</button></div></body>`))
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	s, err := Open(ctx, base, Options{CheckoutBases: []string{srv.URL}, LoginBase: srv.URL, SettleWait: 50 * time.Millisecond, CheckoutWait: 5 * time.Second, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	res := s.Claim(ctx, testOffer())
+	if res.Outcome != Failed || !strings.Contains(res.Detail, "not recognised") || !strings.Contains(res.Detail, "Dodaj kod") {
+		t.Fatalf("result = %v", res)
+	}
+}
+
+func TestNewCheckoutLayoutShowingAPriceIsNotOrdered(t *testing.T) {
+	r := runScenario(t, scenario{SignedIn: true, NewLayout: true, NewPrice: "$19.99", NoFreeText: true}, nil)
+	wantOutcome(t, r, Failed, 0)
+	if !strings.Contains(r.res.Detail, "could not be confirmed") {
+		t.Errorf("detail = %q", r.res.Detail)
+	}
+}
+
+func TestNewCheckoutLayoutWithNoPriceAtAllIsNotOrdered(t *testing.T) {
+	r := runScenario(t, scenario{SignedIn: true, NewLayout: true, NewPrice: "Included", NoFreeText: true}, nil)
+	wantOutcome(t, r, Failed, 0)
+}
+
+func TestThrottledAccount(t *testing.T) {
+	r := runScenario(t, scenario{SignedIn: true, NewLayout: true, Throttled: true}, nil)
+	wantOutcome(t, r, Throttled, 0)
 }
 
 func TestDryRunPlacesNoOrder(t *testing.T) {
@@ -522,7 +593,7 @@ func TestFallsThroughToAWorkingCheckoutAddress(t *testing.T) {
 	// First address: a site with no checkout at all. Second: signed out
 	// (error page). Third: works.
 	nothing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte("<!doctype html><title>404</title><body><h1>Page not found</h1></body>"))
 	}))

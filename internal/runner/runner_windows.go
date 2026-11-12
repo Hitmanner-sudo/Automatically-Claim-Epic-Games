@@ -243,7 +243,74 @@ type LaunchReport struct {
 	HiddenWindows  []win.Window
 	OnUserDesktop  []win.Window
 	SignedIn       string // "yes", "no", "unknown"
+	Pages          []PageSurvey
 	Err            string
+}
+
+// PageSurvey describes one launcher page: where it is, which buttons it
+// shows, and which functions the launcher offers to it. No page text and no
+// account details are collected.
+type PageSurvey struct {
+	URL     string   `json:"url"`
+	Title   string   `json:"title"`
+	Buttons []string `json:"buttons"`
+	Bridge  []string `json:"bridge"`
+	Err     string   `json:"err,omitempty"`
+}
+
+const surveyJS = `(function () {
+  function t(el) { return ((el.innerText || el.textContent) || '').replace(/\s+/g, ' ').trim().slice(0, 40); }
+  var out = { url: location.origin + location.pathname, title: document.title.slice(0, 80), buttons: [], bridge: [] };
+  var bs = document.querySelectorAll('button, [role="button"]');
+  for (var i = 0; i < bs.length && out.buttons.length < 25; i++) {
+    var r = bs[i].getBoundingClientRect();
+    var label = t(bs[i]) || (bs[i].getAttribute('aria-label') || '').slice(0, 40);
+    if (r.width > 4 && r.height > 4 && label) out.buttons.push(label);
+  }
+  try {
+    var ue = window.ue;
+    if (ue) for (var k in ue) {
+      var names = [];
+      try { for (var f in ue[k]) names.push(f); } catch (e) {}
+      out.bridge.push(k + (names.length ? ': ' + names.slice(0, 30).join(' ') : ''));
+      if (out.bridge.length >= 40) break;
+    }
+  } catch (e) {}
+  return out;
+})()`
+
+func surveyPages(ctx context.Context, base string) []PageSurvey {
+	lctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	targets, err := cdp.Targets(lctx, base)
+	cancel()
+	if err != nil {
+		return nil
+	}
+	var out []PageSurvey
+	for _, t := range targets {
+		if t.Type != "page" || len(out) >= 6 {
+			continue
+		}
+		var ps PageSurvey
+		func() {
+			pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			page, err := cdp.OpenPage(pctx, t)
+			if err != nil {
+				ps.URL, ps.Err = t.URL, err.Error()
+				return
+			}
+			defer page.Close()
+			if err := page.Eval(pctx, surveyJS, &ps); err != nil {
+				ps.URL, ps.Err = t.URL, err.Error()
+			}
+		}()
+		if i := strings.IndexAny(ps.URL, "?#"); i >= 0 {
+			ps.URL = ps.URL[:i]
+		}
+		out = append(out, ps)
+	}
+	return out
 }
 
 // TrialLaunch starts the hidden launcher, looks at what it exposes, and
@@ -333,6 +400,12 @@ func (r *Runner) TrialLaunch(ctx context.Context) LaunchReport {
 			break
 		}
 	}
+	if rep.SignedIn == "yes" {
+		// Give the launcher's store page a moment to finish loading.
+		time.Sleep(8 * time.Second)
+		rep.TargetsAfter = list()
+	}
+	rep.Pages = surveyPages(ctx, base)
 	rep.HiddenWindows = in.HiddenWindows()
 	rep.OnUserDesktop = in.OnUserDesktop()
 	return rep

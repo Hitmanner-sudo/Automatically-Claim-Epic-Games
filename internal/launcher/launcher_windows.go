@@ -567,6 +567,7 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 
 	stopGuard := make(chan struct{})
 	var guardDone sync.WaitGroup
+	var hiddenCount int
 	guardDone.Add(1)
 	go func() {
 		defer guardDone.Done()
@@ -593,15 +594,21 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 				for _, w := range win.Windows() {
 					if names[w.PID] && w.Visible {
 						win.HideWindow(w.HWND)
+						hiddenCount++
 					}
 				}
 			}
 		}
 	}()
-	defer func() {
-		close(stopGuard)
-		guardDone.Wait()
-	}()
+	guardStopped := false
+	stopGuardNow := func() {
+		if !guardStopped {
+			guardStopped = true
+			close(stopGuard)
+			guardDone.Wait()
+		}
+	}
+	defer stopGuardNow()
 
 	// The update is finished when the (restarted) launcher is back with its
 	// DevTools endpoint up.
@@ -650,10 +657,15 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	stopGuardNow()
 	if !ok {
 		return errors.New("the launcher did not come back from its update within 10 minutes")
 	}
-	logf("the launcher finished updating itself")
+	if hiddenCount > 0 {
+		logf("the launcher finished updating itself (it tried to show a window %d time(s); each was hidden again within a few hundredths of a second)", hiddenCount)
+	} else {
+		logf("the launcher finished updating itself (no window was shown)")
+	}
 	return nil
 }
 

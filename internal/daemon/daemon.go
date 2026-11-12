@@ -105,7 +105,9 @@ const (
 	busyRetry    = 10 * time.Minute
 	yieldRetry   = 30 * time.Minute
 	dryRunRetry  = 24 * time.Hour
-	minSleep     = time.Minute
+	// Epic's own notice asks to wait 24 hours.
+	throttleRetry = 25 * time.Hour
+	minSleep      = time.Minute
 	// endMargin: no order is started this close to a promotion's end.
 	endMargin = 3 * time.Minute
 )
@@ -297,6 +299,9 @@ func (d *Daemon) claim(ctx context.Context, due []feed.Offer) time.Time {
 				e.Attempts++
 				e.NextAttempt = now.Add(pick(captchaBackoff, e.Attempts))
 				d.logf("%s: %s; leaving it alone until %s", o.Title, res.Detail, e.NextAttempt.Local().Format("Mon 15:04"))
+			case claim.Throttled:
+				e.NextAttempt = now.Add(throttleRetry)
+				d.logf("%s: %s; trying again in %v", o.Title, res.Detail, throttleRetry)
 			case claim.NotSignedIn:
 				e.NextAttempt = now.Add(signInRetry)
 				d.notice("signin", "%s: %s; will try again in %v", o.Title, res.Detail, signInRetry)

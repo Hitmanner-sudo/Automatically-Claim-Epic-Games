@@ -379,6 +379,18 @@ func cmdDoctor(a *app, args []string) int {
 		fmt.Fprintf(a.out, "  %-8s %s\n", t.Type, u)
 	}
 	fmt.Fprintf(a.out, "Signed in: %s\n", rep.SignedIn)
+	for _, pg := range rep.Pages {
+		fmt.Fprintf(a.out, "  page %s  (%s)\n", pg.URL, pg.Title)
+		if pg.Err != "" {
+			fmt.Fprintf(a.out, "    could not be read: %s\n", pg.Err)
+		}
+		if len(pg.Buttons) > 0 {
+			fmt.Fprintf(a.out, "    buttons: %s\n", strings.Join(pg.Buttons, " | "))
+		}
+		for _, b := range pg.Bridge {
+			fmt.Fprintf(a.out, "    launcher function group %s\n", b)
+		}
+	}
 	visibleHidden := 0
 	for _, w := range rep.HiddenWindows {
 		if w.Visible {

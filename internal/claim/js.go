@@ -40,7 +40,7 @@ const inspectJS = `(function () {
   out.browserCheck = /just a moment|verify you are human|checking your browser|attention required/i.test(document.title + ' ' + body.slice(0, 400));
 
   var app = document.querySelector('#purchase-app');
-  out.app = !!app;
+  out.app = !!app || /\/(purchase|checkout)(\/|$)/.test(path);
   var msg = app && app.querySelector('.message');
   out.appError = msg ? text(msg).slice(0, 200) : '';
 
@@ -51,20 +51,33 @@ const inspectJS = `(function () {
 
   function pick(test) { for (var i = 0; i < buttons.length; i++) if (test(buttons[i])) return buttons[i]; return null; }
   var consent = pick(function (b) { return /payment-confirm__btn/.test(cls(b)) && !/secondary|cancel/i.test(cls(b)); }) ||
-    pick(function (b) { return /^(i accept|i agree|accept)$/i.test(text(b)); });
+    pick(function (b) { return /^(i accept|i agree|accept|akzeptieren|ich stimme zu)$/i.test(text(b)); });
+  // Epic renamed the button from "Place Order" to "Add to library" for free
+  // offers in 2026; both are in use.
   var place = pick(function (b) { return /payment-order-confirm__btn/.test(cls(b)); }) ||
-    pick(function (b) { return /^place order$/i.test(text(b)); });
-  if (!place && app) {
-    // Unknown language or renamed classes: accept the checkout's single
-    // primary button, but only when there is exactly one candidate.
-    var prim = [];
+    pick(function (b) { return /^(place order|add to library|zur bibliothek hinzuf\u00fcgen|bestellung abschlie\u00dfen)$/i.test(text(b)); });
+  out.guessed = false;
+  if (!place && out.app) {
+    // Unknown language or renamed classes. Accept the checkout's single
+    // primary button, or failing that its single button that is not a way
+    // out, but only when there is exactly one candidate. (Nothing is
+    // pressed anyway unless the page proves the price is zero.)
+    var wayOut = /cancel|close|back|dismiss|abbrechen|schlie|zur\u00fcck|annuler|fermer|retour|cancelar|cerrar|volver|annulla|chiudi|anuluj|zamknij|\u043e\u0442\u043c\u0435\u043d|\u0437\u0430\u043a\u0440\u044b|iptal|kapat|\u53d6\u6d88|\u5173\u95ed|\u95dc\u9589|\u30ad\u30e3\u30f3\u30bb\u30eb|\u9589\u3058\u308b|\ucde8\uc18c|\ub2eb\uae30/i;
+    var prim = [], rest = [];
     for (var j = 0; j < buttons.length; j++) {
-      if (buttons[j] !== consent && /btn--primary|payment-btn--primary/.test(cls(buttons[j]))) prim.push(buttons[j]);
+      var bj = buttons[j];
+      if (bj === consent) continue;
+      var label = text(bj) + ' ' + (bj.getAttribute('aria-label') || '');
+      if (/btn--primary|payment-btn--primary/.test(cls(bj))) prim.push(bj);
+      if (text(bj) && !wayOut.test(label)) rest.push(bj);
     }
-    if (prim.length === 1) place = prim[0];
+    if (prim.length === 1) { place = prim[0]; out.guessed = true; }
+    else if (prim.length === 0 && rest.length === 1) { place = rest[0]; out.guessed = true; }
   }
   out.place = place ? button(place) : null;
   out.consent = consent && consent !== place ? button(consent) : null;
+  out.buttons = [];
+  for (var bi = 0; bi < buttons.length && out.buttons.length < 10; bi++) out.buttons.push(text(buttons[bi]).slice(0, 40));
 
   // A CAPTCHA only counts when its challenge is actually on screen: the
   // checkout always carries invisible hCaptcha frames.
@@ -75,7 +88,8 @@ const inspectJS = `(function () {
     var id = (f.src || '') + ' ' + (f.id || '') + ' ' + (f.title || '') + ' ' + (f.parentElement ? (f.parentElement.id || '') + ' ' + cls(f.parentElement) : '');
     if (/hcaptcha|h_captcha|recaptcha|arkoselabs|funcaptcha|talon/i.test(id) && shown(f, 120)) out.captcha = true;
   }
-  if (/one more step|please complete (a|the) security check|select all (images|squares)/i.test(body)) out.captcha = true;
+  if (/one more step|complete (a|the) security check|select all (images|squares)/i.test(body)) out.captcha = true;
+  out.throttled = /unable to download any more free games|wait 24 hours before trying to redeem/i.test(body);
 
   out.pin = !!scope.querySelector('.payment-pin-code, [class*="pin-code"]');
 
@@ -96,11 +110,24 @@ const inspectJS = `(function () {
     if (tt && tt.length < 120) out.totals.push(tt);
   }
 
+  // Every amount of money mentioned on the page. A number only counts when
+  // a currency sign or code stands next to it ("over 18" is not a price).
+  out.prices = [];
+  var CUR = '(?:R\\$|[$\u20ac\u00a3\u00a5\u20b9\u20bd\u20a9\u20ba\u20b4\u20ab\u0e3f\u20aa]|z\u0142|K\u010d|kr|Ft|lei|TL|' +
+    'USD|EUR|GBP|CAD|AUD|NZD|BRL|RUB|TRY|PLN|JPY|KRW|INR|CNY|MXN|ARS|CLP|COP|PEN|UAH|KZT|CHF|SEK|NOK|DKK|CZK|HUF|RON|BGN|ILS|SAR|AED|QAR|ZAR|THB|IDR|MYR|PHP|SGD|HKD|TWD|VND)';
+  var NUM = '\\d{1,3}(?:[ .,\u00a0\u202f]\\d{3})+(?:[.,]\\d{1,2})?|\\d+(?:[.,]\\d{1,2})?';
+  var priceRe = new RegExp('(?:^|[^A-Za-z0-9])(' + CUR + '\\s?-?(?:' + NUM + ')|-?(?:' + NUM + ')\\s?' + CUR + ')(?![A-Za-z0-9])', 'g');
+  var checkoutText = app && app.innerText ? text(app) : body;
+  var pm;
+  while ((pm = priceRe.exec(checkoutText)) && out.prices.length < 40) out.prices.push(pm[1]);
+  // Epic's own statement on the free checkout.
+  out.saysFree = /\bthis (game |product |item |add-on |bundle )?is free\b/i.test(checkoutText);
+
   var pre = null;
   try { pre = window.__epic_web_purchase_dataPreload; } catch (err) {}
   try { out.preload = pre ? JSON.stringify(pre).slice(0, 400000) : ''; } catch (err2) { out.preload = ''; }
 
-  out.success = /thanks? for your (order|purchase)|thank you for (buying|your order|your purchase)|order (is )?(complete|confirmed)/i.test(body);
+  out.success = /thanks? for your (order|purchase)|thank you for (buying|your order|your purchase)|order (is )?(complete|confirmed)|it.?s all yours|vielen dank f\u00fcr.{0,40}bestellung|bestellung erfolgreich/i.test(body);
   out.owned = /already own|you own this (item|product|game)/i.test(body);
   out.region = /unavailable in your region|not available in your (region|country)/i.test(body);
   return out;
@@ -117,11 +144,16 @@ type pageState struct {
 	App          bool     `json:"app"`
 	AppError     string   `json:"appError"`
 	Place        *btn     `json:"place"`
+	Guessed      bool     `json:"guessed"`
+	Buttons      []string `json:"buttons"`
 	Consent      *btn     `json:"consent"`
 	Captcha      bool     `json:"captcha"`
 	Pin          bool     `json:"pin"`
 	Errors       []string `json:"errors"`
 	Totals       []string `json:"totals"`
+	Prices       []string `json:"prices"`
+	SaysFree     bool     `json:"saysFree"`
+	Throttled    bool     `json:"throttled"`
 	Preload      string   `json:"preload"`
 	Success      bool     `json:"success"`
 	Owned        bool     `json:"owned"`

@@ -37,6 +37,8 @@ const (
 	Unavailable Outcome = "unavailable"
 	// Captcha: Epic asked for a human check. Nothing was done; retry later.
 	Captcha Outcome = "captcha"
+	// Throttled: Epic says the account must wait before claiming more.
+	Throttled Outcome = "throttled"
 	// NotSignedIn: the launcher (or its web session) is signed out.
 	NotSignedIn Outcome = "not-signed-in"
 	// NotFree: the checkout showed a price above zero. Nothing was ordered.
@@ -606,6 +608,8 @@ func (s *Session) checkout(ctx context.Context, o feed.Offer, w *orderWatch, add
 				return Result{Unavailable, "not available in this account's region"}, last, false
 			case st.Pin:
 				return Result{Unavailable, "the account asks for a parental-control PIN, which this program does not handle"}, last, false
+			case st.Throttled:
+				return Result{Throttled, "Epic says this account cannot claim more free games right now"}, last, false
 			case st.Captcha:
 				return Result{Captcha, "Epic asked for a human check before the order"}, last, false
 			}
@@ -641,6 +645,10 @@ func (s *Session) checkout(ctx context.Context, o feed.Offer, w *orderWatch, add
 			}
 			if ierr != nil {
 				return Result{Failed, "the checkout page could not be read: " + ierr.Error()}, last, mayFallThrough
+			}
+			if last.App && last.AppError == "" && len(last.Buttons) > 0 {
+				// A checkout did come up; another address would look the same.
+				return Result{Failed, fmt.Sprintf("the checkout loaded but its order button was not recognised or never became ready (buttons on the page: %q)", last.Buttons)}, last, false
 			}
 			return Result{Failed, "the checkout did not become ready (page: " + trimURL(last.URL) + ")"}, last, mayFallThrough
 		}
@@ -679,12 +687,31 @@ func (s *Session) checkout(ctx context.Context, o feed.Offer, w *orderWatch, add
 	if preview != Unknown {
 		evidence = append(evidence, fmt.Sprintf("order preview (%v)", preview))
 	}
-	pre := Combine(dom, preload, preview)
+	// Epic's newer free checkout has no "total" line: it shows the price
+	// (zero) and says "This is free".
+	shown := JudgePrices(last.Prices)
+	if shown == Free {
+		evidence = append(evidence, fmt.Sprintf("the only price on the page is %q", last.Prices[0]))
+	}
+	stated := Unknown
+	if last.SaysFree {
+		stated = Free
+		evidence = append(evidence, "the page says it is free")
+	}
+	pre := Combine(dom, preload, preview, shown, stated)
 	if pre == Paid {
 		return Result{NotFree, "the checkout does not show a zero total; nothing was ordered: " + strings.Join(evidence, "; ")}, last, false
 	}
+	if pre != Free {
+		// No button is pressed without positive evidence of a zero price.
+		return Result{Failed, fmt.Sprintf("the price could not be confirmed to be zero from the checkout page (amounts seen: %q); nothing was ordered", last.Prices)}, last, false
+	}
 	w.setPreClick(pre)
-	s.opt.Logf("%s: checkout ready, price check = %v [%s]", o.Title, pre, strings.Join(evidence, "; "))
+	how := ""
+	if last.Guessed {
+		how = "; the order button was identified by elimination, not by its label"
+	}
+	s.opt.Logf("%s: checkout ready, price check = %v [%s]; button %q%s", o.Title, pre, strings.Join(evidence, "; "), last.Place.Text, how)
 
 	if s.opt.DryRun {
 		return Result{DryRun, fmt.Sprintf("checkout reached and \"%s\" is ready; price check = %v; order not placed (dry run)", last.Place.Text, pre)}, last, false
@@ -724,6 +751,8 @@ func (s *Session) checkout(ctx context.Context, o feed.Offer, w *orderWatch, add
 			switch {
 			case st.Success:
 				return Result{Claimed, "the checkout shows the order confirmation"}, last, false
+			case st.Throttled:
+				return Result{Throttled, "Epic says this account cannot claim more free games right now"}, last, false
 			case st.Captcha:
 				return Result{Captcha, "Epic asked for a human check; the order was not completed"}, last, false
 			case st.Owned:
