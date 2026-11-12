@@ -202,6 +202,10 @@ window.addEventListener('message', function (ev) {
 
 func (m *mockStore) URL() string { return m.srv.URL }
 
+// (Pages report with a "keepalive" request: the claim ends as soon as the
+// order is answered and the page is then taken off, which on a slow machine
+// sometimes cancelled an ordinary request before it had left the browser.)
+//
 // hitCount is how often pages reported an event (a click on the order
 // button reports "place").
 func (m *mockStore) hitCount(what string) int {
@@ -417,7 +421,7 @@ if (S.throttled) document.getElementById('extra').textContent = 'Your account is
 setTimeout(function () { btn.disabled = false; }, S.slowMs || 0);
 btn.addEventListener('click', function (ev) {
   window.clicks.push({ what: 'place', trusted: ev.isTrusted });
-  fetch('/hit?what=place');
+  fetch('/hit?what=place', { keepalive: true });
   var order = { purchaseToken: 'tok', offers: offers };
   if (S.real2026) order = { useDefault: true, setDefault: false, namespace: 'ns', country: 'US', countryName: 'United States', orderId: null, orderComplete: null, orderError: null, orderPending: null, offers: offers, includeAccountBalance: false, totalAmount: 0, affiliateId: '', creatorSource: '', syncToken: 'tok' };
   fetch(S.submitPath || (S.real2026 ? '/v2/purchase/confirm-order' : '/checkout/api/complete'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(order) })
@@ -582,7 +586,7 @@ function submit() {
 }
 btn.addEventListener('click', function (ev) {
   window.clicks.push({ what: 'place', trusted: ev.isTrusted });
-  fetch('/hit?what=place');
+  fetch('/hit?what=place', { keepalive: true });
   submit();
 });
 </script></body></html>`
