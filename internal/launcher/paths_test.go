@@ -191,3 +191,26 @@ func TestPendingInstall(t *testing.T) {
 		t.Fatal("an .item file in Pending is an unfinished install")
 	}
 }
+
+func TestHasSwitch(t *testing.T) {
+	const exe = `"C:\Program Files\Epic Games\Launcher\Portal\Binaries\Win64\EpicGamesLauncher.exe"`
+	for _, c := range []struct {
+		cmd, sw string
+		want    bool
+	}{
+		{exe + ` -cefdebug=5555 -silent`, "-cefdebug=5555", true},
+		{exe + ` -silent -cefdebug=5555`, "-cefdebug=5555", true},
+		{exe + ` "-cefdebug=5555" -silent`, "-cefdebug=5555", true},
+		{exe + ` -cefdebug=55551 -silent`, "-cefdebug=5555", false},
+		{exe + ` -cefdebug=15555 -silent`, "-cefdebug=5555", false},
+		{exe + ` -xcefdebug=5555`, "-cefdebug=5555", false},
+		{exe + ` -cefdebug=55551 -cefdebug=5555`, "-cefdebug=5555", true},
+		{exe + ` -silent`, "-cefdebug=5555", false},
+		{exe, "", false},
+		{"", "-cefdebug=5555", false},
+	} {
+		if got := hasSwitch(c.cmd, c.sw); got != c.want {
+			t.Errorf("hasSwitch(%q, %q) = %v, want %v", c.cmd, c.sw, got, c.want)
+		}
+	}
+}

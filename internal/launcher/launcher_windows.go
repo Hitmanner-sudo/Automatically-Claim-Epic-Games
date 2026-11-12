@@ -555,7 +555,7 @@ func (in *Instance) isMine(pid uint32, job map[uint32]bool) (mine, known bool) {
 	if cmd == "" {
 		return false, false // gone already, or not readable: cannot tell
 	}
-	v = in.flag != "" && strings.Contains(cmd, in.flag)
+	v = hasSwitch(cmd, in.flag)
 	if !v && strings.Contains(cmd, "-Commandlet=") {
 		// The launcher's own maintenance runs (self-update install) are
 		// neither this instance nor the user asking for the launcher.
@@ -824,7 +824,7 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 				continue
 			}
 			cmd := win.CommandLine(p.PID)
-			if cmd != "" && !strings.Contains(cmd, flag) && !strings.Contains(cmd, "-Commandlet=") {
+			if cmd != "" && !hasSwitch(cmd, flag) && !strings.Contains(cmd, "-Commandlet=") {
 				return cmd, true
 			}
 		}
@@ -865,7 +865,7 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 							switch {
 							case strings.EqualFold(p.Name, "EpicGamesUpdater.exe") && win.InThisSession(p.PID):
 								extra[p.PID] = true
-							case isLauncher(p) && strings.Contains(win.CommandLine(p.PID), flag):
+							case isLauncher(p) && hasSwitch(win.CommandLine(p.PID), flag):
 								extra[p.PID] = true
 							}
 						}
@@ -912,7 +912,7 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 			var mine []uint32
 			if procs, err := win.Processes(); err == nil {
 				for _, p := range procs {
-					if isLauncher(p) && strings.Contains(win.CommandLine(p.PID), flag) {
+					if isLauncher(p) && hasSwitch(win.CommandLine(p.PID), flag) {
 						mine = append(mine, p.PID)
 					}
 				}

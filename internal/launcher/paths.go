@@ -133,6 +133,27 @@ func debugArgs(gen Generation, port int) (args, env []string, flag string) {
 	return []string{flag, "-silent"}, nil, flag
 }
 
+// hasSwitch reports whether a command line carries the given switch as a
+// whole word ("-cefdebug=5555" is not found in "-cefdebug=55551").
+func hasSwitch(commandLine, sw string) bool {
+	if sw == "" {
+		return false
+	}
+	for from := 0; ; {
+		i := strings.Index(commandLine[from:], sw)
+		if i < 0 {
+			return false
+		}
+		start, end := from+i, from+i+len(sw)
+		before := start == 0 || commandLine[start-1] == ' ' || commandLine[start-1] == '\t' || commandLine[start-1] == '"'
+		after := end == len(commandLine) || commandLine[end] == ' ' || commandLine[end] == '\t' || commandLine[end] == '"'
+		if before && after {
+			return true
+		}
+		from = end
+	}
+}
+
 func itoa(n int) string {
 	if n == 0 {
 		return "0"
