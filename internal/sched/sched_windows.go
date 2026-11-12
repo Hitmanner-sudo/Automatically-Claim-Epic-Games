@@ -108,7 +108,7 @@ func Remove(name string) error {
 		return nil
 	}
 	if _, err := schtasks("/Delete", "/TN", name, "/F"); err != nil {
-		return fmt.Errorf("remove the daily task: %w", err)
+		return fmt.Errorf("remove the hourly task: %w", err)
 	}
 	return nil
 }

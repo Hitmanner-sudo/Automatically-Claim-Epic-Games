@@ -224,8 +224,10 @@ func (d *Daemon) Due() time.Time {
 
 // feedRetry is how long to wait after the n-th consecutive failure to read
 // the list: soon at first (a PC that has just woken up may not be online
-// yet), then more slowly, and after a few hours not before the next regular
-// check.
+// yet), then more slowly, and after a few hours only at the regular checks.
+// The quick retries start afresh after a success, and when a regular check
+// comes late (the PC was asleep or off meanwhile, and may only now be
+// getting back online).
 // rememberAfter is how many reads in a row must have failed before the
 // list as last read is gone by.
 const rememberAfter = 3
@@ -278,9 +280,17 @@ func (d *Daemon) round(ctx context.Context) (next time.Time, read bool) {
 		var gaveUpUntil time.Time
 		_ = d.State.SetSchedule(func(sc *state.Schedule) {
 			if !sc.FeedGaveUpUntil.IsZero() && !now.Before(sc.FeedGaveUpUntil) {
-				// This is the regular check the retries were left to: a
-				// failure now is the first of a new series.
-				sc.FeedFailures, sc.FeedGaveUpUntil = 0, time.Time{}
+				// This is the regular check the retries were left to. Where
+				// such checks are far apart (once a day), or this one comes
+				// late (the PC was asleep or off), a failure now is the
+				// first of a new series. With a check every hour it is not:
+				// a list that stays out of reach is then simply asked for at
+				// the regular checks, not with a new burst of quick retries
+				// every few hours.
+				if d.Slot != nil || d.every() > 2*time.Hour || now.Sub(sc.FeedGaveUpUntil) > 10*time.Minute {
+					sc.FeedFailures = 0
+				}
+				sc.FeedGaveUpUntil = time.Time{}
 			}
 			sc.FeedFailures++
 			failures, gaveUpUntil = sc.FeedFailures, sc.FeedGaveUpUntil
@@ -299,7 +309,9 @@ func (d *Daemon) round(ctx context.Context) (next time.Time, read bool) {
 		}
 		listRetry = d.regular(now)
 		if failures > len(feedRetry) {
-			if gaveUpUntil.IsZero() {
+			// (A time further ahead than this timetable ever plans was
+			// written under another one, a daily check say; it is set anew.)
+			if gaveUpUntil.IsZero() || gaveUpUntil.Sub(now) > d.horizon() {
 				gaveUpUntil = listRetry
 				_ = d.State.SetSchedule(func(sc *state.Schedule) { sc.FeedGaveUpUntil = gaveUpUntil })
 			}
@@ -610,6 +622,9 @@ func (d *Daemon) Run(ctx context.Context, opt RunOptions) {
 func sleepUntil(ctx context.Context, when time.Time, now func() time.Time) bool {
 	// One look at the clock a minute is all a wait costs.
 	const step = time.Minute
+	// By the wall clock, not the one that counts running time (which a
+	// time worked out as "now plus an hour" would otherwise be compared on).
+	when = when.Round(0)
 	for {
 		remaining := when.Sub(now())
 		if remaining <= 0 {

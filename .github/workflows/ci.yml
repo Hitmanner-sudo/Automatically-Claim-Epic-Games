@@ -94,6 +94,15 @@ jobs:
         shell: pwsh
         run: |
           $exe = "$env:LOCALAPPDATA\EpicAutoClaim\EpicAutoClaim.exe"
+          # The checks below count processes and need the background process
+          # to be idle. Two things could disturb that. The hourly task fires
+          # on the full hour: wait that out rather than run across it.
+          $n = Get-Date
+          if ($n.Minute -ge 57) { Start-Sleep -Seconds ((60 - $n.Minute) * 60 - $n.Second + 5) }
+          # And a look that the round before left due within minutes (it
+          # does when Epic's list could not be read) would start a launcher.
+          $due = (Get-Content "$env:LOCALAPPDATA\EpicAutoClaim\state.json" -Raw | ConvertFrom-Json).schedule.nextDue
+          if ($due -and ([datetime]$due).ToUniversalTime() -lt (Get-Date).ToUniversalTime().AddMinutes(5)) { throw "the round before this step left a look due at $due; the checks below need an idle background process" }
           & "$env:RUNNER_TEMP/eac-console.exe" install
           if ($LASTEXITCODE -ne 0) { throw "install failed with $LASTEXITCODE" }
           if (-not (Test-Path $exe)) { throw 'the program was not copied to its folder' }

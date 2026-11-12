@@ -20,20 +20,25 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
       - name: Test
-        run: go test ./... -count=1
+        env:
+          CHROMIUM_REQUIRED: '1'
+        run: go test ./... -count=1 -timeout 20m
       - name: Build
         shell: pwsh
         run: |
           $tag = '${{ inputs.version }}'
           if (-not $tag) { $tag = '${{ github.ref_name }}' }
-          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "version must look like v1.2.3, got '$tag'" }
+          if ($tag -cnotmatch '^v\d+\.\d+\.\d+$') { throw "version must look like v1.2.3, got '$tag'" }
+          # A version is published once: a second run under the same number
+          # would put a different file under the old tag.
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch' -and (git ls-remote --tags origin "refs/tags/$tag")) { throw "$tag exists already; use the next version number" }
           go build -trimpath -ldflags "-H=windowsgui -s -w -X main.version=$($tag.Substring(1))" -o EpicAutoClaim.exe ./cmd/epicautoclaim
           $hash = (Get-FileHash EpicAutoClaim.exe -Algorithm SHA256).Hash
           $size = [math]::Round((Get-Item EpicAutoClaim.exe).Length / 1MB, 1)
@@ -51,7 +56,7 @@ jobs:
           - The order safeguards in this version are stricter than in the build that made the first real claims (0.1.18). They pass every test, including a run inside the launcher's own built-in browser, but this exact build has not yet met Epic's real checkout. ``EpicAutoClaim.exe once --dry-run`` rehearses everything except the order.
 
           SHA-256 of ``EpicAutoClaim.exe``: ``$hash``
-          "@ -replace '(?m)^          ', '' | Out-File -Encoding utf8 release-notes.md
+          "@ | Out-File -Encoding utf8 release-notes.md
           Get-Content release-notes.md
       - uses: softprops/action-gh-release@v2
         with:

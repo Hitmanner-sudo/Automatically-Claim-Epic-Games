@@ -436,6 +436,102 @@ func TestFeedErrorsRetrySoonButNotForever(t *testing.T) {
 	}
 }
 
+func TestAListThatStaysOutOfReachIsAskedForAtTheRegularRate(t *testing.T) {
+	// Looking every hour, with the list unreadable for three days (no
+	// internet, or Epic's servers refusing): after the first quick retries
+	// it is asked for about once an hour, not with a new burst of retries
+	// every few hours, and it is said twice in the log, not thirty times.
+	r := newRig(t)
+	r.feed.err = errors.New("no network")
+	start := r.now
+	reads, longest := 0, time.Duration(0)
+	for r.now.Sub(start) < 72*time.Hour {
+		next := r.d.Tick(context.Background())
+		reads++
+		if !r.d.Due().Equal(next) {
+			t.Fatalf("after %v: planned %v, but a restart would look at %v", r.now.Sub(start), next, r.d.Due())
+		}
+		wait := next.Sub(r.now)
+		if wait > longest {
+			longest = wait
+		}
+		if wait < time.Minute {
+			t.Fatalf("after %v: next look in %v", r.now.Sub(start), wait)
+		}
+		r.now = next
+	}
+	if longest > 66*time.Minute {
+		t.Errorf("longest wait %v; want no more than about an hour", longest)
+	}
+	// 72 regular looks, plus the handful of quick retries at the start.
+	if reads < 72 || reads > 90 {
+		t.Errorf("%d reads in three days; want about one an hour", reads)
+	}
+	said := 0
+	for _, l := range r.logs {
+		if strings.Contains(l, "free-games list") {
+			said++
+		}
+	}
+	if said > 3 {
+		t.Errorf("the outage was reported %d times: %q", said, r.logs)
+	}
+	// The PC was asleep through a regular check and wakes up later: it may
+	// not be online yet, so the quick retries start afresh.
+	r.now = r.now.Add(3 * time.Hour)
+	if wait := r.tick(); wait != time.Minute {
+		t.Errorf("after waking up late: next look in %v, want a quick retry", wait)
+	}
+	// One success and everything is as if nothing had happened.
+	r.feed.err = nil
+	if wait := r.tick(); wait != 54*time.Minute {
+		t.Errorf("after recovery: next look in %v", wait)
+	}
+	if sc := r.d.State.Schedule(); sc.FeedFailures != 0 || !sc.FeedGaveUpUntil.IsZero() {
+		t.Errorf("after recovery: %+v", sc)
+	}
+}
+
+func TestATimetableWrittenUnderAnotherIntervalIsNotObeyedBlindly(t *testing.T) {
+	// How far ahead a stored time may lie depends on how often the program
+	// looks.
+	for _, c := range []struct {
+		every   time.Duration
+		ahead   time.Duration
+		trusted bool
+	}{
+		{15 * time.Minute, 16 * time.Minute, true},
+		{15 * time.Minute, time.Hour, false},
+		{time.Hour, 66 * time.Minute, true},
+		{time.Hour, 3 * time.Hour, false},
+		{24 * time.Hour, 26 * time.Hour, true},
+		{24 * time.Hour, 60 * time.Hour, false},
+	} {
+		r := newRig(t)
+		r.d.CheckEvery = c.every
+		_ = r.d.State.SetSchedule(func(sc *state.Schedule) { sc.NextDue = r.now.Add(c.ahead) })
+		if got := r.d.Due().Equal(r.now.Add(c.ahead)); got != c.trusted {
+			t.Errorf("looking every %v, a time %v ahead: trusted=%v, want %v", c.every, c.ahead, got, c.trusted)
+		}
+	}
+	// The list had been given up on until tomorrow's daily check; then the
+	// program was set to look every hour. If the list still cannot be read,
+	// the next look is an hour away, not tomorrow.
+	r := newRig(t)
+	r.feed.err = errors.New("no network")
+	_ = r.d.State.SetSchedule(func(sc *state.Schedule) {
+		sc.FeedFailures = len(feedRetry) + 1
+		sc.FeedGaveUpUntil = r.now.Add(22 * time.Hour)
+		sc.NextDue = r.now.Add(22 * time.Hour)
+	})
+	if !r.d.Due().Equal(r.now) {
+		t.Fatalf("due %v, want now", r.d.Due())
+	}
+	if wait := r.tick(); wait > 66*time.Minute {
+		t.Fatalf("next look in %v, want within about an hour", wait)
+	}
+}
+
 func TestNeverSpinsFasterThanEveryTwoMinutes(t *testing.T) {
 	r := newRig(t)
 	r.feed.snap = feed.Snapshot{NextChange: r.now.Add(-time.Hour)} // stale
@@ -683,6 +779,11 @@ func TestARestartDoesNotCauseACheck(t *testing.T) {
 	done := make(chan struct{})
 	go func() { again.Run(ctx, RunOptions{}); close(done) }()
 	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("Run returned although nothing had asked it to stop: it is to stay for as long as the user is signed in")
+	default:
+	}
 	cancel()
 	select {
 	case <-done:

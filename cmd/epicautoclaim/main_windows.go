@@ -243,6 +243,29 @@ func settle() time.Duration {
 	return 0
 }
 
+// fileStamp tells one state of a file from another: its size and the time
+// it was last written ("" if it is not there).
+func fileStamp(path string) string {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%d/%d", fi.Size(), fi.ModTime().UnixNano())
+}
+
+// whatBringsItBack says, after the background process has been stopped,
+// when Windows will start it again.
+func whatBringsItBack() string {
+	name := taskName()
+	switch {
+	case name != "" && sched.Exists(name):
+		return "Windows starts it again within the hour (to remove it for good: EpicAutoClaim.exe uninstall)."
+	case autostartValue() != "":
+		return "It starts again when you next sign in to Windows (to remove it for good: EpicAutoClaim.exe uninstall)."
+	}
+	return "Nothing starts it again: it is not installed."
+}
+
 // taskSpec is the hourly task as it should be registered for this user:
 // what brings the program back if it is not running.
 func taskSpec(p paths) (sched.Spec, error) {
@@ -350,10 +373,36 @@ func cmdRun(a *app, scheduled bool, afterPID uint32) int {
 		a.log.Printf("%v", a.cfgErr)
 	}
 	d := a.daemon()
+	// The program runs for as long as the user is signed in, and reads its
+	// settings once, as it starts. So before every round it looks whether
+	// the settings file has been changed since; if so it hands over to a
+	// fresh copy of itself, which reads them anew and does that round.
+	settings := fileStamp(a.p.config)
+	holdOff := func() time.Duration {
+		if hold := settle(); hold > 0 {
+			return hold
+		}
+		if fileStamp(a.p.config) == settings {
+			return 0
+		}
+		self, err := os.Executable()
+		if err == nil {
+			err = win.StartDetached(self, append(daemonArgs(), "--after-pid="+strconv.Itoa(os.Getpid())), a.p.dir)
+		}
+		if err != nil {
+			// Carry on with the settings as read; say so, once.
+			a.log.Printf("the settings file has changed, but the program could not be started afresh to read it (%v); the changes apply from the next start", err)
+			settings = fileStamp(a.p.config)
+			return 0
+		}
+		a.log.Printf("the settings file has changed; starting afresh to read it")
+		cancel()
+		return time.Minute
+	}
 	// While it waits the program makes itself as small as it can: it gives
 	// its memory back to Windows and drops to the lowest priority for the
 	// processor, the disk and memory (Windows' "efficiency mode").
-	opt := daemon.RunOptions{Settle: settle, Waiting: func(waiting bool) {
+	opt := daemon.RunOptions{Settle: holdOff, Waiting: func(waiting bool) {
 		if waiting {
 			debug.FreeOSMemory()
 		}
@@ -378,10 +427,9 @@ func describeDue(due time.Time) string {
 
 // keepTaskCurrent re-registers the hourly task when it no longer matches
 // this program's location or was registered by an earlier version (which
-// had a task for a set time of day). Windows has just started the program
-// through that task, so it exists; if it cannot be read, it is left alone.
-// An installation made by an earlier version had no start-up entry; that is
-// put right here as well.
+// had a task for a set time of day, and no start-up entry: that is put
+// right as well). Windows has just started the program through that task,
+// so it exists; if it cannot be read, it is left alone.
 func keepTaskCurrent(a *app) {
 	spec, err := taskSpec(a.p)
 	if err != nil {
@@ -392,13 +440,17 @@ func keepTaskCurrent(a *app) {
 		return
 	}
 	// The task carries a marker saying what it was registered for.
-	if !strings.Contains(def, spec.Marker()) {
-		if _, err := registerTask(a.p); err != nil {
-			a.log.Printf("Windows' hourly task could not be brought up to date: %v", err)
-		} else {
-			a.log.Printf("Windows' hourly task was brought up to date")
-		}
+	if strings.Contains(def, spec.Marker()) {
+		return
 	}
+	if _, err := registerTask(a.p); err != nil {
+		a.log.Printf("Windows' hourly task could not be brought up to date: %v", err)
+	} else {
+		a.log.Printf("Windows' hourly task was brought up to date")
+	}
+	// (Only together with an out-of-date task: an entry that is missing
+	// next to an up-to-date one was taken away on purpose, by "uninstall"
+	// or by the user, and is not put back.)
 	if autostartValue() == "" {
 		if err := setAutostart(a.p.exe); err == nil {
 			a.log.Printf("the program now also starts as you sign in to Windows")
@@ -900,6 +952,12 @@ func cmdInstall(interactive bool, out io.Writer) int {
 		if err := win.StartDetached(p.exe, daemonArgs(), p.dir); err != nil {
 			return fail(err)
 		}
+		// Not done before it is up: a second installer (the double-click
+		// made twice) must find it running, or it would try to replace a
+		// program file that is in use.
+		for i := 0; i < 50 && !daemonRunning(); i++ {
+			time.Sleep(200 * time.Millisecond)
+		}
 	}
 
 	msg := "Installed.\n\n" + how
@@ -950,7 +1008,7 @@ const usage = `EpicAutoClaim - claims Epic's free games through your Epic Games 
   EpicAutoClaim.exe once --dry-run   same, but stop just before placing the order
   EpicAutoClaim.exe once --dry-run --again   rehearse also with games it has dealt with already
   EpicAutoClaim.exe doctor       check the setup; add --launch to try the hidden launcher
-  EpicAutoClaim.exe stop         stop the background process (Windows starts it again within the hour)
+  EpicAutoClaim.exe stop         stop the background process (Windows starts it again within the hour, or when you next sign in)
   EpicAutoClaim.exe uninstall    stop it and remove it from Windows' start-up and schedule
 `
 
@@ -1004,9 +1062,9 @@ func main() {
 		case !was:
 			fmt.Fprintln(out, "It was not running.")
 		case gone:
-			fmt.Fprintln(out, "Stopped.")
+			fmt.Fprintln(out, "Stopped. "+whatBringsItBack())
 		default:
-			fmt.Fprintln(out, "Asked to stop; it is finishing what it was doing and will exit shortly.")
+			fmt.Fprintln(out, "Asked to stop; it is finishing what it was doing and will exit shortly. "+whatBringsItBack())
 		}
 		os.Exit(0)
 	case "version", "--version", "-v":

@@ -86,7 +86,7 @@ A good first test on your own PC is `EpicAutoClaim.exe doctor --launch` followed
 
 ## Settings
 
-Edit `config.json`, then double-click the program again (or run `EpicAutoClaim.exe install`) so that it picks the changes up. Every setting is optional. If the file cannot be read after an edit (a stray comma, say), the program orders nothing until it is fixed, and `EpicAutoClaim.exe status` says so.
+Edit `config.json`. The program notices the change by itself before its next look (within the hour, unless you have set a longer interval); to apply it at once, double-click the program again (or run `EpicAutoClaim.exe install`). Every setting is optional. If the file cannot be read after an edit (a stray comma, say), the program orders nothing until it is fixed, and `EpicAutoClaim.exe status` says so.
 
 | Setting | Default | Meaning |
 |---|---|---|
