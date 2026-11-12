@@ -444,10 +444,16 @@ func (r *Runner) session(ctx context.Context, inst launcher.Install, sn *seen, o
 				// (It closes itself when it has an update of its own to
 				// install, and it can crash.)
 				r.logf("%s: %s. Starting the launcher again and taking this up afresh", o.Title, res.Detail)
+				if afterAPress(res) {
+					// The press stays on record should no later round
+					// get to this offer; one that does writes over it.
+					results[o.Key()] = res
+				}
 				lostAt = i
 				break
 			}
-			results[o.Key()] = res
+			prev, had := results[o.Key()]
+			results[o.Key()] = settle(prev, had, res)
 			if gone {
 				break // the offers behind it were not reached; they keep their turn
 			}

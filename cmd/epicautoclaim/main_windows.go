@@ -620,7 +620,9 @@ func cmdOnce(a *app, args []string) int {
 		case proved > 0 || claimed > 0:
 			a.log.Printf("Done. The whole path works on this PC: the order button was pressed and Epic answered (%d time(s) \"you have this already\", %d game(s) claimed).", proved, claimed)
 		default:
-			a.log.Printf("Done, but no order button was pressed in this run with --again, so it shows nothing about the press: the lines above say why.")
+			// (Not "nothing was pressed": a press whose answer never
+			// came, or was not understood, ends here too.)
+			a.log.Printf("Done, but this run with --again did not see Epic answer a press of the order button, so it does not prove the whole path: the lines above say why.")
 		}
 	default:
 		fmt.Fprintf(a.out, "\nDone. The background process would check again at %s.\n", next.Local().Format("Mon 2 Jan 15:04"))

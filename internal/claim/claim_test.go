@@ -1678,6 +1678,19 @@ func TestTheLogSaysWhyTheStoreDidNotAnswerAboutTheLibrary(t *testing.T) {
 	if got := graphQLError([]byte(`{"errors":[{"message":"no access for 0123456789abcdef0123456789abcdef (someone@example.com)"}]}`)); strings.Contains(got, "0123") || strings.Contains(got, "@") {
 		t.Errorf("an identifier got into the log text: %q", got)
 	}
+	// A token in base64 goes too; Epic's error codes and field names stay.
+	if got := scrub("bad token abcdEFGH+ijklMNOP/qrstUVWX+yz012345/6789abcd== for you"); strings.Contains(got, "abcd") || strings.Contains(got, "6789") {
+		t.Errorf("a token got through: %q", got)
+	}
+	for _, keep := range []string{
+		"errors.com.epicgames.common.authentication.token_verification_failed",
+		"Entitlements/cartOffersValidation: Request failed with status code 401",
+		`Cannot query field "unablePartiallyUpgradeOffers"`,
+	} {
+		if got := scrub(keep); got != keep {
+			t.Errorf("scrub(%q) = %q, want it left as it is", keep, got)
+		}
+	}
 	if got := graphQLError([]byte(`<html>blocked</html>`)); got != "" {
 		t.Errorf("graphQLError of a page = %q", got)
 	}

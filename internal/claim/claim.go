@@ -1307,16 +1307,27 @@ func graphQLError(body []byte) string {
 	for _, e := range doc.Errors {
 		if m := strings.TrimSpace(e.Message); m != "" {
 			// (Nothing that could name an account goes into the log.)
-			return clip(reIdentifier.ReplaceAllString(m, "…"), 100)
+			return clip(scrub(m), 100)
 		}
 	}
 	return ""
 }
 
-// reIdentifier matches what could identify an account or a session in a
-// message from the store: long runs of hex digits or of letters and digits,
-// and e-mail addresses.
-var reIdentifier = regexp.MustCompile(`[0-9a-fA-F-]{16,}|\S+@\S+|[A-Za-z0-9_-]{24,}`)
+// scrub takes out of a message from the store what could identify an
+// account or a session: e-mail addresses, and long runs of letters and
+// digits (ids, tokens). Long words without a digit stay: Epic's error
+// codes and field names are such words, and they are what the message is
+// read for.
+func scrub(m string) string {
+	return reIdentifier.ReplaceAllStringFunc(m, func(t string) string {
+		if strings.Contains(t, "@") || strings.ContainsAny(t, "0123456789") {
+			return "…"
+		}
+		return t
+	})
+}
+
+var reIdentifier = regexp.MustCompile(`\S+@\S+|[A-Za-z0-9_+/=-]{16,}`)
 
 // clip shortens a text for the log and keeps it on one line.
 func clip(s string, n int) string {
@@ -1860,6 +1871,8 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 		return Result{Failed, "could not press the order button: " + err.Error()}, last, false
 	}
 	s.opt.Logf("%s: pressed %q; waiting for Epic's answer", o.Title, pressed.Text)
+	// (A look that failed before the press says nothing about now.)
+	lost = false
 	clickedAt := time.Now()
 	clicks := 1
 	deadline = time.Now().Add(s.opt.OrderWait)

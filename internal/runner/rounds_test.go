@@ -3,7 +3,10 @@ package runner
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/claim"
 )
 
 func TestALauncherThatGoesAwayIsStartedAgainForWhatIsLeft(t *testing.T) {
@@ -71,5 +74,46 @@ func TestAnErrorOrAnOrdinaryEndEndsTheSession(t *testing.T) {
 	})
 	if n != 1 {
 		t.Fatalf("an index beyond the items led to %d rounds", n)
+	}
+}
+
+func TestAPressLostWithTheLauncherIsNotForgotten(t *testing.T) {
+	lost := claim.Result{Outcome: claim.Failed, Detail: "the launcher went away after the order button was pressed, before Epic's answer was seen; the library will be checked next time"}
+	if !afterAPress(lost) {
+		t.Fatal("a result that speaks of a press is not recognised as one")
+	}
+	for _, d := range []string{
+		"the launcher went away just before the order button was to be pressed; nothing was pressed",
+		"the launcher went away while the checkout was being opened; nothing was pressed",
+		"the launcher went away during the rehearsal, before the last look; nothing was pressed",
+	} {
+		if afterAPress(claim.Result{Outcome: claim.Failed, Detail: d}) {
+			t.Errorf("%q counts as a press", d)
+		}
+	}
+
+	// The next round finds the game in the library: the record says that a
+	// press went before, whoever says "owned".
+	for _, owned := range []string{
+		"the store says the account has it already; nothing was pressed",
+		"Epic says the account has this already (errors.com.epicgames.ecommerce.orderprocessor.purchase_limit_error)",
+	} {
+		got := settle(lost, true, claim.Result{Outcome: claim.Owned, Detail: owned})
+		if got.Outcome != claim.Owned || !strings.HasPrefix(got.Detail, owned) || !strings.Contains(got.Detail, "had been pressed before the launcher went away") {
+			t.Errorf("after a lost press, %q was written down as %v", owned, got)
+		}
+	}
+	// Anything else is written down as it is.
+	claimed := claim.Result{Outcome: claim.Claimed, Detail: "order confirmed by Epic"}
+	if got := settle(lost, true, claimed); got != claimed {
+		t.Errorf("a claim after a lost press was changed to %v", got)
+	}
+	plain := claim.Result{Outcome: claim.Owned, Detail: "the store says the account has it already; nothing was pressed"}
+	if got := settle(claim.Result{}, false, plain); got != plain {
+		t.Errorf("without an earlier press the result was changed to %v", got)
+	}
+	notPressed := claim.Result{Outcome: claim.Failed, Detail: "the launcher went away just before the order button was to be pressed; nothing was pressed"}
+	if got := settle(notPressed, true, plain); got != plain {
+		t.Errorf("after a loss without a press the result was changed to %v", got)
 	}
 }

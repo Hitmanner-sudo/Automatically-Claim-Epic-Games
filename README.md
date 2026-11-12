@@ -137,6 +137,8 @@ Those runs were made with build 0.1.18. The order safeguards were tightened furt
 - the launcher did not go away during that run, so the restart has not been seen at work on a real launcher. Its parts are covered by tests (a claim ends at once when the launcher is gone; which offers are then taken up again);
 - the store's own answer to "does the account have this already?" turned out to be an error inside the launcher (its service answers 401 there). So for a game that is already owned the program learns it from Epic's refusal of the order, as above, which changes nothing.
 
+The source is a little ahead of that build: a review of it led to small corrections in what the program writes down (a press whose answer was lost with the launcher stays on record; error codes are no longer cut out of the log). They change nothing about when or what it orders, pass the tests, and are not in a release yet.
+
 What has not been tried on that PC is the installation itself (the double-click): the PC's owner does that, not the AI. It is tested on GitHub's Windows machines on every change (see above).
 
 What a single test cannot show is how Epic's pages will change. The program is written to fail safely when they do: if the checkout does not look the way it expects, it places no order, saves what it saw under `diagnostics\`, and tries again later. If a giveaway is not claimed, the log and that folder say why.
