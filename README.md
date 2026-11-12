@@ -148,8 +148,11 @@ What a single test cannot show is how Epic's pages will change. The program is w
 
 ```
 go test ./...
-GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-H=windowsgui -s -w" -o EpicAutoClaim.exe ./cmd/epicautoclaim
+go run ./internal/winres/mkres -version 0.0.1 -o cmd/epicautoclaim/rsrc_windows_amd64.syso
+GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-H=windowsgui -s -w -X main.version=0.0.1" -o EpicAutoClaim.exe ./cmd/epicautoclaim
 ```
+
+The second line makes the small file that gives the program its name and version as Windows shows them (the linker picks it up); give it the same version as the build.
 
 Go 1.26 or newer. The checkout tests need Chrome or Chromium (set `CHROMIUM_PATH` if it is not found). `ci/egl-probe.ps1` is the script that was used to establish how the launcher behaves; it installs the launcher on a Windows runner and reports.
 

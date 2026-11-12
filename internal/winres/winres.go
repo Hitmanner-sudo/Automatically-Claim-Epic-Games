@@ -40,24 +40,44 @@ func Program(version string) Info {
 		Name:        "EpicAutoClaim",
 		FileName:    "EpicAutoClaim.exe",
 		Description: "EpicAutoClaim",
-		Company:     "EpicAutoClaim (open-source project)",
+		Company:     "EpicAutoClaim (unofficial)",
 		Copyright:   "Unofficial. Not affiliated with or endorsed by Epic Games.",
 		Comments:    "Claims the Epic Games Store's free games through your own Epic Games Launcher.",
 	}
 }
 
 // parts turns "0.2.1" (or "0.1.34", or anything else) into four numbers.
+// It takes what it can read; see Check for a version that must be right.
 func parts(version string) [4]uint16 {
-	var out [4]uint16
+	out, _ := numbers(version)
+	return out
+}
+
+// numbers reads the numbers out of a version. ok is false when one of them
+// does not fit (Windows keeps each in sixteen bits) or there are more than
+// four.
+func numbers(version string) (out [4]uint16, ok bool) {
 	fields := strings.FieldsFunc(version, func(r rune) bool { return r < '0' || r > '9' })
-	for i := 0; i < len(fields) && i < 4; i++ {
-		n, err := strconv.ParseUint(fields[i], 10, 16)
+	if len(fields) > 4 {
+		return out, false
+	}
+	for i, f := range fields {
+		n, err := strconv.ParseUint(f, 10, 16)
 		if err != nil {
-			break
+			return [4]uint16{}, false
 		}
 		out[i] = uint16(n)
 	}
-	return out
+	return out, true
+}
+
+// Check says whether a version can be written down as Windows wants it:
+// one to four numbers, each below 65536, separated by dots.
+func Check(version string) error {
+	if _, ok := numbers(version); !ok || version == "" || strings.Trim(version, "0123456789.") != "" {
+		return fmt.Errorf("version %q cannot be written as up to four numbers below 65536", version)
+	}
+	return nil
 }
 
 func dotted(v [4]uint16) string { return fmt.Sprintf("%d.%d.%d.%d", v[0], v[1], v[2], v[3]) }
@@ -160,7 +180,7 @@ func xmlText(s string) string {
 
 // Manifest renders the application manifest. It asks for nothing: the
 // program runs as the user who starts it, without elevation, and says which
-// Windows versions it was made for. (No DPI setting and no dependencies:
+// Windows it was made for (10 and 11; it does not run on anything older). (No DPI setting and no dependencies:
 // neither is to change how the program behaves.)
 func Manifest(in Info) []byte {
 	return []byte(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` + "\r\n" +
@@ -177,9 +197,6 @@ func Manifest(in Info) []byte {
 		`  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">` + "\r\n" +
 		`    <application>` + "\r\n" +
 		`      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>` + "\r\n" + // Windows 10 and 11
-		`      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>` + "\r\n" + // Windows 8.1
-		`      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>` + "\r\n" + // Windows 8
-		`      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>` + "\r\n" + // Windows 7
 		`    </application>` + "\r\n" +
 		`  </compatibility>` + "\r\n" +
 		`</assembly>` + "\r\n")

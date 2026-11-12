@@ -600,10 +600,25 @@ func cmdOnce(a *app, args []string) int {
 	switch {
 	case ctx.Err() != nil:
 		fmt.Fprintln(a.out, "\nStopped before the round was finished.")
-	case trial || dry:
+	case trial || dry || (again && a.cfg.DryRun):
 		fmt.Fprintln(a.out, "\nTrial finished; nothing was ordered.")
 	case again:
-		fmt.Fprintln(a.out, "\nDone. (\"owned: Epic says the account has this already\" below means the whole path works: the button was pressed, the order went out, and Epic answered.)")
+		// Say whether the run showed what it was made to show.
+		proved, claimed := 0, 0
+		for _, e := range a.st.All() {
+			switch {
+			case e.Status == state.Claimed:
+				claimed++
+			case strings.Contains(e.LastResult, "Epic says the account has this already") || strings.Contains(e.LastResult, "after the press"):
+				proved++
+			}
+		}
+		switch {
+		case proved > 0 || claimed > 0:
+			fmt.Fprintf(a.out, "\nDone. The whole path works on this PC: the order button was pressed and Epic answered (%d time(s) \"you have this already\", %d game(s) claimed).\n", proved, claimed)
+		default:
+			fmt.Fprintln(a.out, "\nDone, but no order button was pressed in this run, so it shows nothing about the press: the lines below say why.")
+		}
 	default:
 		fmt.Fprintf(a.out, "\nDone. The background process would check again at %s.\n", next.Local().Format("Mon 2 Jan 15:04"))
 	}

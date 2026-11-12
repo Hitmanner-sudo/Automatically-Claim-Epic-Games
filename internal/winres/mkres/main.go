@@ -20,6 +20,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: mkres -version 0.2.1 -o rsrc_windows_amd64.syso")
 		os.Exit(2)
 	}
+	if err := winres.Check(*version); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	if err := os.WriteFile(*out, winres.Object(winres.Program(*version)), 0o644); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

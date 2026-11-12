@@ -14,10 +14,119 @@ import (
 func TestVersionNumbers(t *testing.T) {
 	for in, want := range map[string]string{
 		"0.2.1": "0.2.1.0", "0.1.34": "0.1.34.0", "1.2.3.4": "1.2.3.4", "v2.0": "2.0.0.0",
-		"cef90": "90.0.0.0", "dev": "0.0.0.0", "": "0.0.0.0", "1.2.3.4.5": "1.2.3.4", "70000.1": "0.0.0.0",
+		"cef90": "90.0.0.0", "dev": "0.0.0.0", "": "0.0.0.0", "1.2.3.4.5": "0.0.0.0", "70000.1": "0.0.0.0", "0.2.20261112": "0.0.0.0",
 	} {
 		if got := dotted(parts(in)); got != want {
 			t.Errorf("version %q -> %s, want %s", in, got, want)
+		}
+	}
+	// A version that is to be published must be one Windows can hold.
+	for in, ok := range map[string]bool{"0.2.1": true, "0.1.34": true, "1.2.3.4": true, "65535.0.1": true, "0.2.20261112": false, "1.70000.5": false, "v1.2.3": false, "dev": false, "": false, "1.2.3.4.5": false} {
+		if got := Check(in) == nil; got != ok {
+			t.Errorf("Check(%q) ok=%v, want %v", in, got, ok)
+		}
+	}
+}
+
+// block is one block of a version resource as Windows walks it.
+type block struct {
+	key      string
+	valueLen int
+	text     bool
+	value    []byte
+	children []block
+}
+
+// walk reads the block at the start of b (which ends where its length
+// says), the way VerQueryValue does: the name, padding to a multiple of
+// four, the value, padding, then the blocks inside it one after another.
+func walk(t *testing.T, b []byte, base int) block {
+	t.Helper()
+	length := int(binary.LittleEndian.Uint16(b))
+	if length > len(b) || length < 6 {
+		t.Fatalf("block at %d: length %d of %d", base, length, len(b))
+	}
+	blk := block{valueLen: int(binary.LittleEndian.Uint16(b[2:])), text: binary.LittleEndian.Uint16(b[4:]) == 1}
+	at := 6
+	var name []uint16
+	for {
+		u := binary.LittleEndian.Uint16(b[at:])
+		at += 2
+		if u == 0 {
+			break
+		}
+		name = append(name, u)
+	}
+	blk.key = string(utf16Decode(name))
+	align := func(n int) int { return (base+n+3)&^3 - base }
+	at = align(at)
+	valueBytes := blk.valueLen
+	if blk.text {
+		valueBytes *= 2
+	}
+	if at+valueBytes > length {
+		t.Fatalf("block %q: its value (%d bytes at %d) runs past its end (%d)", blk.key, valueBytes, at, length)
+	}
+	blk.value = b[at : at+valueBytes]
+	at = align(at + valueBytes)
+	for at < length {
+		child := walk(t, b[at:length], base+at)
+		blk.children = append(blk.children, child)
+		at = align(at + int(binary.LittleEndian.Uint16(b[at:])))
+	}
+	if at != align(length) {
+		t.Fatalf("block %q: what is inside it ends at %d, its length says %d", blk.key, at, length)
+	}
+	return blk
+}
+
+func utf16Decode(u []uint16) []rune {
+	out := make([]rune, len(u))
+	for i, c := range u {
+		out[i] = rune(c) // (the names and values here are plain letters)
+	}
+	return out
+}
+
+func (b block) child(t *testing.T, key string) block {
+	t.Helper()
+	for _, c := range b.children {
+		if c.key == key {
+			return c
+		}
+	}
+	t.Fatalf("no %q inside %q", key, b.key)
+	return block{}
+}
+
+func TestVersionInfoCanBeWalkedTheWayWindowsWalksIt(t *testing.T) {
+	for _, version := range []string{"0.2.1", "0.1.345", "10.20.30", "1.0"} {
+		in := Program(version)
+		raw := VersionInfo(in)
+		root := walk(t, raw, 0)
+		if root.key != "VS_VERSION_INFO" || root.text || root.valueLen != 52 || len(root.children) != 2 {
+			t.Fatalf("root: %q, %d children", root.key, len(root.children))
+		}
+		tr := root.child(t, "VarFileInfo").child(t, "Translation")
+		if tr.text || tr.valueLen != 4 || !bytes.Equal(tr.value, []byte{0x09, 0x04, 0xB0, 0x04}) {
+			t.Errorf("Translation: %+v", tr)
+		}
+		table := root.child(t, "StringFileInfo").child(t, "040904B0")
+		want := map[string]string{
+			"Comments": in.Comments, "CompanyName": in.Company, "FileDescription": in.Description,
+			"FileVersion": dotted(parts(version)), "InternalName": in.Name, "LegalCopyright": in.Copyright,
+			"OriginalFilename": in.FileName, "ProductName": in.Name, "ProductVersion": version,
+		}
+		if len(table.children) != len(want) {
+			t.Errorf("version %s: %d strings, want %d", version, len(table.children), len(want))
+		}
+		for key, text := range want {
+			s := table.child(t, key)
+			// The length of a string counts its characters and the zero
+			// that ends it.
+			if !s.text || s.valueLen != len([]rune(text))+1 || !bytes.Equal(s.value, wide(text)) {
+				t.Errorf("version %s: %s = %q (length %d), want %q", version, key, s.value, s.valueLen, text)
+			}
 		}
 	}
 }
@@ -48,7 +157,7 @@ func TestVersionInfoIsLaidOutAsWindowsReadsIt(t *testing.T) {
 			t.Errorf("the version information names %q", not)
 		}
 	}
-	if m := string(Manifest(Program("0.2.1"))); !strings.Contains(m, `version="0.2.1.0"`) || !strings.Contains(m, `level="asInvoker"`) || strings.Contains(m, "dpiAware") || strings.Contains(m, "dependency") {
+	if m := string(Manifest(Program("0.2.1"))); !strings.Contains(m, `version="0.2.1.0"`) || !strings.Contains(m, `level="asInvoker"`) || strings.Contains(m, "dpiAware") || strings.Contains(m, "dependency") || strings.Count(m, "<supportedOS") != 1 {
 		t.Errorf("manifest:\n%s", m)
 	}
 }

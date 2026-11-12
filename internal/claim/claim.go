@@ -1536,8 +1536,9 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 	var errorSince, strangerSince, lastAdopt, checkSeen time.Time
 	adopted, sawBrowserCheck, ownChecked, sawButton := false, false, false, false
 	// ownedBefore: the store says the account has this already, and the
-	// run goes on regardless (Options.Again).
-	ownedBefore := false
+	// run goes on regardless (Options.Again). notOwnedBefore: the store
+	// says the account does not have it. (Neither, when it gave no answer.)
+	ownedBefore, notOwnedBefore := false, false
 	var evidence []string
 	pre := Unknown
 	for {
@@ -1580,13 +1581,16 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 			switch {
 			case st.Login:
 				return Result{NotSignedIn, "Epic's web sign-in page came up instead of the checkout"}, last, mayFallThrough
-			case (st.Owned || w.ownedHint()) && !(s.opt.Again && st.Place.clickable()):
+			case (st.Owned || w.ownedHint()) && !(s.opt.Again && st.Place != nil):
+				// (With Again and an order button on the page, ready or
+				// about to be, the run goes on to it; if it never becomes
+				// ready, the wait ends as any other.)
 				// "Owned" ends all further attempts, so a second opinion is
 				// taken from the store when it will give one.
 				if s.ownership(ctx, st, o) == ownNo {
 					return Result{Failed, "the checkout says this is already owned but the store says it is not; will look again later"}, last, false
 				}
-				return Result{Owned, "the checkout says this is already in the library"}, last, false
+				return Result{Owned, "the checkout says this is already in the library" + s.notPressed()}, last, false
 			case st.Region || w.regionHint():
 				return Result{Unavailable, "not available in this account's region"}, last, false
 			case st.Pin:
@@ -1624,6 +1628,8 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 					// takes a moment, so the page is read afresh afterwards.)
 					ownChecked = true
 					switch s.ownership(ctx, st, o) {
+					case ownNo:
+						notOwnedBefore = true
 					case ownYes:
 						if !s.opt.Again {
 							return Result{Owned, "already in the library"}, last, false
@@ -1727,8 +1733,13 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 		return Result{Failed, "interrupted"}, last, false
 	}
 	pressed := *last.Place
-	// Words of thanks that were on the page before the press prove nothing.
-	thanksBefore := last.Success
+	// Words of thanks that were on the page before the press prove nothing,
+	// and neither do "you already own this" or an error shown before it.
+	thanksBefore, ownedTextBefore := last.Success, last.Owned
+	errorsBefore := map[string]bool{}
+	for _, e := range last.Errors {
+		errorsBefore[e] = true
+	}
 	if ownedBefore {
 		s.opt.Logf("%s: pressing %q although the game is in the library: Epic is expected to refuse the order, which is what this run is for", o.Title, last.Place.Text)
 	}
@@ -1808,8 +1819,8 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 				return Result{Throttled, "Epic says this account cannot claim more free games right now"}, last, false
 			case st.Captcha:
 				return Result{Captcha, "Epic asked for a human check; the order was not completed"}, last, false
-			case st.Owned:
-				return Result{Owned, "the checkout says this is already in the library"}, last, false
+			case st.Owned && !ownedTextBefore:
+				return Result{Owned, "after the press, the checkout says this is already in the library"}, last, false
 			case st.Region:
 				return Result{Unavailable, "not available in this account's region"}, last, false
 			case st.Login:
@@ -1843,9 +1854,16 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 					return Result{NotFree, "the checkout showed a total above zero before the final confirmation; nothing was confirmed"}, last, false
 				}
 			}
-			if len(st.Errors) > 0 {
-				if errSeen.IsZero() || st.Errors[0] != errText {
-					errSeen, errText = time.Now(), st.Errors[0]
+			fresh := ""
+			for _, e := range st.Errors {
+				if !errorsBefore[e] {
+					fresh = e
+					break
+				}
+			}
+			if fresh != "" {
+				if errSeen.IsZero() || fresh != errText {
+					errSeen, errText = time.Now(), fresh
 				}
 				if oc, known := classifyError(errText); known {
 					return Result{oc, errText}, last, false
@@ -1868,9 +1886,11 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 				}
 			}
 		}
-		// (Not when the game was in the library before the press: the
-		// library would say "claimed" whatever Epic answers.)
-		if !ownedBefore && time.Since(lastOwnCheck) > 4*time.Second {
+		// The library listing the game counts as "claimed" only if it did
+		// not list it before the press. (If it did, or gave no answer then,
+		// its "yes" now says nothing about this order: Epic's reply and
+		// the page decide.)
+		if notOwnedBefore && time.Since(lastOwnCheck) > 4*time.Second {
 			lastOwnCheck = time.Now()
 			if s.ownership(ctx, last, o) == ownYes {
 				return Result{Claimed, "now in the library"}, last, false
@@ -1912,6 +1932,16 @@ func (s *Session) stillThere(ctx context.Context, b *btn, w *orderWatch) error {
 		return fmt.Errorf("%w: the button moved or changed just before the press", errCalledOff)
 	}
 	return nil
+}
+
+// notPressed is added, in a run with Again, to an answer that ends it
+// before anything was pressed: such a run is made to see the press happen,
+// and its result must say when it did not.
+func (s *Session) notPressed() string {
+	if s.opt.Again {
+		return "; nothing was pressed"
+	}
+	return ""
 }
 
 // approach does everything click does up to the press, and leaves it at

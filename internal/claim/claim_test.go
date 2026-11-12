@@ -1586,6 +1586,68 @@ func TestGoingThroughTheCheckoutAgainForAGameAlreadyOwned(t *testing.T) {
 	accepted.ConfirmStatus, accepted.ConfirmRaw = 0, ""
 	r = runScenario(t, accepted, func(o *Options) { o.Again = true })
 	wantOutcome(t, r, Claimed, 1)
+
+	// The price rules are what they always are, owned or not, again or
+	// not. A total on the page: nothing is pressed.
+	limit := owned.ConfirmRaw
+	r = runScenario(t, scenario{SignedIn: true, Owned: true, DomTotal: "$19.99", NoPreview: true, ConfirmTotal: intp(1999)}, func(o *Options) { o.Again = true })
+	wantOutcome(t, r, NotFree, 0)
+	if n := r.store.hitCount("place"); n != 0 {
+		t.Fatalf("pressed %d time(s) although the page showed a total", n)
+	}
+	logged = false
+	for _, l := range r.logs {
+		logged = logged || strings.Contains(l, "going on all the same")
+	}
+	if !logged {
+		t.Error("this case was meant to get past the ownership question and stop at the price")
+	}
+	// A total in the order itself: it is stopped at the network.
+	r = runScenario(t, scenario{SignedIn: true, Owned: true, DomTotal: "$0.00", ConfirmTotal: intp(1999)}, func(o *Options) { o.Again = true })
+	wantRefusedAtTheNetwork(t, r)
+
+	// The checkout itself says "you already own this" next to its order
+	// button. Without Again that ends it; with Again the button is pressed
+	// and it is Epic's answer to the order that is reported, not the words
+	// that were on the page all along.
+	ownedText := scenario{SignedIn: true, Owned: true, OwnedMessage: true, DomTotal: "$0.00", ConfirmTotal: intp(0), SlowMs: 1500, ConfirmStatus: 404, ConfirmRaw: limit}
+	r = runScenario(t, ownedText, nil)
+	wantOutcome(t, r, Owned, 0)
+	r = runScenario(t, ownedText, func(o *Options) { o.Again = true })
+	wantOutcome(t, r, Owned, 1)
+	if !strings.Contains(r.res.Detail, "Epic says the account has this already") || r.store.hitCount("place") != 1 {
+		t.Errorf("owned text on the page: %v, %d press(es)", r.res, r.store.hitCount("place"))
+	}
+	// ...and if Epic takes that order, it is a claim, whatever the page
+	// said before.
+	ownedText.ConfirmStatus, ownedText.ConfirmRaw = 0, ""
+	r = runScenario(t, ownedText, func(o *Options) { o.Again = true })
+	wantOutcome(t, r, Claimed, 1)
+	// A run that ends before a press says so.
+	r = runScenario(t, scenario{SignedIn: true, Owned: true, OwnedMessage: true, DomTotal: "$0.00", ConfirmTotal: intp(0), SlowMs: 60000}, func(o *Options) { o.Again = true; o.CheckoutWait = 4 * time.Second })
+	if r.res.Outcome == Claimed || r.store.hitCount("place") != 0 {
+		t.Errorf("button never ready: %v, %d press(es)", r.res, r.store.hitCount("place"))
+	}
+}
+
+func TestTheLibraryOnlyConfirmsAClaimIfItDidNotListTheGameBefore(t *testing.T) {
+	// The question "does the account have this?" got no answer before the
+	// press (the store's server hiccuped). The account did have it. After
+	// the press the library says "yes", as it would have all along: that
+	// is not a claim. Epic's answer to the order decides.
+	limit := `{"errorCode":"errors.com.epicgames.ecommerce.orderprocessor.purchase_limit_error","errorMessage":"Sorry, you already own this item, or it's still being processed.","numericErrorCode":20203,"correlationId":"x"}`
+	sc := scenario{SignedIn: true, NewLayout: true, Real2026: true, Owned: true, OwnershipFails: 1, ConfirmStatus: 404, ConfirmRaw: limit}
+	for _, again := range []bool{false, true} {
+		r := runScenario(t, sc, func(o *Options) { o.Again = again })
+		wantOutcome(t, r, Owned, 1)
+		if !strings.Contains(r.res.Detail, "already") {
+			t.Errorf("again=%v: %v", again, r.res)
+		}
+	}
+	// With the answer "no" before the press, the library's "yes" after it
+	// is a claim, as before.
+	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0)}, nil)
+	wantOutcome(t, r, Claimed, 1)
 }
 
 // ---- what runs next to the checkout is supervised from its first moment

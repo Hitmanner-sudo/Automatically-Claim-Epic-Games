@@ -38,18 +38,20 @@ type scenario struct {
 	// Real2026 makes the 2026 layout talk to the addresses Epic's real
 	// free checkout was seen to use on a signed-in launcher in November
 	// 2026: /v2/purchase/order-preview and /v2/purchase/confirm-order.
-	Real2026     bool   `json:"real2026"`
-	GraphQLDown  bool   `json:"graphqlDown"`  // ownership query unavailable
-	German       bool   `json:"german"`       // non-English labels
-	OwnedMessage bool   `json:"ownedMessage"` // checkout itself says "already own"
-	Region       bool   `json:"region"`       // checkout says unavailable in region
-	Pin          bool   `json:"pin"`          // parental PIN prompt
-	FormPost     bool   `json:"formPost"`     // order is sent as a form, not JSON
-	NewLayout    bool   `json:"newLayout"`    // Epic's 2026 free checkout: no "total" line, "Add to library"
-	NewPrice     string `json:"newPrice"`     // price shown by the new layout (default "$0.00")
-	NewTitle     string `json:"newTitle"`     // the game's name in the new layout (default "Flotsam")
-	NoFreeText   bool   `json:"noFreeText"`   // new layout without the "This is free" sentence
-	Throttled    bool   `json:"throttled"`    // "unable to download any more free games"
+	Real2026    bool `json:"real2026"`
+	GraphQLDown bool `json:"graphqlDown"` // ownership query unavailable
+	// OwnershipFails makes the first so many ownership queries fail.
+	OwnershipFails int    `json:"-"`
+	German         bool   `json:"german"`       // non-English labels
+	OwnedMessage   bool   `json:"ownedMessage"` // checkout itself says "already own"
+	Region         bool   `json:"region"`       // checkout says unavailable in region
+	Pin            bool   `json:"pin"`          // parental PIN prompt
+	FormPost       bool   `json:"formPost"`     // order is sent as a form, not JSON
+	NewLayout      bool   `json:"newLayout"`    // Epic's 2026 free checkout: no "total" line, "Add to library"
+	NewPrice       string `json:"newPrice"`     // price shown by the new layout (default "$0.00")
+	NewTitle       string `json:"newTitle"`     // the game's name in the new layout (default "Flotsam")
+	NoFreeText     bool   `json:"noFreeText"`   // new layout without the "This is free" sentence
+	Throttled      bool   `json:"throttled"`    // "unable to download any more free games"
 	// DirectBlocked makes the checkout refuse to open unless it is reached
 	// from the store page (as when only the launcher's own flow works).
 	DirectBlocked bool   `json:"directBlocked"`
@@ -94,6 +96,7 @@ type mockStore struct {
 	lastOffers string
 	firstHit   time.Time
 	pageLoads  int      // how often the checkout page was asked for
+	ownAsked   int      // how often the ownership query was made
 	hits       []string // what pages reported through /hit
 }
 
@@ -301,7 +304,14 @@ func (m *mockStore) handleGraphQL(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if m.sc.GraphQLDown || r.URL.Query().Get("operationName") != "getOffersValidation" || !m.hasSession(r) {
+	failNow := false
+	if r.URL.Query().Get("operationName") == "getOffersValidation" {
+		m.mu.Lock()
+		m.ownAsked++
+		failNow = m.ownAsked <= m.sc.OwnershipFails
+		m.mu.Unlock()
+	}
+	if failNow || m.sc.GraphQLDown || r.URL.Query().Get("operationName") != "getOffersValidation" || !m.hasSession(r) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = io.WriteString(w, `{"errors":[{"message":"PersistedQueryNotFound"}]}`)

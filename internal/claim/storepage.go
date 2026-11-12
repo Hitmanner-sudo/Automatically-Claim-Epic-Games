@@ -190,10 +190,10 @@ func (s *Session) viaStorePage(ctx context.Context, o feed.Offer, w *orderWatch)
 				// only believed for a game or bundle, whose page is its own.
 				switch s.ownership(ctx, pageState{URL: ps.URL}, o) {
 				case ownYes:
-					return Result{Owned, "the store page shows it is in the library"}, last
+					return Result{Owned, "the store page shows it is in the library" + s.notPressed()}, last
 				case ownUnknown:
 					if o.OfferType == "" || o.OfferType == "BASE_GAME" || o.OfferType == "BUNDLE" {
-						return Result{Owned, "the store page shows it is in the library"}, last
+						return Result{Owned, "the store page shows it is in the library" + s.notPressed()}, last
 					}
 				}
 				return Result{Failed, "the store page says \"In Library\", but that could not be confirmed for this very offer; will look again later"}, last

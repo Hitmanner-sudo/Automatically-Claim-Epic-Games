@@ -1,13 +1,18 @@
 name: Release
+run-name: ${{ inputs.publish_run == '' && format('Candidate {0}', inputs.version) || format('Publish {0} from run {1}', inputs.version, inputs.publish_run) }}
 
 # Publishes EpicAutoClaim.exe as a GitHub release, in two steps, so that the
 # file that is published is the very file that was tried beforehand:
 #
 #   1. Run it with a version (v1.2.3). It tests, builds the program and
-#      keeps it with the run ("candidate"). Nothing is published.
-#   2. Try that file. Then run it again with the same version and with
-#      "publish_run" set to the number of the first run (the digits at the
-#      end of its address). It takes the file from that run and publishes it.
+#      keeps it with the run ("candidate"). Nothing is published. The log
+#      prints each file's SHA-256.
+#   2. Try that file. Then, without changing the branch in between, run it
+#      again with the same version, with "publish_run" set to the number of
+#      the first run (the digits at the end of its address), "sha256" set to
+#      the SHA-256 of the file that was tried, and "tried" saying how. It
+#      takes the file from that run, checks that it is that file, and
+#      publishes it.
 
 on:
   workflow_dispatch:
@@ -22,13 +27,18 @@ on:
         default: ''
         type: string
       variant:
-        description: Which of the candidate's two builds to publish
+        description: To publish - which of the candidate's two builds
         required: false
         default: standard
         type: choice
         options:
           - standard
           - symbols
+      sha256:
+        description: To publish - SHA-256 of the file that was tried
+        required: false
+        default: ''
+        type: string
       tried:
         description: To publish - one sentence on how this very file was tried (goes into the notes)
         required: false
@@ -55,22 +65,28 @@ jobs:
         run: go test ./... -count=1 -timeout 20m
       - name: Build
         shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          $tag = '${{ inputs.version }}'
+          $tag = "$env:VERSION".Trim()
           if ($tag -cnotmatch '^v\d+\.\d+\.\d+$') { throw "version must look like v1.2.3, got '$tag'" }
-          if (git ls-remote --tags origin "refs/tags/$tag") { throw "$tag exists already; use the next version number" }
+          $known = git ls-remote --tags origin "refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw "could not look up $tag" }
+          if ($known) { throw "$tag exists already; use the next version number" }
           $v = $tag.Substring(1)
           go run ./internal/winres/mkres -version $v -o cmd/epicautoclaim/rsrc_windows_amd64.syso
           if ($LASTEXITCODE -ne 0) { throw 'the resource object could not be made' }
           New-Item -ItemType Directory -Force standard, symbols | Out-Null
           # The program as it is published: one file, no console.
           go build -trimpath -ldflags "-H=windowsgui -s -w -X main.version=$v" -o standard/EpicAutoClaim.exe ./cmd/epicautoclaim
+          if ($LASTEXITCODE -ne 0) { throw 'build failed' }
           # The same with its symbol table left in (bigger; nothing else differs).
           go build -trimpath -ldflags "-H=windowsgui -X main.version=$v" -o symbols/EpicAutoClaim.exe ./cmd/epicautoclaim
+          if ($LASTEXITCODE -ne 0) { throw 'build failed' }
           foreach ($d in 'standard', 'symbols') {
             $f = Get-Item "$d/EpicAutoClaim.exe"
             $vi = $f.VersionInfo
-            if ($vi.ProductName -ne 'EpicAutoClaim' -or $vi.ProductVersion -ne $v) { throw "${d}: Windows reads '$($vi.ProductName)' $($vi.ProductVersion) from the file, want EpicAutoClaim $v" }
+            if ($vi.ProductName -ne 'EpicAutoClaim' -or $vi.ProductVersion -ne $v -or $vi.FileVersion -ne "$v.0") { throw "${d}: Windows reads '$($vi.ProductName)' $($vi.ProductVersion) ($($vi.FileVersion)) from the file, want EpicAutoClaim $v" }
             "{0,-9} {1,9} bytes  SHA-256 {2}" -f $d, $f.Length, (Get-FileHash $f.FullName -Algorithm SHA256).Hash
           }
       - uses: actions/upload-artifact@v4
@@ -102,26 +118,50 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD: ${{ github.sha }}
+          VERSION: ${{ inputs.version }}
+          RUN: ${{ inputs.publish_run }}
+          VARIANT: ${{ inputs.variant }}
+          WANT: ${{ inputs.sha256 }}
           TRIED: ${{ inputs.tried }}
         run: |
-          $tag = '${{ inputs.version }}'
+          $tag = "$env:VERSION".Trim()
           if ($tag -cnotmatch '^v\d+\.\d+\.\d+$') { throw "version must look like v1.2.3, got '$tag'" }
           $v = $tag.Substring(1)
-          $f = Get-Item EpicAutoClaim.exe
-          if ($f.VersionInfo.ProductVersion -ne $v) { throw "the candidate says it is version $($f.VersionInfo.ProductVersion), not $v" }
-          # The release is tagged at the commit the candidate was built from.
-          $run = gh api "repos/${{ github.repository }}/actions/runs/${{ inputs.publish_run }}" | ConvertFrom-Json
-          if ($run.path -notlike '*release.yml' -or $run.conclusion -ne 'success') { throw "run ${{ inputs.publish_run }} is not a successful candidate run" }
-          gh api "repos/${{ github.repository }}/git/ref/tags/$tag" *> $null
-          if ($LASTEXITCODE -eq 0) { throw "$tag exists already; use the next version number" }
-          $hash = (Get-FileHash $f.FullName -Algorithm SHA256).Hash
-          $size = [math]::Round($f.Length / 1MB, 1)
-          "TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "SHA=$($run.head_sha)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $id = "$env:RUN".Trim()
+          if ($id -notmatch '^\d+$') { throw 'publish_run must be the digits of the candidate run' }
           $tried = "$env:TRIED".Trim()
-          if ($tried) { $tried = "- **How this file was tried:** $tried`n" }
+          if (-not $tried) { throw 'say in "tried" how this file was tried; a file that was not tried is not published' }
+
+          # The run must be a candidate run of this workflow, started by
+          # hand in this repository, and built from the commit this run is
+          # at (the release is tagged there).
+          $run = gh api "repos/$env:REPO/actions/runs/$id" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "could not look up run $id" }
+          if ($run.path -notlike '*release.yml' -or $run.conclusion -ne 'success' -or $run.event -ne 'workflow_dispatch' -or $run.head_repository.full_name -ne $env:REPO) { throw "run $id is not a successful candidate run of this repository" }
+          if ($run.head_sha -ne $env:HEAD) { throw "the branch has moved since the candidate was built ($($run.head_sha) then, $env:HEAD now); build a new candidate and try that one" }
+
+          # The file must be the one that was tried, and say the version.
+          $f = Get-Item EpicAutoClaim.exe
+          $hash = (Get-FileHash $f.FullName -Algorithm SHA256).Hash
+          if ($hash -ne "$env:WANT".Trim().ToUpper()) { throw "this is not the file that was tried: its SHA-256 is $hash" }
+          if ($f.VersionInfo.ProductVersion -ne $v) { throw "the candidate says it is version $($f.VersionInfo.ProductVersion), not $v" }
+
+          # A version is published once.
+          $refs = gh api "repos/$env:REPO/git/matching-refs/tags/$tag" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "could not look up $tag" }
+          if ($refs | Where-Object { $_.ref -eq "refs/tags/$tag" }) { throw "$tag exists already; use the next version number" }
+          $releases = gh api "repos/$env:REPO/releases?per_page=100" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'could not list the releases' }
+          if ($releases | Where-Object { $_.tag_name -eq $tag }) { throw "a release (or a draft of one) for $tag exists already" }
+
+          $size = [math]::Round($f.Length / 1MB, 1)
+          $kind = ''
+          if ("$env:VARIANT" -eq 'symbols') { $kind = ' This is the build with its symbol table left in, which is why it is bigger; nothing else differs.' }
+          "TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append
           @"
-          **One file: ``EpicAutoClaim.exe`` ($size MB).** Download it and double-click it. That installs it (one dialog, the only window it ever shows). From then on it starts by itself when you sign in to Windows, looks at Epic's free-games list every hour, and claims each free game through your own Epic Games Launcher without showing anything.
+          **One file: ``EpicAutoClaim.exe`` ($size MB).**$kind Download it and double-click it. That installs it (one dialog, the only window it ever shows). From then on it starts by itself when you sign in to Windows, looks at Epic's free-games list every hour, and claims each free game through your own Epic Games Launcher without showing anything.
 
           Before the first run: the Epic Games Launcher must be installed and signed in with **Remember me** ticked.
 
@@ -129,20 +169,18 @@ jobs:
 
           Things to know:
 
-          $tried- The file is not code-signed. Windows may ask before running it (**More info → Run anyway**). Where **Smart App Control** is switched on, Windows decides by itself whether an unsigned program may start and offers no "run anyway"; if it refuses this file, nothing is installed and nothing is broken. See the README.
+          - **How this file was tried:** $tried
+          - The file is not code-signed. Windows may ask before running it (**More info → Run anyway**). Where **Smart App Control** is switched on, Windows decides by itself whether an unsigned program may start and offers no "run anyway"; if it refuses this file, nothing is installed and nothing is broken. See the README.
           - To see for yourself that it works on your PC: ``EpicAutoClaim.exe once --dry-run`` rehearses everything except the order. If this week's game is already in your library, ``EpicAutoClaim.exe once --again`` orders it again for real: Epic answers that you have it, which shows that the whole path works, and nothing changes.
 
           SHA-256 of ``EpicAutoClaim.exe``: ``$hash``
           "@ | Out-File -Encoding utf8 release-notes.md
           Get-Content release-notes.md
-          # (The look-up of the tag above ends "not found" when all is well;
-          # that must not be taken for this step's own result.)
-          exit 0
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
           name: EpicAutoClaim ${{ env.TAG }}
-          target_commitish: ${{ env.SHA }}
+          target_commitish: ${{ github.sha }}
           body_path: release-notes.md
           files: EpicAutoClaim.exe
           fail_on_unmatched_files: true
