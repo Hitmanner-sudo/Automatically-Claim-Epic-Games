@@ -51,22 +51,24 @@ func (c *fakeClaimer) ClaimAll(ctx context.Context, offers []feed.Offer) (map[st
 }
 
 type rig struct {
-	t     *testing.T
-	now   time.Time
-	feed  *fakeFeed
-	claim *fakeClaimer
-	d     *Daemon
-	logMu sync.Mutex
-	logs  []string
+	t         *testing.T
+	statePath string
+	now       time.Time
+	feed      *fakeFeed
+	claim     *fakeClaimer
+	d         *Daemon
+	logMu     sync.Mutex
+	logs      []string
 }
 
 func newRig(t *testing.T) *rig {
 	t.Helper()
-	st, err := state.Open(filepath.Join(t.TempDir(), "state.json"))
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	st, err := state.Open(statePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &rig{t: t, now: time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC), feed: &fakeFeed{}, claim: &fakeClaimer{results: map[string]claim.Result{}}}
+	r := &rig{t: t, statePath: statePath, now: time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC), feed: &fakeFeed{}, claim: &fakeClaimer{results: map[string]claim.Result{}}}
 	r.d = &Daemon{
 		Feed: r.feed, Claimer: r.claim, State: st,
 		Country: "US", CheckEvery: time.Hour,
@@ -398,7 +400,9 @@ func TestSoonestEndingOfferGoesFirstAndUnreachedOnesAreRetried(t *testing.T) {
 func TestFeedErrorsRetrySoonButNotForever(t *testing.T) {
 	r := newRig(t)
 	r.feed.err = errors.New("no network")
-	want := []time.Duration{2 * time.Minute, 4 * time.Minute, 6 * time.Minute}
+	// Soon at first (a PC that has just woken up may not be online yet),
+	// then more slowly.
+	want := []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute, 20 * time.Minute, 30 * time.Minute}
 	for i, w := range want {
 		if next := r.tick(); next != w {
 			t.Fatalf("failure %d: next = %v, want %v", i+1, next, w)
@@ -464,7 +468,7 @@ func TestRunStopsWithItsContext(t *testing.T) {
 	r.d.Now = time.Now
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { r.d.Run(ctx, 0); close(done) }()
+	go func() { r.d.Run(ctx, RunOptions{}); close(done) }()
 	deadline := time.After(5 * time.Second)
 	for r.feed.calls.Load() == 0 {
 		select {
@@ -567,5 +571,243 @@ func TestAStopHalfWayKeepsWhatWasFoundOut(t *testing.T) {
 	}
 	if e := r.entry("c"); e.Attempts != 0 || !e.NextAttempt.IsZero() || !e.LastAttempt.IsZero() {
 		t.Errorf("the offer that was never reached was touched: %+v", e)
+	}
+}
+
+// ---- the daily timetable
+
+func TestDailySlot(t *testing.T) {
+	utc := DailySlot(16, 30, time.UTC)
+	at := func(s string) time.Time {
+		v, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	for after, want := range map[string]string{
+		"2026-11-12T10:00:00Z": "2026-11-12T16:30:00Z",
+		"2026-11-12T16:29:59Z": "2026-11-12T16:30:00Z",
+		"2026-11-12T16:30:00Z": "2026-11-13T16:30:00Z", // strictly after
+		"2026-11-12T23:00:00Z": "2026-11-13T16:30:00Z",
+		"2026-12-31T20:00:00Z": "2027-01-01T16:30:00Z",
+	} {
+		if got := utc(at(after)); !got.Equal(at(want)) {
+			t.Errorf("after %s: %s, want %s", after, got.UTC().Format(time.RFC3339), want)
+		}
+	}
+	// A local time of day keeps to the wall clock across a change to and
+	// from daylight saving time.
+	berlin, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skip("no time zone data")
+	}
+	local := DailySlot(18, 0, berlin)
+	for after, want := range map[string]string{
+		"2026-03-28T20:00:00+01:00": "2026-03-29T18:00:00+02:00", // clocks go forward that night
+		"2026-10-24T20:00:00+02:00": "2026-10-25T18:00:00+01:00", // and back
+		"2026-07-01T17:59:00+02:00": "2026-07-01T18:00:00+02:00",
+	} {
+		if got := local(at(after)); !got.Equal(at(want)) {
+			t.Errorf("after %s: %s, want %s", after, got.In(berlin).Format(time.RFC3339), want)
+		}
+	}
+	// A time of day that does not exist on the day the clocks go forward
+	// still gives a moment later that day, not an endless loop.
+	gap := DailySlot(2, 30, berlin)
+	if got := gap(at("2026-03-28T20:00:00+01:00")); !got.After(at("2026-03-28T20:00:00+01:00")) || got.Sub(at("2026-03-28T20:00:00+01:00")) > 30*time.Hour {
+		t.Errorf("slot in the missing hour: %s", got)
+	}
+}
+
+func slotRig(t *testing.T) *rig {
+	r := newRig(t)
+	r.d.Slot = DailySlot(16, 30, time.UTC)
+	return r
+}
+
+func TestChecksOnceADayAtTheSlot(t *testing.T) {
+	r := slotRig(t) // the rig's clock stands at 10:00 UTC
+	a := r.offer("a", 6*24*time.Hour)
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a}}
+	r.claim.results[a.Key()] = claim.Result{Outcome: claim.Claimed}
+	if wait := r.tick(); wait != 6*time.Hour+30*time.Minute {
+		t.Fatalf("next check in %v, want at 16:30", wait)
+	}
+	r.now = r.now.Add(6*time.Hour + 30*time.Minute)
+	if wait := r.tick(); wait != 24*time.Hour {
+		t.Fatalf("next check in %v, want a day later", wait)
+	}
+	// A giveaway that is due to start is looked at shortly after it starts,
+	// not only at the next daily time.
+	r.feed.snap.NextChange = r.now.Add(5 * time.Hour)
+	if wait := r.tick(); wait != 5*time.Hour+2*time.Minute {
+		t.Fatalf("next check in %v, want just after the giveaway starts", wait)
+	}
+}
+
+func TestARestartDoesNotCauseACheck(t *testing.T) {
+	r := slotRig(t)
+	a := r.offer("a", 6*24*time.Hour)
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a}}
+	r.claim.results[a.Key()] = claim.Result{Outcome: claim.Claimed}
+
+	// Never run before: look at once.
+	if !r.d.Due().Equal(r.now) {
+		t.Fatalf("first run due %v, want now", r.d.Due())
+	}
+	next := r.d.Tick(context.Background())
+	if sc := r.d.State.Schedule(); !sc.NextDue.Equal(next) || !sc.LastCheck.Equal(r.now) {
+		t.Fatalf("timetable not written down: %+v", sc)
+	}
+
+	// The program is started again (the PC was restarted, say), two hours
+	// later: a new Daemon over the same state file.
+	r.now = r.now.Add(2 * time.Hour)
+	st, err := state.Open(r.statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again := &Daemon{Feed: r.feed, Claimer: r.claim, State: st, Slot: r.d.Slot, Now: func() time.Time { return r.now }, Jitter: r.d.Jitter, Logf: r.d.Logf}
+	if !again.Due().Equal(next) {
+		t.Fatalf("after a restart the next check is due %v, want still %v", again.Due(), next)
+	}
+	calls := r.feed.calls.Load()
+	// Started by Windows' daily schedule with nothing due for hours: it
+	// returns at once and has not looked at anything.
+	done := make(chan struct{})
+	go func() { again.Run(context.Background(), RunOptions{ExitWhenIdleFor: 2 * time.Hour}); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return although nothing was due")
+	}
+	if r.feed.calls.Load() != calls {
+		t.Fatal("the list was read merely because the program was started")
+	}
+	if !r.logged("nothing to do before") {
+		t.Errorf("logs = %q", r.logs)
+	}
+}
+
+func TestATimetableFromAWrongClockIsNotTrusted(t *testing.T) {
+	r := slotRig(t)
+	_ = r.d.State.SetSchedule(func(sc *state.Schedule) { sc.NextDue = r.now.Add(400 * 24 * time.Hour) })
+	if due := r.d.Due(); due.Sub(r.now) > 25*time.Hour {
+		t.Fatalf("due in %v", due.Sub(r.now))
+	}
+}
+
+func TestAnInterruptedRoundIsTakenUpAgain(t *testing.T) {
+	r := slotRig(t)
+	a := r.offer("a", 6*24*time.Hour)
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a}}
+	_ = r.d.State.SetSchedule(func(sc *state.Schedule) { sc.NextDue = r.now.Add(-time.Minute) })
+	ctx, cancel := context.WithCancel(context.Background())
+	r.claim.during = cancel
+	r.claim.err = context.Canceled
+	r.d.Tick(ctx)
+	if sc := r.d.State.Schedule(); !sc.NextDue.Equal(r.now.Add(-time.Minute)) {
+		t.Fatalf("a round cut short moved the timetable to %v", sc.NextDue)
+	}
+}
+
+func TestFailuresToReadTheListAreRememberedAcrossRestarts(t *testing.T) {
+	r := slotRig(t)
+	r.feed.err = errors.New("no network")
+	if wait := r.tick(); wait != time.Minute {
+		t.Fatalf("first failure: %v", wait)
+	}
+	st, err := state.Open(r.statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again := &Daemon{Feed: r.feed, Claimer: r.claim, State: st, Slot: r.d.Slot, Now: func() time.Time { return r.now }, Jitter: r.d.Jitter, Logf: r.d.Logf}
+	if wait := again.Tick(context.Background()).Sub(r.now); wait != 2*time.Minute {
+		t.Fatalf("second failure after a restart: %v", wait)
+	}
+	// After some hours of failures it is left until the next daily check.
+	for i := 0; i < 20; i++ {
+		again.Tick(context.Background())
+	}
+	if wait := again.Tick(context.Background()).Sub(r.now); wait != 6*time.Hour+30*time.Minute {
+		t.Fatalf("after many failures: next try in %v, want at the daily time", wait)
+	}
+	// One success clears the count.
+	r.feed.err = nil
+	again.Tick(context.Background())
+	if n := st.Schedule().FeedFailures; n != 0 {
+		t.Fatalf("failures after a success = %d", n)
+	}
+}
+
+func TestRunWaitsOutTheMinutesAfterSignIn(t *testing.T) {
+	r := newRig(t)
+	r.d.Now = time.Now
+	holds := []time.Duration{150 * time.Millisecond, 0}
+	var mu sync.Mutex
+	settle := func() time.Duration {
+		mu.Lock()
+		defer mu.Unlock()
+		h := holds[0]
+		if len(holds) > 1 {
+			holds = holds[1:]
+		}
+		return h
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := time.Now()
+	go r.d.Run(ctx, RunOptions{Settle: settle})
+	for r.feed.calls.Load() == 0 {
+		if time.Since(started) > 5*time.Second {
+			t.Fatal("the round never ran")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if waited := time.Since(started); waited < 150*time.Millisecond {
+		t.Fatalf("the round ran after %v, before the hold-off was over", waited)
+	}
+}
+
+func TestRunStaysForWorkThatIsDueSoonAndLeavesWhenItIsNot(t *testing.T) {
+	// Due now, and afterwards nothing until tomorrow: one round, then Run
+	// returns by itself.
+	r := newRig(t)
+	r.d.Now = time.Now
+	r.d.Slot = func(after time.Time) time.Time { return after.Add(24 * time.Hour) }
+	done := make(chan struct{})
+	go func() { r.d.Run(context.Background(), RunOptions{ExitWhenIdleFor: 2 * time.Hour}); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after its round")
+	}
+	if n := r.feed.calls.Load(); n != 1 {
+		t.Fatalf("rounds = %d", n)
+	}
+}
+
+func TestAnAnswerAboutTheAccountCountsEvenWhenTheSessionWasCutShort(t *testing.T) {
+	// The first offer's checkout says the account is throttled; then the
+	// user opens the launcher and the session is handed over (or the
+	// program is told to stop). The offer behind it must not be tried
+	// again half an hour later.
+	for name, sessionErr := range map[string]error{"handed over": ErrYielded, "stopped": context.Canceled} {
+		r := newRig(t)
+		a := r.offer("a", 5*24*time.Hour)
+		b := r.offer("b", 6*24*time.Hour)
+		r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a, b}}
+		r.claim.results[a.Key()] = claim.Result{Outcome: claim.Throttled, Detail: "x"}
+		r.claim.err = sessionErr
+		ctx, cancel := context.WithCancel(context.Background())
+		if sessionErr == context.Canceled {
+			r.claim.during = cancel
+		}
+		r.d.Tick(ctx)
+		cancel()
+		if e := r.entry("b"); e.NextAttempt.Sub(r.now) != 25*time.Hour || e.Attempts != 0 {
+			t.Errorf("%s: the offer behind it waits %v (attempts %d), want 25h", name, e.NextAttempt.Sub(r.now), e.Attempts)
+		}
 	}
 }

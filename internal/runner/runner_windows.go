@@ -66,17 +66,41 @@ type hidden struct {
 	watch   sync.WaitGroup
 	userCmd atomic.Pointer[string]
 
-	// strays are windows of the hidden launcher that turned up on the
-	// visible desktop (and were hidden again at once). There should never
-	// be any; they are kept so that a trial can report them.
-	strayMu sync.Mutex
-	strays  []win.Window
+	seen *seen
 }
 
-func (h *hidden) leaked() []win.Window {
-	h.strayMu.Lock()
-	defer h.strayMu.Unlock()
-	return append([]win.Window(nil), h.strays...)
+// seen collects, over a whole session (all its start attempts and update
+// rounds), what should never happen: launcher windows that reached the
+// visible desktop. Each was hidden again at once; they are kept so that a
+// trial can report them.
+type seen struct {
+	mu sync.Mutex
+	// leaked are windows of a hidden launcher, or of one left over from an
+	// update round, that turned up on the visible desktop.
+	leaked []win.Window
+	// flickers counts windows the launcher tried to show while it was
+	// installing an update of its own in the tray.
+	flickers int
+}
+
+func (s *seen) add(ws ...win.Window) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, w := range ws {
+		known := false
+		for _, k := range s.leaked {
+			known = known || k.HWND == w.HWND
+		}
+		if !known {
+			s.leaked = append(s.leaked, w)
+		}
+	}
+}
+
+func (s *seen) report() (leaked []win.Window, flickers int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]win.Window(nil), s.leaked...), s.flickers
 }
 
 func (r *Runner) startWatch(h *hidden) {
@@ -100,23 +124,13 @@ func (r *Runner) startWatch(h *hidden) {
 				if n, shown := h.in.EndStale(); n > 0 {
 					// A launcher that the update machinery started late.
 					r.logf("ended %d launcher process(es) left over from the launcher's self-update", n)
-					h.strayMu.Lock()
-					h.strays = append(h.strays, shown...)
-					h.strayMu.Unlock()
+					h.seen.add(shown...)
 				}
 				if stray := h.in.OnUserDesktop(); len(stray) > 0 {
-					h.strayMu.Lock()
 					for _, w := range stray {
 						win.HideWindow(w.HWND)
-						known := false
-						for _, k := range h.strays {
-							known = known || k.HWND == w.HWND
-						}
-						if !known {
-							h.strays = append(h.strays, w)
-						}
 					}
-					h.strayMu.Unlock()
+					h.seen.add(stray...)
 					if !warned {
 						warned = true
 						r.logf("a window of the hidden launcher appeared on the visible desktop and was hidden again (class %q, title %q)", stray[0].Class, stray[0].Title)
@@ -174,7 +188,7 @@ func (r *Runner) handOver(inst launcher.Install, h *hidden) {
 // bringUp starts the hidden launcher and waits for its DevTools endpoint.
 // A launcher that first wants to update itself is let do so. On errUserAsked
 // the launcher is already running for the user.
-func (r *Runner) bringUp(ctx context.Context, inst launcher.Install) (*hidden, error) {
+func (r *Runner) bringUp(ctx context.Context, inst launcher.Install, sn *seen) (*hidden, error) {
 	// A launcher with an update of its own to install exits instead of
 	// coming up. It is then let update (see launcher.UpdateRun) and started
 	// again; a large update can take more than one such round.
@@ -194,7 +208,7 @@ func (r *Runner) bringUp(ctx context.Context, inst launcher.Install) (*hidden, e
 		if err != nil {
 			return nil, fmt.Errorf("start the hidden launcher: %w", err)
 		}
-		h := &hidden{in: in, base: cdp.Base(port)}
+		h := &hidden{in: in, base: cdp.Base(port), seen: sn}
 		h.ctx, h.cancel = context.WithCancel(ctx)
 		r.startWatch(h)
 
@@ -233,7 +247,11 @@ func (r *Runner) bringUp(ctx context.Context, inst launcher.Install) (*hidden, e
 		} else {
 			r.logf("the launcher closed itself again (launcher processes seen: %s); its update does not seem to be finished, so it gets another round in the tray", seen)
 		}
-		if err := launcher.UpdateRun(ctx, inst, r.logf); err != nil {
+		flickers, err := launcher.UpdateRun(ctx, inst, r.logf)
+		sn.mu.Lock()
+		sn.flickers += flickers
+		sn.mu.Unlock()
+		if err != nil {
 			if errors.Is(err, launcher.ErrUserStarted) {
 				return nil, errUserAsked
 			}
@@ -348,7 +366,8 @@ func (r *Runner) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]
 	}()
 
 	started := time.Now()
-	h, err := r.bringUp(ctx, inst)
+	sn := &seen{}
+	h, err := r.bringUp(ctx, inst, sn)
 	if err != nil {
 		if errors.Is(err, errUserAsked) {
 			handedOver = true // the launcher is running for the user now
@@ -412,7 +431,12 @@ type LaunchReport struct {
 	HiddenWindows  []win.Window
 	OnUserDesktop  []win.Window // still showing on the visible desktop at the end
 	Leaked         []win.Window // showed on the visible desktop at some point (hidden again at once)
-	SignedIn       string       // "yes", "no", "unknown"
+	// UpdateFlickers counts the windows the launcher tried to show while it
+	// installed an update of its own, which it can only do in its tray mode
+	// on the visible desktop; each was put away within a hundredth of a
+	// second or so.
+	UpdateFlickers int
+	SignedIn       string // "yes", "no", "unknown"
 	Pages          []PageSurvey
 	Err            string
 }
@@ -486,10 +510,9 @@ func surveyPages(ctx context.Context, base string) []PageSurvey {
 // TrialLaunch starts the hidden launcher, looks at what it exposes, and
 // shuts it down again. It claims nothing. It refuses to run while the user's
 // own launcher is open.
-func (r *Runner) TrialLaunch(ctx context.Context) LaunchReport {
+func (r *Runner) TrialLaunch(ctx context.Context) (rep LaunchReport) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var rep LaunchReport
 	inst, restore, release, err := r.makeRoom()
 	rep.Install = inst
 	if err != nil {
@@ -505,7 +528,9 @@ func (r *Runner) TrialLaunch(ctx context.Context) LaunchReport {
 	}()
 
 	started := time.Now()
-	h, err := r.bringUp(ctx, inst)
+	sn := &seen{}
+	defer func() { rep.Leaked, rep.UpdateFlickers = sn.report() }()
+	h, err := r.bringUp(ctx, inst, sn)
 	if err != nil {
 		if errors.Is(err, errUserAsked) {
 			handedOver = true
@@ -520,13 +545,21 @@ func (r *Runner) TrialLaunch(ctx context.Context) LaunchReport {
 	rep.Up = true
 	rep.StartupSeconds = time.Since(started).Seconds()
 
-	vctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// Everything from here on ends at once if the user asks for the
+	// launcher (h.ctx is then cancelled by the watch).
+	pause := func(d time.Duration) {
+		select {
+		case <-h.ctx.Done():
+		case <-time.After(d):
+		}
+	}
+	vctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
 	if v, err := cdp.Version(vctx, base); err == nil {
 		rep.Browser, rep.UserAgent = v.Browser, v.UserAgent
 	}
 	cancel()
 	list := func() []cdp.Target {
-		lctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		lctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
 		defer cancel()
 		t, _ := cdp.Targets(lctx, base)
 		for i := range t {
@@ -534,16 +567,18 @@ func (r *Runner) TrialLaunch(ctx context.Context) LaunchReport {
 		}
 		return t
 	}
-	time.Sleep(3 * time.Second)
+	pause(3 * time.Second)
 	rep.Targets = list()
 
-	if err := in.Summon(); err != nil {
-		r.logf("summon: %v", err)
-	}
 	rep.SignedIn = "unknown"
+	if h.ctx.Err() == nil {
+		if err := in.Summon(); err != nil {
+			r.logf("summon: %v", err)
+		}
+	}
 	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) && ctx.Err() == nil {
-		time.Sleep(2 * time.Second)
+	for time.Now().Before(deadline) && h.ctx.Err() == nil {
+		pause(2 * time.Second)
 		rep.TargetsAfter = list()
 		pages, login := 0, false
 		for _, t := range rep.TargetsAfter {
@@ -563,13 +598,15 @@ func (r *Runner) TrialLaunch(ctx context.Context) LaunchReport {
 			break
 		}
 	}
-	if rep.SignedIn == "yes" {
+	if rep.SignedIn == "yes" && h.ctx.Err() == nil {
 		// Give the launcher's store page a moment to finish loading.
-		time.Sleep(8 * time.Second)
+		pause(8 * time.Second)
 		rep.TargetsAfter = list()
 	}
-	rep.Pages = surveyPages(ctx, base)
-	rep.HiddenWindows = in.HiddenWindows()
+	if h.ctx.Err() == nil {
+		rep.Pages = surveyPages(h.ctx, base)
+		rep.HiddenWindows = in.HiddenWindows()
+	}
 	rep.OnUserDesktop = in.OnUserDesktop()
 	grace := 8 * time.Second
 	if ctx.Err() != nil {
@@ -579,7 +616,6 @@ func (r *Runner) TrialLaunch(ctx context.Context) LaunchReport {
 		handedOver = true
 		rep.Err = "the launcher was started by the user during the trial; stepped aside"
 	}
-	rep.Leaked = h.leaked()
 	if ctx.Err() != nil && rep.Err == "" {
 		rep.Err = "interrupted"
 	}

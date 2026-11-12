@@ -18,7 +18,7 @@ func TestDefaultsAndPartialFile(t *testing.T) {
 	if c != Default() {
 		t.Fatalf("missing file should give defaults, got %+v", c)
 	}
-	if !c.RestartIdleLauncher || c.DryRun || c.CheckEveryMinutes != 60 {
+	if !c.RestartIdleLauncher || c.DryRun || c.DailyAt != "" {
 		t.Fatalf("defaults changed: %+v", c)
 	}
 
@@ -31,21 +31,31 @@ func TestDefaultsAndPartialFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Country != "DE" || !c.RestartIdleLauncher || !c.KeepDiagnostics || c.CheckEveryMinutes != 60 {
+	if c.Country != "DE" || !c.RestartIdleLauncher || !c.KeepDiagnostics || c.DailyAt != "" {
 		t.Fatalf("partial file: %+v", c)
 	}
 }
 
 func TestNormalizeAndBadInput(t *testing.T) {
-	c := Config{Country: "Germany", CheckEveryMinutes: 1}
+	c := Config{Country: "Germany", DailyAt: " 7.05 "}
 	c.Normalize()
-	if c.Country != "" || c.CheckEveryMinutes != 10 {
+	if c.Country != "" || c.DailyAt != "07:05" {
 		t.Fatalf("normalize: %+v", c)
 	}
-	c = Config{Country: "u1", CheckEveryMinutes: 999999}
+	c = Config{Country: "u1", DailyAt: "25:00"}
 	c.Normalize()
-	if c.Country != "" || c.CheckEveryMinutes != 1440 {
+	if c.Country != "" || c.DailyAt != "" {
 		t.Fatalf("normalize: %+v", c)
+	}
+	for in, want := range map[string]string{
+		"18:30": "18:30", "0:00": "00:00", "23:59": "23:59", "9:5": "", "24:00": "", "12:60": "",
+		"noon": "", "": "", "12": "", "1:2:3": "", "-1:00": "", "１２:００": "",
+	} {
+		c = Config{DailyAt: in}
+		c.Normalize()
+		if c.DailyAt != want {
+			t.Errorf("dailyAt %q -> %q, want %q", in, c.DailyAt, want)
+		}
 	}
 
 	path := filepath.Join(t.TempDir(), "config.json")
@@ -76,14 +86,14 @@ func TestNormalizeAndBadInput(t *testing.T) {
 	}
 
 	// One value of the wrong kind: the rest of the file still applies.
-	if err := os.WriteFile(path, []byte(`{"dryRun": true, "checkEveryMinutes": "30", "restartIdleLauncher": false, "country": "de"}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"dryRun": true, "keepDiagnostics": "no", "restartIdleLauncher": false, "country": "de"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	c, err = Load(path)
-	if err == nil || !strings.Contains(err.Error(), "checkEveryMinutes") {
+	if err == nil || !strings.Contains(err.Error(), "keepDiagnostics") {
 		t.Fatalf("type error should name the setting: %v", err)
 	}
-	if !c.DryRun || c.RestartIdleLauncher || c.Country != "DE" || c.CheckEveryMinutes != 60 {
+	if !c.DryRun || c.RestartIdleLauncher || c.Country != "DE" || !c.KeepDiagnostics {
 		t.Fatalf("type error: %+v", c)
 	}
 }
@@ -95,7 +105,7 @@ func TestWrongKindSafetySettingsAreReadCautiously(t *testing.T) {
 		`{"country": 5, "dryRun": "yes"}`:                    {true, true},
 		`{"restartIdleLauncher": 0, "country": "us"}`:        {false, false},
 		`{"DryRun": 1}`: {true, true},
-		`{"checkEveryMinutes": "30", "dryRun": false}`: {false, true},
+		`{"keepDiagnostics": "30", "dryRun": false}`: {false, true},
 	} {
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 			t.Fatal(err)
@@ -139,7 +149,7 @@ func TestEnsureFileAndRoundTrip(t *testing.T) {
 	if err := EnsureFile(path); err != nil {
 		t.Fatal(err)
 	}
-	want := Config{Country: "US", CheckEveryMinutes: 30, RestartIdleLauncher: false, DryRun: true, KeepDiagnostics: false, LauncherPath: `D:\Epic\EpicGamesLauncher.exe`}
+	want := Config{Country: "US", DailyAt: "18:30", RestartIdleLauncher: false, DryRun: true, KeepDiagnostics: false, LauncherPath: `D:\Epic\EpicGamesLauncher.exe`}
 	if err := Save(path, want); err != nil {
 		t.Fatal(err)
 	}
@@ -152,5 +162,37 @@ func TestEnsureFileAndRoundTrip(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("round trip: %+v != %+v", got, want)
+	}
+}
+
+func TestSettingsFromAnOlderVersionStillLoad(t *testing.T) {
+	// Earlier versions had "checkEveryMinutes". A file that still carries
+	// it loads without complaint; the value is no longer used.
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"country": "gb", "checkEveryMinutes": 60, "restartIdleLauncher": false, "dailyAt": "7:30"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Country != "GB" || c.RestartIdleLauncher || c.DryRun || c.DailyAt != "07:30" {
+		t.Fatalf("%+v", c)
+	}
+}
+
+func TestSettingsFileThatCannotBeReadMeansCaution(t *testing.T) {
+	// A directory where the file should be stands in for a file that
+	// exists and cannot be read.
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "NOTHING WILL BE ORDERED") {
+		t.Fatalf("error = %v", err)
+	}
+	if !c.DryRun || c.RestartIdleLauncher {
+		t.Fatalf("settings = %+v", c)
 	}
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/launcher"
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/logx"
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/runner"
+	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/sched"
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/state"
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/win"
 )
@@ -122,12 +123,22 @@ func stopDaemonCtx(ctx context.Context) (was, gone bool) {
 	if !daemonRunning() {
 		return false, true
 	}
-	win.RaiseStopSignal(stopName)
+	// The request is repeated for as long as something holds the lock: a
+	// manual run, or the successor it arranged, may take the old process's
+	// place half-way through, and must hear it too. "Gone" means the lock
+	// has stayed free for a moment, not that it was free once.
 	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) && ctx.Err() == nil && daemonRunning() {
+	free := 0
+	for time.Now().Before(deadline) && ctx.Err() == nil && free < 5 {
+		if daemonRunning() {
+			free = 0
+			win.RaiseStopSignal(stopName)
+		} else {
+			free++
+		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return true, !daemonRunning()
+	return true, free >= 5
 }
 
 // ---------------------------------------------------------------- pieces
@@ -190,13 +201,104 @@ func (a *app) runner() *runner.Runner {
 
 func (a *app) daemon() *daemon.Daemon {
 	return &daemon.Daemon{
-		Feed:       &feed.Client{},
-		Claimer:    a.runner(),
-		State:      a.st,
-		Logf:       a.log.Printf,
-		Country:    country(a.cfg),
-		CheckEvery: time.Duration(a.cfg.CheckEveryMinutes) * time.Minute,
+		Feed:    &feed.Client{},
+		Claimer: a.runner(),
+		State:   a.st,
+		Logf:    a.log.Printf,
+		Country: country(a.cfg),
+		Slot:    dailySlot(a.cfg),
 	}
+}
+
+// The background process holds off this long after the user has signed in
+// to Windows: nothing is to happen merely because the PC was turned on.
+const settleAfterSignIn = 10 * time.Minute
+
+// When started by Windows' daily schedule, the background process leaves
+// again once nothing is due for this long. (It stays for retries later the
+// same day, and while it waits for a launcher that is in use.)
+const idleExit = 6*time.Hour + 30*time.Minute
+
+func settle() time.Duration {
+	if since, ok := win.SignedInSince(); ok {
+		if hold := settleAfterSignIn - time.Since(since); hold > 0 {
+			return hold
+		}
+	}
+	return 0
+}
+
+// slotClock is the daily time of day as set (local time) or, by default,
+// shortly after Epic's change of giveaways (a fixed time in UTC).
+func slotClock(cfg config.Config) (hour, minute int, utc bool) {
+	if h, m, ok := config.ParseClock(cfg.DailyAt); ok {
+		return h, m, false
+	}
+	h, m, _ := config.ParseClock(daemon.DefaultSlotUTC)
+	return h, m, true
+}
+
+func dailySlot(cfg config.Config) func(time.Time) time.Time {
+	h, m, utc := slotClock(cfg)
+	if utc {
+		return daemon.DailySlot(h, m, time.UTC)
+	}
+	return daemon.DailySlot(h, m, time.Local)
+}
+
+// slotLocal says the daily time in this PC's local time, for people.
+func slotLocal(cfg config.Config) string {
+	return dailySlot(cfg)(time.Now()).Local().Format("15:04")
+}
+
+// taskSpec is the daily task as it should be registered for this user.
+func taskSpec(p paths, cfg config.Config) (sched.Spec, error) {
+	sid, err := sched.CurrentUserSID()
+	if err != nil {
+		return sched.Spec{}, err
+	}
+	h, m, utc := slotClock(cfg)
+	return sched.Spec{
+		Name: sched.TaskName(appName, sid), Exe: p.exe, Args: "run --scheduled", Dir: p.dir,
+		UserSID: sid, Hour: h, Minute: m, UTC: utc,
+	}, nil
+}
+
+// registerTask creates (or replaces) the daily task. A time given in UTC is
+// retried as the same moment in local time if Windows will not take it.
+func registerTask(p paths, cfg config.Config) (sched.Spec, error) {
+	spec, err := taskSpec(p, cfg)
+	if err != nil {
+		return spec, err
+	}
+	err = sched.Register(spec)
+	if err != nil && spec.UTC {
+		local := dailySlot(cfg)(time.Now()).Local()
+		alt := spec
+		alt.Hour, alt.Minute, alt.UTC = local.Hour(), local.Minute(), false
+		if sched.Register(alt) == nil {
+			return alt, nil
+		}
+	}
+	return spec, err
+}
+
+// taskName is the name of this user's daily task ("" if it cannot be told).
+func taskName() string {
+	sid, err := sched.CurrentUserSID()
+	if err != nil {
+		return ""
+	}
+	return sched.TaskName(appName, sid)
+}
+
+// daemonArgs is how the background process is started by hand (after an
+// installation, or after a manual run): the way Windows would start it.
+func daemonArgs() []string {
+	if name := taskName(); name != "" && sched.Exists(name) {
+		return []string{"run", "--scheduled"}
+	}
+	return []string{"run", "--login"}
 }
 
 // ---------------------------------------------------------------- commands
@@ -204,16 +306,17 @@ func (a *app) daemon() *daemon.Daemon {
 // cmdRun is the background process. afterPID, when set, is a manual run
 // ("once") that stopped the background process and started this one to take
 // over as soon as it has ended, however it ends.
-func cmdRun(a *app, atLogin bool, afterPID uint32) int {
+//
+// scheduled means Windows' daily task started it: it does what is due and
+// leaves again when nothing is due for hours. Otherwise (started through the
+// start-up entry, which is only used where a daily task cannot be created)
+// it stays and keeps to the same daily timetable.
+func cmdRun(a *app, scheduled bool, afterPID uint32) int {
 	var stop *win.StopSignal
 	if afterPID != 0 {
 		stop, _ = win.NewStopSignal(stopName)
 		if win.WaitExitOrStop(afterPID, stop) {
 			return 0 // told to stop while waiting
-		}
-		// The manual run recorded what it did; start from that.
-		if st, err := state.Open(a.p.state); err == nil {
-			a.st = st
 		}
 	}
 	var release func()
@@ -236,6 +339,13 @@ func cmdRun(a *app, atLogin bool, afterPID uint32) int {
 		time.Sleep(200 * time.Millisecond)
 	}
 	defer release()
+	if afterPID != 0 {
+		// Whoever held the lock before has recorded what it did by now;
+		// start from that.
+		if st, err := state.Open(a.p.state); err == nil {
+			a.st = st
+		}
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -251,13 +361,6 @@ func cmdRun(a *app, atLogin bool, afterPID uint32) int {
 		}()
 	}
 
-	// Right after sign-in the PC (and the launcher's own autostart) is
-	// busy; wait for things to settle. (Uptime is no guide: with Windows'
-	// fast start-up it keeps counting across shutdowns.)
-	delay := 15 * time.Second
-	if atLogin {
-		delay = 4 * time.Minute
-	}
 	mode := ""
 	if a.cfg.DryRun {
 		mode = " (dry run: no orders will be placed)"
@@ -265,10 +368,54 @@ func cmdRun(a *app, atLogin bool, afterPID uint32) int {
 	if a.cfgErr != nil {
 		a.log.Printf("%v", a.cfgErr)
 	}
-	a.log.Printf("%s %s started%s; country %s; first check in %v", appName, version, mode, country(a.cfg), delay)
-	a.daemon().Run(ctx, delay)
+	d := a.daemon()
+	opt := daemon.RunOptions{Settle: settle}
+	if scheduled {
+		opt.ExitWhenIdleFor = idleExit
+		keepTaskCurrent(a)
+	}
+	due := d.Due()
+	if wait := time.Until(due); scheduled && wait > idleExit {
+		// The usual case when Windows starts it and everything is done:
+		// say so in one line and leave.
+		a.log.Printf("%s %s: nothing to do before %s", appName, version, due.Local().Format("Mon 2 Jan 15:04"))
+		return 0
+	}
+	a.log.Printf("%s %s started%s; country %s; daily at %s; next round %s", appName, version, mode, country(a.cfg), slotLocal(a.cfg), describeDue(due))
+	d.Run(ctx, opt)
 	a.log.Printf("stopped")
 	return 0
+}
+
+func describeDue(due time.Time) string {
+	if !due.After(time.Now()) {
+		return "now"
+	}
+	return due.Local().Format("Mon 2 Jan 15:04")
+}
+
+// keepTaskCurrent re-registers the daily task when it no longer matches the
+// settings (the time of day was changed in config.json) or this program's
+// location. Windows has just started the program through that task, so it
+// exists; if it cannot be read, it is left alone.
+func keepTaskCurrent(a *app) {
+	spec, err := taskSpec(a.p, a.cfg)
+	if err != nil {
+		return
+	}
+	def := sched.Definition(spec.Name)
+	if def == "" {
+		return
+	}
+	want := fmt.Sprintf("T%02d:%02d:00", spec.Hour, spec.Minute)
+	if strings.Contains(def, want) && strings.Contains(strings.ToLower(def), strings.ToLower(a.p.exe)) {
+		return
+	}
+	if got, err := registerTask(a.p, a.cfg); err != nil {
+		a.log.Printf("the daily task could not be brought in line with the settings: %v", err)
+	} else {
+		a.log.Printf("the daily task now runs at %s", got.Slot())
+	}
 }
 
 func cmdOnce(a *app, args []string) int {
@@ -311,7 +458,7 @@ func cmdOnce(a *app, args []string) int {
 			return
 		}
 		successorStarted = true
-		if err := win.StartDetached(a.p.exe, []string{"run", "--after-pid=" + strconv.Itoa(os.Getpid())}, a.p.dir); err != nil {
+		if err := win.StartDetached(a.p.exe, append(daemonArgs(), "--after-pid="+strconv.Itoa(os.Getpid())), a.p.dir); err != nil {
 			fmt.Fprintf(a.out, "Could not arrange for the background process to come back (%v); double-click %s afterwards.\n", err, exeName)
 		}
 	}
@@ -444,11 +591,26 @@ func printState(a *app) {
 
 func cmdStatus(a *app) int {
 	fmt.Fprintf(a.out, "%s %s\n", appName, version)
-	fmt.Fprintf(a.out, "Background process: %s\n", map[bool]string{true: "running", false: "not running"}[daemonRunning()])
-	if v := autostartValue(); v != "" {
-		fmt.Fprintf(a.out, "Starts with Windows: yes (%s)\n", v)
+	name := taskName()
+	switch {
+	case name != "" && sched.Exists(name):
+		fmt.Fprintf(a.out, "Schedule: once a day at about %s (your time), or later that day if the PC was off then. Windows task %q.\n", slotLocal(a.cfg), name)
+	case autostartValue() != "":
+		fmt.Fprintf(a.out, "Schedule: once a day at about %s (your time). No daily Windows task could be created, so the program starts with Windows and keeps that timetable itself.\n", slotLocal(a.cfg))
+	default:
+		fmt.Fprintln(a.out, "Schedule: NOT INSTALLED - nothing starts this program. Double-click it (or run \"install\") to set it up.")
+	}
+	if daemonRunning() {
+		fmt.Fprintln(a.out, "Background process: running")
 	} else {
-		fmt.Fprintln(a.out, "Starts with Windows: no")
+		fmt.Fprintln(a.out, "Background process: not running at the moment (normal between its daily rounds)")
+	}
+	if sc := a.st.Schedule(); !sc.LastCheck.IsZero() || !sc.NextDue.IsZero() {
+		last := "never"
+		if !sc.LastCheck.IsZero() {
+			last = sc.LastCheck.Local().Format("Mon 2 Jan 15:04")
+		}
+		fmt.Fprintf(a.out, "Free-games list last read: %s; next round due: %s\n", last, describeDue(sc.NextDue))
 	}
 	fmt.Fprintf(a.out, "Folder: %s\n", a.p.dir)
 	if inst, err := launcher.Locate(a.cfg.LauncherPath); err != nil {
@@ -512,6 +674,9 @@ func cmdDoctor(a *app, args []string) int {
 	defer stopSignals()
 	rep := a.runner().TrialLaunch(ctx)
 	if rep.Err != "" {
+		for _, w := range rep.Leaked {
+			fmt.Fprintf(a.out, "  LEAKED (appeared on your desktop for a moment and was hidden): %s\n", describeWindow(w))
+		}
 		fmt.Fprintf(a.out, "RESULT: FAILED: %s\n", rep.Err)
 		return 1
 	}
@@ -556,6 +721,9 @@ func cmdDoctor(a *app, args []string) int {
 	}
 	for _, w := range rep.Leaked {
 		fmt.Fprintf(a.out, "  LEAKED (appeared for a moment and was hidden): %s\n", describeWindow(w))
+	}
+	if rep.UpdateFlickers > 0 {
+		fmt.Fprintf(a.out, "NOTE: the launcher installed an update of its own first, which it can only do in its tray mode on your desktop. It tried to show a window %d time(s); each was put away within about a hundredth of a second.\n", rep.UpdateFlickers)
 	}
 	ok := rep.Up && len(rep.OnUserDesktop) == 0 && len(rep.Leaked) == 0 && len(rep.TargetsAfter) > 0
 	if ok {
@@ -622,9 +790,13 @@ func cmdInstall(interactive bool, out io.Writer) int {
 	fail := func(err error) int {
 		// A failed upgrade must not leave the PC without the copy that was
 		// installed and running before.
-		if stoppedOld && !daemonRunning() {
-			if _, statErr := os.Stat(p.exe); statErr == nil {
-				_ = win.StartDetached(p.exe, []string{"run"}, p.dir)
+		if _, statErr := os.Stat(p.exe); stoppedOld && statErr == nil {
+			if daemonRunning() {
+				// Told to stop and still winding down: its successor
+				// waits for this installer, and then for it, to end.
+				_ = win.StartDetached(p.exe, append(daemonArgs(), "--after-pid="+strconv.Itoa(os.Getpid())), p.dir)
+			} else {
+				_ = win.StartDetached(p.exe, daemonArgs(), p.dir)
 			}
 		}
 		releaseInstall()
@@ -665,17 +837,27 @@ func cmdInstall(interactive bool, out io.Writer) int {
 	if err := config.EnsureFile(p.config); err != nil {
 		return fail(err)
 	}
-	if err := setAutostart(p.exe); err != nil {
-		return fail(err)
+	cfg, _ := config.Load(p.config)
+	// Windows is asked to start the program once a day. Where it will not
+	// take such a task (a locked-down PC), the program starts with Windows
+	// instead and keeps the same daily timetable by itself.
+	how := ""
+	if _, taskErr := registerTask(p, cfg); taskErr == nil {
+		removeAutostart()
+		how = fmt.Sprintf("It looks for Epic's free games once a day, at about %s (or later that day if the PC was off then), and claims each one through your Epic Games Launcher without showing anything. Nothing happens merely because the PC is turned on.\n\n", slotLocal(cfg))
+	} else {
+		if err := setAutostart(p.exe); err != nil {
+			return fail(fmt.Errorf("%v; and the start-up entry could not be written either: %v", taskErr, err))
+		}
+		how = fmt.Sprintf("It looks for Epic's free games once a day, at about %s, and claims each one through your Epic Games Launcher without showing anything.\n\n(Windows did not accept a daily task: %v. The program therefore starts with Windows and keeps to its daily timetable by itself.)\n\n", slotLocal(cfg), taskErr)
 	}
 	if !daemonRunning() {
-		if err := win.StartDetached(p.exe, []string{"run"}, p.dir); err != nil {
+		if err := win.StartDetached(p.exe, daemonArgs(), p.dir); err != nil {
 			return fail(err)
 		}
 	}
 
-	msg := "Installed and running in the background.\n\n" +
-		"It starts with Windows, watches Epic's free games, and claims each one through your Epic Games Launcher without showing anything.\n\n"
+	msg := "Installed.\n\n" + how
 	if inst, err := launcher.Locate(""); err != nil {
 		msg += "WARNING: the Epic Games Launcher was not found on this PC. Install it and sign in; this program will pick it up by itself.\n\n"
 	} else {
@@ -698,27 +880,32 @@ func cmdUninstall(out io.Writer) int {
 		return 1
 	}
 	removeAutostart()
+	if name := taskName(); name != "" {
+		if err := sched.Remove(name); err != nil {
+			fmt.Fprintf(out, "The daily task %q could not be removed (%v); delete it in Windows' Task Scheduler.\n", name, err)
+		}
+	}
 	if _, gone := stopDaemon(); !gone {
-		fmt.Fprintf(out, "Removed from Windows start-up. The background process is finishing something and has not stopped yet; it will not start again.\nYou can delete the folder %s once it is gone.\n", p.dir)
+		fmt.Fprintf(out, "Removed from Windows' schedule. The background process is finishing something and has not stopped yet; it will not start again.\nYou can delete the folder %s once it is gone.\n", p.dir)
 		return 0
 	}
 	if self, err := os.Executable(); err == nil && !samePath(self, p.exe) {
 		_ = os.Remove(p.exe)
 	}
-	fmt.Fprintf(out, "Stopped and removed from Windows start-up.\nYou can delete the folder %s to remove the log and settings.\n", p.dir)
+	fmt.Fprintf(out, "Stopped and removed from Windows' schedule.\nYou can delete the folder %s to remove the log and settings.\n", p.dir)
 	return 0
 }
 
 const usage = `EpicAutoClaim - claims Epic's free games through your Epic Games Launcher, invisibly.
 
-  EpicAutoClaim.exe              install (first time) or show status
+  EpicAutoClaim.exe              install, or repair the installation
   EpicAutoClaim.exe status       what it has done and what it is waiting for
   EpicAutoClaim.exe check        list what is free right now (does not claim)
   EpicAutoClaim.exe once         do one round now instead of waiting
   EpicAutoClaim.exe once --dry-run   same, but stop just before placing the order
   EpicAutoClaim.exe doctor       check the setup; add --launch to try the hidden launcher
-  EpicAutoClaim.exe stop         stop the background process (it starts again at next login)
-  EpicAutoClaim.exe uninstall    stop it and remove it from Windows start-up
+  EpicAutoClaim.exe stop         stop the background process (Windows starts it again at its daily time)
+  EpicAutoClaim.exe uninstall    stop it and remove it from Windows' schedule
 `
 
 func main() {
@@ -730,11 +917,11 @@ func main() {
 		if err != nil {
 			os.Exit(1)
 		}
-		atLogin := false
+		scheduled := false
 		var afterPID uint32
 		for _, arg := range args[1:] {
-			if arg == "--login" {
-				atLogin = true
+			if arg == "--scheduled" {
+				scheduled = true
 			}
 			if v, ok := strings.CutPrefix(arg, "--after-pid="); ok {
 				if n, err := strconv.ParseUint(v, 10, 32); err == nil {
@@ -742,7 +929,7 @@ func main() {
 				}
 			}
 		}
-		code := cmdRun(a, atLogin, afterPID)
+		code := cmdRun(a, scheduled, afterPID)
 		a.log.Close()
 		os.Exit(code)
 	}
@@ -752,17 +939,9 @@ func main() {
 		out = f
 	}
 
-	// Double-click.
+	// Double-click: install, or bring an existing installation up to date
+	// (the daily task follows the settings).
 	if len(args) == 0 {
-		p, err := appPaths()
-		self, _ := os.Executable()
-		if err == nil && samePath(self, p.exe) && autostartValue() != "" {
-			if !daemonRunning() {
-				_ = win.StartDetached(p.exe, []string{"run"}, p.dir)
-			}
-			win.MessageBox(dialogName, "Already installed and running in the background.\n\nLog and settings: "+p.dir, false)
-			os.Exit(0)
-		}
 		os.Exit(cmdInstall(true, out))
 	}
 

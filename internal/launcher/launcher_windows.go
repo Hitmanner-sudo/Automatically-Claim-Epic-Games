@@ -792,23 +792,23 @@ func (in *Instance) WaitDevTools(ctx context.Context, timeout time.Duration) (up
 // this one step the launcher runs on the normal desktop in its own
 // start-in-tray mode, in which it shows no window; any window it or its
 // updater shows regardless is hidden again at once.
-func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) error {
+func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) (flickers int, err error) {
 	if inst.Gen != Legacy {
-		return errors.New("self-update handling is only known for the classic launcher")
+		return 0, errors.New("self-update handling is only known for the classic launcher")
 	}
 	if launcherRunning() {
 		// Somebody else's launcher: a start here would only be passed on to
 		// it, and would bring its window up.
-		return ErrUserStarted
+		return 0, ErrUserStarted
 	}
 	port, err := FreePort()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	args, env, flag := debugArgs(inst.Gen, port)
 	proc, err := win.Start(inst.Exe, args, inst.Dir, "", env)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer proc.Close()
 
@@ -900,6 +900,26 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 	}
 	defer stopGuardNow()
 
+	// othersRunning reports a launcher that is neither this run's (it does
+	// not carry its switch) nor one of the launcher's own maintenance runs:
+	// somebody else's, in practice the user's.
+	othersRunning := func() bool {
+		procs, err := win.Processes()
+		if err != nil {
+			return false
+		}
+		for _, p := range procs {
+			if !isLauncher(p) {
+				continue
+			}
+			cmd := win.CommandLine(p.PID)
+			if cmd != "" && !hasSwitch(cmd, flag) && !strings.Contains(cmd, "-Commandlet=") {
+				return true
+			}
+		}
+		return false
+	}
+
 	// endRun ends every launcher that carries this run's switch, wherever
 	// the updater started it from, and waits until the launcher's update
 	// machinery has come to rest: it can start the launcher once more a
@@ -925,6 +945,11 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 		stop := time.Now().Add(25 * time.Second)
 		quietSince := time.Now()
 		for time.Now().Before(stop) {
+			if len(userStart) > 0 || othersRunning() {
+				// The user has started the launcher meanwhile: what runs
+				// now is theirs, and waiting for it to go away is pointless.
+				return
+			}
 			if killMine() || launcherRunning() || updaterRunning() {
 				quietSince = time.Now()
 			} else if time.Since(quietSince) >= quiet {
@@ -939,12 +964,15 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 	// this program's switches. It is ended, and the launcher is started
 	// afresh the way they started it, so that what they get is entirely
 	// their own.
-	handOver := func(cmd string) error {
+	handOver := func(cmd string) (int, error) {
 		stopGuardNow()
 		endRun(time.Second)
-		_ = win.StartDetached(inst.Exe, userArgs(cmd), inst.Dir)
+		// Unless their launcher is up by now anyway.
+		if !launcherRunning() {
+			_ = win.StartDetached(inst.Exe, userArgs(cmd), inst.Dir)
+		}
 		logf("the launcher was started by the user while it was updating; leaving it to them")
-		return ErrUserStarted
+		return hiddenCount, ErrUserStarted
 	}
 
 	// The update is finished when the (restarted) launcher is back with its
@@ -987,13 +1015,19 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 	}
 
 	endRun(3 * time.Second)
-
-	if ctx.Err() != nil {
-		return ctx.Err()
+	// The guard kept watch during those seconds too.
+	select {
+	case cmd := <-userStart:
+		return handOver(cmd)
+	default:
 	}
+
 	stopGuardNow()
+	if ctx.Err() != nil {
+		return hiddenCount, ctx.Err()
+	}
 	if !ok {
-		return errors.New("the launcher did not come back from its update within 10 minutes")
+		return hiddenCount, errors.New("the launcher did not come back from its update within 10 minutes")
 	}
 	took := time.Since(started).Round(time.Second)
 	if hiddenCount > 0 {
@@ -1001,7 +1035,7 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 	} else {
 		logf("the launcher finished updating itself after %v (no window was shown)", took)
 	}
-	return nil
+	return hiddenCount, nil
 }
 
 // UserArgs extracts, from the command line of a launcher start made by the

@@ -444,9 +444,52 @@ var ownSession = sync.OnceValue(func() uint32 {
 func InThisSession(pid uint32) bool {
 	var sid uint32
 	if err := windows.ProcessIdToSessionId(pid, &sid); err != nil {
-		return !errors.Is(err, windows.ERROR_ACCESS_DENIED)
+		if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			return true
+		}
+		// A process of another account, which may not be opened. It can
+		// still be in this session ("Run as different user"); the system's
+		// process table says where it is without opening it.
+		if s, ok := sessionFromProcessTable(pid); ok {
+			return s == ownSession()
+		}
+		return false
 	}
 	return sid == ownSession()
+}
+
+// sessionFromProcessTable looks a process's session up in the system-wide
+// process table, which needs no access to the process itself.
+func sessionFromProcessTable(pid uint32) (uint32, bool) {
+	size := uint32(1 << 18)
+	for try := 0; try < 6; try++ {
+		buf := make([]byte, size)
+		var need uint32
+		err := windows.NtQuerySystemInformation(windows.SystemProcessInformation, unsafe.Pointer(&buf[0]), size, &need)
+		if err == windows.STATUS_INFO_LENGTH_MISMATCH || err == windows.STATUS_BUFFER_TOO_SMALL {
+			if need > size {
+				size = need
+			}
+			size += 1 << 16
+			continue
+		}
+		if err != nil {
+			return 0, false
+		}
+		entry := unsafe.Sizeof(windows.SYSTEM_PROCESS_INFORMATION{})
+		for off := uintptr(0); off+entry <= uintptr(len(buf)); {
+			p := (*windows.SYSTEM_PROCESS_INFORMATION)(unsafe.Pointer(&buf[off]))
+			if uint32(p.UniqueProcessID) == pid {
+				return p.SessionID, true
+			}
+			if p.NextEntryOffset == 0 {
+				break
+			}
+			off += uintptr(p.NextEntryOffset)
+		}
+		return 0, false
+	}
+	return 0, false
 }
 
 // ImagePath returns the full path of a process's executable.
@@ -589,6 +632,59 @@ func SingleInstance(name string) (release func(), ok bool, err error) {
 		return nil, false, nil
 	}
 	return func() { _ = windows.CloseHandle(h) }, true, nil
+}
+
+var (
+	modwtsapi32                     = windows.NewLazySystemDLL("wtsapi32.dll")
+	procWTSQuerySessionInformationW = modwtsapi32.NewProc("WTSQuerySessionInformationW")
+)
+
+// wtsInfo is WTSINFOW from wtsapi32.h (what WTSQuerySessionInformation
+// returns for the WTSSessionInfo class).
+type wtsInfo struct {
+	State                   uint32
+	SessionID               uint32
+	IncomingBytes           uint32
+	OutgoingBytes           uint32
+	IncomingFrames          uint32
+	OutgoingFrames          uint32
+	IncomingCompressedBytes uint32
+	OutgoingCompressedBytes uint32
+	WinStationName          [32]uint16 // WINSTATIONNAME_LENGTH
+	Domain                  [17]uint16 // DOMAIN_LENGTH
+	UserName                [21]uint16 // USERNAME_LENGTH + 1
+	ConnectTime             int64      // these five are FILETIME values (UTC)
+	DisconnectTime          int64
+	LastInputTime           int64
+	LogonTime               int64
+	CurrentTime             int64
+}
+
+// SignedInSince returns when the user signed in to the Windows session this
+// program runs in. ok is false when Windows will not say.
+func SignedInSince() (t time.Time, ok bool) {
+	const (
+		wtsCurrentSession = ^uint32(0) // WTS_CURRENT_SESSION
+		wtsSessionInfo    = 24         // WTS_INFO_CLASS: WTSSessionInfo
+	)
+	var buf *wtsInfo
+	var n uint32
+	r, _, _ := procWTSQuerySessionInformationW.Call(0, uintptr(wtsCurrentSession), wtsSessionInfo,
+		uintptr(unsafe.Pointer(&buf)), uintptr(unsafe.Pointer(&n)))
+	if r == 0 || buf == nil {
+		return time.Time{}, false
+	}
+	defer windows.WTSFreeMemory(uintptr(unsafe.Pointer(buf)))
+	if uintptr(n) < unsafe.Sizeof(wtsInfo{}) || buf.LogonTime <= 0 {
+		return time.Time{}, false
+	}
+	ft := windows.Filetime{LowDateTime: uint32(buf.LogonTime), HighDateTime: uint32(buf.LogonTime >> 32)}
+	t = time.Unix(0, ft.Nanoseconds())
+	// A value that is plainly not a sign-in time of this session.
+	if t.After(time.Now().Add(time.Minute)) || t.Before(time.Now().Add(-400*24*time.Hour)) {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // LockHeld reports whether some process holds the named single-instance

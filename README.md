@@ -2,7 +2,7 @@
 
 A small Windows program that claims the Epic Games Store's free games for you.
 
-It runs in the background, watches Epic's free-games list, and when a new giveaway appears it uses **your own Epic Games Launcher** (already installed and signed in) to add the game to your library. The launcher never appears on screen while this happens, and the program shows no notifications.
+Once a day it looks at Epic's free-games list, and when there is a giveaway you do not have yet it uses **your own Epic Games Launcher** (already installed and signed in) to add the game to your library. The launcher never appears on screen while this happens, and the program shows no notifications.
 
 > Unofficial. Not affiliated with or endorsed by Epic Games. See [Things to know](#things-to-know).
 
@@ -12,15 +12,17 @@ It runs in the background, watches Epic's free-games list, and when a new giveaw
 2. Get `EpicAutoClaim.exe`. If this repository has a release, take the file from the **Releases** page. Otherwise, signed in to GitHub, open the **Actions** tab, the newest green **Build and test** run, and download the **EpicAutoClaim** artifact (a zip; extract the exe from it). Artifacts expire after about three months; running the **Release** workflow from the Actions tab publishes a release that does not.
 3. Double-click `EpicAutoClaim.exe`.
 
-A single dialog confirms the installation. That is the only window the program ever shows. From then on it starts with Windows and works on its own.
+A single dialog confirms the installation. That is the only window the program ever shows. From then on Windows starts it once a day (it adds a task of its own to Windows' Task Scheduler; no administrator rights are needed) and it works on its own.
 
 Windows may warn about an unknown publisher the first time, because the file is not code-signed. Choose **More info → Run anyway** if you trust this build.
 
 ## What it does
 
-- Reads Epic's public free-games list about once an hour, and again a few minutes after the next giveaway is due to start.
+- Looks **once a day**, at about half an hour after the time Epic changes its giveaways (16:30 UTC; you can choose another time). If the PC was off at that time, it looks later the same day instead, but not in the first ten minutes after you sign in to Windows: nothing happens merely because the PC was turned on, and restarting the PC does not cause another look.
+- Reads Epic's public free-games list. If nothing is new, that is all it does, and it ends until the next day.
 - When something is free and not yet claimed, it starts the launcher on a separate Windows desktop that is never displayed, opens Epic's checkout inside it, confirms that the price is zero, and places the order. If the checkout cannot be opened directly, it goes the way you would: the game's store page, **Get**, and the launcher's own checkout window.
 - Closes the hidden launcher again. The whole thing takes about a minute.
+- If a claim could not be made (see below), it stays in the background and tries again later the same day; what is still open after that is taken up at the next daily round.
 - Writes what it did to a log file. Nothing else.
 
 ### When it waits
@@ -63,19 +65,20 @@ From a terminal in that folder:
 | `EpicAutoClaim.exe once` | Does one round now instead of waiting (Ctrl+C stops it cleanly) |
 | `EpicAutoClaim.exe once --dry-run` | Same, but stops just before placing the order |
 | `EpicAutoClaim.exe doctor --launch` | Starts the launcher hidden for a moment and reports what it found; claims nothing |
-| `EpicAutoClaim.exe stop` | Stops the background process until the next login |
-| `EpicAutoClaim.exe uninstall` | Stops it and removes it from Windows start-up |
+| `EpicAutoClaim.exe stop` | Stops the background process until Windows starts it again at its daily time |
+| `EpicAutoClaim.exe install` | Installs it, or brings the installation in line with the settings (same as a double-click, without the dialog) |
+| `EpicAutoClaim.exe uninstall` | Stops it and removes its daily task from Windows |
 
 A good first test on your own PC is `EpicAutoClaim.exe doctor --launch` followed by `EpicAutoClaim.exe once --dry-run`.
 
 ## Settings
 
-Edit `config.json` and restart the program (`EpicAutoClaim.exe stop`, then double-click it again). Every setting is optional. If the file cannot be read after an edit (a stray comma, say), the program orders nothing until it is fixed, and `EpicAutoClaim.exe status` says so.
+Edit `config.json`, then double-click the program again (or run `EpicAutoClaim.exe install`) so that it picks the changes up. Every setting is optional. If the file cannot be read after an edit (a stray comma, say), the program orders nothing until it is fixed, and `EpicAutoClaim.exe status` says so.
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `country` | your Windows region | Two-letter country of your Epic account, used to ask which games are free there |
-| `checkEveryMinutes` | `60` | How often the free-games list is read (10 to 1440) |
+| `dailyAt` | shortly after Epic's changeover | Time of day for the daily look, as `"HH:MM"` in your local time, e.g. `"18:30"` |
 | `restartIdleLauncher` | `true` | Allow closing a launcher that is idle in the tray for the duration of a claim |
 | `dryRun` | `false` | Go through everything except placing the order |
 | `keepDiagnostics` | `true` | Keep a screenshot and details of failed attempts on this PC |
@@ -106,7 +109,7 @@ Tested in a real browser against a stand-in for Epic's store (about 65 scenarios
 ## How it works
 
 1. `internal/feed` reads `freeGamesPromotions`, Epic's public list, and keeps offers whose promotion is active and whose price is zero.
-2. `internal/daemon` decides what is due, with back-off after failures.
+2. `internal/daemon` decides what is due, with back-off after failures, and writes its timetable down so that a restart changes nothing about it. `internal/sched` has Windows' Task Scheduler start the program once a day.
 3. `internal/launcher` and `internal/win` find the launcher, check that you are not using it, and start it on a private desktop (`CreateDesktop`) in its start-in-tray mode with `-cefdebug=<port>`, which makes its embedded browser accept DevTools connections on localhost. The process tree lives in a job object, so it cannot outlive this program.
 4. `internal/claim` opens Epic's checkout in the launcher's own browser session through `internal/cdp`, reads the page, verifies the price, and clicks. Requests that could place an order are intercepted and inspected first (`watch.go`).
 5. `internal/runner` ties one such session together and steps aside if you start the launcher.
@@ -122,4 +125,4 @@ Go 1.26 or newer. The checkout tests need Chrome or Chromium (set `CHROMIUM_PATH
 
 ## Removing it
 
-Run `EpicAutoClaim.exe uninstall`, then delete the `%LOCALAPPDATA%\EpicAutoClaim` folder.
+Run `EpicAutoClaim.exe uninstall` (it removes the daily task and stops the program), then delete the `%LOCALAPPDATA%\EpicAutoClaim` folder.

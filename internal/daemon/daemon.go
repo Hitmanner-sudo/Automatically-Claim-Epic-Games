@@ -1,11 +1,12 @@
-// Package daemon is the always-running part: it watches Epic's free-games
-// list and decides when to try claiming what.
+// Package daemon is the scheduling part: it reads Epic's free-games list
+// once a day (and right after a new giveaway is due to start), decides when
+// to try claiming what, and remembers its timetable so that being started
+// again changes nothing about when it next looks.
 package daemon
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"math/rand/v2"
 	"sort"
 	"strings"
@@ -51,16 +52,51 @@ type Daemon struct {
 	State   *state.Store
 	Logf    func(format string, args ...any)
 
-	Country    string
+	Country string
+	// Slot gives the next regular (daily) check time after a moment; see
+	// DailySlot. When nil, CheckEvery is used as a plain interval instead.
+	Slot       func(after time.Time) time.Time
 	CheckEvery time.Duration
 
 	// Injectable for tests.
 	Now    func() time.Time
 	Jitter func(max time.Duration) time.Duration
 
-	feedFailures int
-	lastBusy     string
-	lastNotice   string
+	lastBusy   string
+	lastNotice string
+}
+
+// DefaultSlotUTC is the default daily check time: half an hour after the
+// hour at which Epic changes its giveaways (16:00 UTC; 15:00 UTC while the
+// United States are on summer time).
+const DefaultSlotUTC = "16:30"
+
+// DailySlot returns a function that gives the next daily check time after a
+// moment: at hour:minute in loc, every day.
+func DailySlot(hour, minute int, loc *time.Location) func(after time.Time) time.Time {
+	return func(after time.Time) time.Time {
+		a := after.In(loc)
+		for day := 0; ; day++ {
+			// time.Date normalises the day overflow and applies the zone's
+			// rules for that date (daylight saving included).
+			t := time.Date(a.Year(), a.Month(), a.Day()+day, hour, minute, 0, 0, loc)
+			if t.After(after) {
+				return t
+			}
+		}
+	}
+}
+
+// regular is the next regular check after now.
+func (d *Daemon) regular(now time.Time) time.Time {
+	if d.Slot != nil {
+		return d.Slot(now).Add(d.jitter(10 * time.Minute))
+	}
+	every := d.CheckEvery
+	if every <= 0 {
+		every = 24 * time.Hour
+	}
+	return now.Add(every - every/10 + d.jitter(every/5))
 }
 
 func (d *Daemon) now() time.Time {
@@ -138,29 +174,79 @@ func short(s string) string {
 }
 
 // Tick does one round: read the list, claim what is due, and return when to
-// run next.
+// run next. That time is also written down, so that a later start of the
+// program carries on from it.
 func (d *Daemon) Tick(ctx context.Context) time.Time {
-	now := d.now()
-	every := d.CheckEvery
-	if every <= 0 {
-		every = time.Hour
+	next, read := d.round(ctx)
+	if ctx.Err() != nil {
+		// Cut short by a stop request: the timetable stays as it was, so
+		// that the round is taken up again at the next start.
+		return next
 	}
+	_ = d.State.SetSchedule(func(sc *state.Schedule) {
+		sc.NextDue = next
+		if read {
+			sc.LastCheck = d.now()
+		}
+	})
+	return next
+}
+
+// Due is when the next round is due according to what was written down the
+// last time. A restart of the program, or of the PC, therefore does not by
+// itself cause a round: only a program that has never run looks at once.
+func (d *Daemon) Due() time.Time {
+	now := d.now()
+	sc := d.State.Schedule()
+	switch {
+	case sc.NextDue.IsZero():
+		return now
+	case sc.NextDue.Sub(now) > 26*time.Hour:
+		// Further away than any round is ever planned: the clock must have
+		// been wrong when it was written down.
+		return d.regular(now)
+	}
+	return sc.NextDue
+}
+
+// feedRetry is how long to wait after the n-th consecutive failure to read
+// the list: soon at first (a PC that has just woken up may not be online
+// yet), then more slowly, and after a few hours not before the next regular
+// check.
+var feedRetry = []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute, 20 * time.Minute, 30 * time.Minute, time.Hour, time.Hour, time.Hour}
+
+func (d *Daemon) round(ctx context.Context) (next time.Time, read bool) {
+	now := d.now()
 
 	snap, err := d.Feed.Fetch(ctx, d.Country, "en-US", now)
 	if err != nil {
-		d.feedFailures++
-		wait := time.Duration(d.feedFailures) * 2 * time.Minute
-		if wait > every {
-			wait = every
+		if ctx.Err() != nil {
+			return time.Time{}, false
 		}
-		d.notice("feed:"+err.Error(), "could not read the free-games list (%v); trying again in %v", err, wait.Round(time.Minute))
-		return now.Add(wait)
+		failures := 0
+		_ = d.State.SetSchedule(func(sc *state.Schedule) {
+			sc.FeedFailures++
+			failures = sc.FeedFailures
+		})
+		regular := d.regular(now)
+		if failures > len(feedRetry) {
+			d.notice("feed-giving-up", "the free-games list could still not be read after %d tries; leaving it until the next regular check", failures)
+			return regular, false
+		}
+		at := now.Add(feedRetry[failures-1])
+		if regular.Before(at) {
+			at = regular
+		}
+		d.notice("feed:"+err.Error(), "could not read the free-games list (%v); trying again in %v", err, at.Sub(now).Round(time.Minute))
+		return at, false
 	}
-	d.feedFailures = 0
+	if d.State.Schedule().FeedFailures != 0 {
+		_ = d.State.SetSchedule(func(sc *state.Schedule) { sc.FeedFailures = 0 })
+	}
 	_ = d.State.Prune(now, 60*24*time.Hour)
 
 	var due []feed.Offer
-	next := now.Add(every - every/10 + d.jitter(every/5))
+	next = d.regular(now)
 	sooner := func(t time.Time) {
 		if t.Before(next) {
 			next = t
@@ -212,7 +298,7 @@ func (d *Daemon) Tick(ctx context.Context) time.Time {
 	if earliest := now.Add(minSleep); next.Before(earliest) {
 		next = earliest
 	}
-	return next
+	return next, true
 }
 
 // claim runs one session for the due offers, records the outcomes and
@@ -249,20 +335,26 @@ func (d *Daemon) claim(ctx context.Context, due []feed.Offer) time.Time {
 	// A session-level problem applies to every offer the session did not
 	// reach.
 	sessionWait, sessionNote, countAttempt, cancelled := time.Duration(0), "", false, false
+	// An answer that concerns the account rather than one offer ends the
+	// session early; the offers behind it wait just as long, however the
+	// session ended otherwise.
+	acctWait, acctNote := time.Duration(0), ""
+	for _, res := range results {
+		w := time.Duration(0)
+		switch res.Outcome {
+		case claim.NotSignedIn:
+			w = signInRetry
+		case claim.Throttled:
+			w = throttleRetry
+		case claim.Captcha:
+			w = captchaBackoff[0]
+		}
+		if w > acctWait {
+			acctWait, acctNote = w, res.String()
+		}
+	}
 	switch {
 	case err == nil:
-		// An answer that concerns the account rather than one offer ends
-		// the session early; the offers behind it wait just as long.
-		for _, res := range results {
-			switch res.Outcome {
-			case claim.NotSignedIn:
-				sessionWait, sessionNote = signInRetry, res.String()
-			case claim.Throttled:
-				sessionWait, sessionNote = throttleRetry, res.String()
-			case claim.Captcha:
-				sessionWait, sessionNote = captchaBackoff[0], res.String()
-			}
-		}
 	case errors.Is(err, ErrNotInstalled), errors.Is(err, ErrUnsupported):
 		sessionWait, sessionNote = missingRetry, err.Error()
 		d.notice("missing", "%v; will look again in %v", err, missingRetry)
@@ -283,12 +375,15 @@ func (d *Daemon) claim(ctx context.Context, due []feed.Offer) time.Time {
 	if err == nil || countAttempt {
 		d.lastNotice = ""
 	}
+	if acctWait > sessionWait {
+		sessionWait, sessionNote, countAttempt = acctWait, acctNote, false
+	}
 
 	for _, o := range due {
 		key := o.Key()
 		res, reached := results[key]
 		if !reached {
-			if cancelled {
+			if cancelled && acctWait == 0 {
 				continue
 			}
 			_ = d.State.Update(key, func(e *state.Entry) {
@@ -353,13 +448,35 @@ func (d *Daemon) claim(ctx context.Context, due []feed.Offer) time.Time {
 	return earliest
 }
 
-// Run loops until the context ends. startDelay postpones the first round
-// (after a login the PC is busy enough already).
-func (d *Daemon) Run(ctx context.Context, startDelay time.Duration) {
-	next := d.now().Add(startDelay)
+// RunOptions say how Run behaves around its rounds.
+type RunOptions struct {
+	// Settle returns how much longer to hold off because the user has only
+	// just signed in to Windows: the PC is busy then, and nothing should
+	// happen merely because it was turned on. Nil means never hold off.
+	Settle func() time.Duration
+	// ExitWhenIdleFor makes Run return, instead of waiting, when the next
+	// round is further away than this. (Windows starts the program again on
+	// its daily schedule.) Zero means stay and wait.
+	ExitWhenIdleFor time.Duration
+}
+
+// Run does the rounds that are due, one after the other, until the context
+// ends or (with ExitWhenIdleFor) until nothing is due for a while.
+func (d *Daemon) Run(ctx context.Context, opt RunOptions) {
+	next := d.Due()
 	for {
+		if wait := next.Sub(d.now()); opt.ExitWhenIdleFor > 0 && wait > opt.ExitWhenIdleFor {
+			d.logf("nothing to do before %s; leaving it to the daily schedule", next.Local().Format("Mon 2 Jan 15:04"))
+			return
+		}
 		if !sleepUntil(ctx, next, d.now) {
 			return
+		}
+		if opt.Settle != nil {
+			if hold := opt.Settle(); hold > 0 {
+				next = d.now().Add(hold)
+				continue
+			}
 		}
 		func() {
 			defer func() {
@@ -374,7 +491,7 @@ func (d *Daemon) Run(ctx context.Context, startDelay time.Duration) {
 		if ctx.Err() != nil {
 			return
 		}
-		d.logf("next check %s", fmt.Sprint(next.Local().Format("Mon 2 Jan 15:04")))
+		d.logf("next check %s", next.Local().Format("Mon 2 Jan 15:04"))
 	}
 }
 

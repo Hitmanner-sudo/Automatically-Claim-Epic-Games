@@ -18,9 +18,10 @@ type Config struct {
 	// Country is the two-letter country of the Epic account, used to ask
 	// Epic which games are free there. Empty means "use this PC's region".
 	Country string `json:"country"`
-	// CheckEveryMinutes is how often the free-games list is fetched. The
-	// program also wakes up by itself when a new giveaway is due to start.
-	CheckEveryMinutes int `json:"checkEveryMinutes"`
+	// DailyAt is the time of day ("HH:MM", this PC's local time) at which
+	// the program looks for free games, once a day. Empty means the
+	// default: shortly after the hour at which Epic changes its giveaways.
+	DailyAt string `json:"dailyAt"`
 	// LauncherPath overrides auto-detection of EpicGamesLauncher.exe.
 	LauncherPath string `json:"launcherPath"`
 	// RestartIdleLauncher allows closing a launcher that is merely sitting
@@ -38,7 +39,6 @@ type Config struct {
 // Default returns the settings used when no file exists.
 func Default() Config {
 	return Config{
-		CheckEveryMinutes:   60,
 		RestartIdleLauncher: true,
 		KeepDiagnostics:     true,
 	}
@@ -50,13 +50,36 @@ func (c *Config) Normalize() {
 	if len(c.Country) != 2 || c.Country[0] < 'A' || c.Country[0] > 'Z' || c.Country[1] < 'A' || c.Country[1] > 'Z' {
 		c.Country = ""
 	}
-	if c.CheckEveryMinutes < 10 {
-		c.CheckEveryMinutes = 10
-	}
-	if c.CheckEveryMinutes > 24*60 {
-		c.CheckEveryMinutes = 24 * 60
+	if h, m, ok := ParseClock(c.DailyAt); ok {
+		c.DailyAt = fmt.Sprintf("%02d:%02d", h, m)
+	} else {
+		c.DailyAt = ""
 	}
 	c.LauncherPath = strings.TrimSpace(c.LauncherPath)
+}
+
+// ParseClock reads a time of day written as "HH:MM" (also "H:MM", and with
+// a dot instead of the colon).
+func ParseClock(s string) (hour, minute int, ok bool) {
+	s = strings.TrimSpace(strings.ReplaceAll(s, ".", ":"))
+	hh, mm, found := strings.Cut(s, ":")
+	if !found || len(hh) < 1 || len(hh) > 2 || len(mm) != 2 {
+		return 0, 0, false
+	}
+	for _, r := range hh + mm {
+		if r < '0' || r > '9' {
+			return 0, 0, false
+		}
+	}
+	hour = int(hh[0] - '0')
+	if len(hh) == 2 {
+		hour = hour*10 + int(hh[1]-'0')
+	}
+	minute = int(mm[0]-'0')*10 + int(mm[1]-'0')
+	if hour > 23 || minute > 59 {
+		return 0, 0, false
+	}
+	return hour, minute, true
 }
 
 // Load reads the file at path. A missing file yields the defaults. Fields
@@ -68,7 +91,12 @@ func Load(path string) (Config, error) {
 		return c, nil
 	}
 	if err != nil {
-		return c, fmt.Errorf("read settings: %w", err)
+		// The file is there and cannot be read (another program holds it,
+		// or its permissions were changed). What it says is unknown, so the
+		// cautious settings apply, as for a file that cannot be parsed.
+		d := Default()
+		d.DryRun, d.RestartIdleLauncher = true, false
+		return d, fmt.Errorf("settings file %s could not be read (%v); until it can be, NOTHING WILL BE ORDERED (dry run)", path, err)
 	}
 	raw = decodeText(raw)
 	if err := json.Unmarshal(raw, &c); err != nil {

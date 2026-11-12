@@ -44,9 +44,22 @@ type Entry struct {
 	DoneAt      time.Time `json:"doneAt,omitzero"`
 }
 
+// Schedule is what the program remembers about its own timetable, so that
+// being started again (or the PC being restarted) changes nothing about
+// when it next looks.
+type Schedule struct {
+	// LastCheck is when the free-games list was last read successfully.
+	LastCheck time.Time `json:"lastCheck,omitzero"`
+	// NextDue is when the next round is due.
+	NextDue time.Time `json:"nextDue,omitzero"`
+	// FeedFailures counts consecutive failures to read the list.
+	FeedFailures int `json:"feedFailures,omitempty"`
+}
+
 type file struct {
-	Version int               `json:"version"`
-	Offers  map[string]*Entry `json:"offers"`
+	Version  int               `json:"version"`
+	Schedule Schedule          `json:"schedule"`
+	Offers   map[string]*Entry `json:"offers"`
 }
 
 // Store is a JSON file of offer records. It is safe for concurrent use
@@ -83,6 +96,21 @@ func Open(path string) (*Store, error) {
 	f.Version = 1
 	s.data = f
 	return s, nil
+}
+
+// Schedule returns the remembered timetable.
+func (s *Store) Schedule() Schedule {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.data.Schedule
+}
+
+// SetSchedule modifies the remembered timetable and saves the store.
+func (s *Store) SetSchedule(fn func(sc *Schedule)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fn(&s.data.Schedule)
+	return s.saveLocked()
 }
 
 // Get returns a copy of the record for key.
