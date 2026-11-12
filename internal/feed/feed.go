@@ -20,8 +20,12 @@ import (
 	"time"
 )
 
-// Endpoint is the public free-games feed.
-const Endpoint = "https://store-site-backend-static-ipv4.ak.epicgames.com/freeGamesPromotions"
+// Endpoint is the public free-games feed; FallbackEndpoint serves the same
+// document from a second host.
+const (
+	Endpoint         = "https://store-site-backend-static-ipv4.ak.epicgames.com/freeGamesPromotions"
+	FallbackEndpoint = "https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions"
+)
 
 // Offer is one store offer that is free for a limited time.
 type Offer struct {
@@ -39,13 +43,18 @@ type Offer struct {
 	OriginalPrice int64  `json:"originalPrice"`
 	DiscountPrice int64  `json:"discountPrice"`
 	Currency      string `json:"currency"`
-	// Mobile is true when the offer is only for Android/iOS and cannot be
-	// claimed through the desktop checkout.
-	Mobile bool `json:"mobile"`
+	// Placeholder is true for the "mystery game" slots of Epic's holiday
+	// events: the feed lists them under a stand-in namespace and id, so the
+	// real offer has to be looked up by its page (Slug) before it can be
+	// ordered. Slug is empty until the game has been revealed.
+	Placeholder bool `json:"placeholder"`
 }
 
-// Key identifies an offer across runs.
-func (o Offer) Key() string { return o.Namespace + ":" + o.OfferID }
+// Key identifies one giveaway across runs. The start of the promotion is
+// part of it because Epic gives the same game away again in later years.
+func (o Offer) Key() string {
+	return o.Namespace + ":" + o.OfferID + "@" + o.Start.UTC().Format("2006-01-02T15:04Z")
+}
 
 // PurchaseToken is the "1-<namespace>-<offerId>" form the checkout expects.
 func (o Offer) PurchaseToken() string { return "1-" + o.Namespace + "-" + o.OfferID }
@@ -72,6 +81,10 @@ type Snapshot struct {
 	FreeNow []Offer
 	// Upcoming are offers with a 100%-off promotion that has not started yet.
 	Upcoming []Offer
+	// Stale is true when the document still lists as "upcoming" (or at full
+	// price) a giveaway whose start time has passed: Epic's servers have
+	// not caught up yet, and the list is worth reading again soon.
+	Stale bool
 	// NextChange is the earliest future moment at which the set of free
 	// offers is expected to change (a promotion starting or ending). Zero if
 	// the feed does not say.
@@ -79,9 +92,12 @@ type Snapshot struct {
 }
 
 type rawFeed struct {
-	Data struct {
-		Catalog struct {
-			SearchStore struct {
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+	Data *struct {
+		Catalog *struct {
+			SearchStore *struct {
 				Elements []rawElement `json:"elements"`
 			} `json:"searchStore"`
 		} `json:"Catalog"`
@@ -112,6 +128,7 @@ type rawElement struct {
 	Namespace   string `json:"namespace"`
 	OfferType   string `json:"offerType"`
 	Status      string `json:"status"`
+	CodeOnly    bool   `json:"isCodeRedemptionOnly"`
 	ProductSlug string `json:"productSlug"`
 	URLSlug     string `json:"urlSlug"`
 	Seller      struct {
@@ -142,19 +159,42 @@ type rawElement struct {
 
 var hexID = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
+// isPlaceholder recognises the holiday "mystery game" slots.
+func isPlaceholder(e rawElement) bool {
+	if e.CodeOnly || e.OfferType == "OTHERS" {
+		return true
+	}
+	for _, c := range e.Categories {
+		if c.Path == "freegames/vaulted" {
+			return true
+		}
+	}
+	return false
+}
+
+// legacySlug cleans the old productSlug field ("name/home", "[]", "a/b").
+func legacySlug(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "[]" {
+		return ""
+	}
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	return s
+}
+
 // slugOf picks the store page slug for an element.
 //
-// Order matters: the catalog namespace mapping is the canonical product page;
-// offer mappings carry the page of add-ons and editions; productSlug is the
-// legacy field (often with a trailing "/home"); urlSlug is a last resort and
-// is frequently an opaque id that is not a real page.
+// Order matters: the offer's own mapping is the page of exactly this offer
+// (for add-ons and editions the catalog mapping is the parent game's page);
+// the catalog mapping is the product's home page; productSlug is the legacy
+// field; urlSlug is a last resort and is frequently an opaque id or an
+// unrelated internal name, not a real page.
 func slugOf(e rawElement) string {
-	if e.OfferType != "ADD_ON" && e.OfferType != "DLC" {
-		for _, m := range e.CatalogNs.Mappings {
-			if m.PageType == "productHome" && m.PageSlug != "" {
-				return m.PageSlug
-			}
-		}
+	if isPlaceholder(e) {
+		// Only the legacy field carries the revealed game's page.
+		return legacySlug(e.ProductSlug)
 	}
 	for _, m := range e.OfferMappings {
 		if m.PageSlug != "" {
@@ -166,7 +206,7 @@ func slugOf(e rawElement) string {
 			return m.PageSlug
 		}
 	}
-	if s := strings.TrimSuffix(strings.TrimSpace(e.ProductSlug), "/home"); s != "" && s != "[]" {
+	if s := legacySlug(e.ProductSlug); s != "" {
 		return s
 	}
 	if s := strings.TrimSpace(e.URLSlug); s != "" && !hexID.MatchString(s) {
@@ -187,23 +227,6 @@ func isBundle(e rawElement) bool {
 	return false
 }
 
-// isMobileOnly reports whether the element is tagged for Android/iOS without
-// any desktop category. Epic's mobile giveaways cannot be claimed through the
-// desktop checkout.
-func isMobileOnly(e rawElement) bool {
-	mobile, desktop := false, false
-	for _, c := range e.Categories {
-		p := strings.ToLower(c.Path)
-		switch {
-		case strings.Contains(p, "android"), strings.Contains(p, "ios"), strings.Contains(p, "mobile"):
-			mobile = true
-		case p == "games", strings.HasPrefix(p, "games/"), p == "applications", p == "bundles", strings.HasPrefix(p, "bundles/"), p == "addons", strings.HasPrefix(p, "addons/"):
-			desktop = true
-		}
-	}
-	return mobile && !desktop
-}
-
 func parseTime(s string) (time.Time, bool) {
 	if s == "" {
 		return time.Time{}, false
@@ -221,16 +244,16 @@ func isFreePromo(p rawPromo) bool {
 
 func offerFrom(e rawElement, start, end time.Time) Offer {
 	o := Offer{
-		Title:     strings.TrimSpace(e.Title),
-		Namespace: e.Namespace,
-		OfferID:   e.ID,
-		OfferType: e.OfferType,
-		Slug:      slugOf(e),
-		PagePath:  "p",
-		Seller:    e.Seller.Name,
-		Start:     start,
-		End:       end,
-		Mobile:    isMobileOnly(e),
+		Title:       strings.TrimSpace(e.Title),
+		Namespace:   e.Namespace,
+		OfferID:     e.ID,
+		OfferType:   e.OfferType,
+		Slug:        slugOf(e),
+		PagePath:    "p",
+		Seller:      e.Seller.Name,
+		Start:       start,
+		End:         end,
+		Placeholder: isPlaceholder(e),
 		// Unknown prices must never look free.
 		OriginalPrice: -1,
 		DiscountPrice: -1,
@@ -264,6 +287,18 @@ func Parse(data []byte, now time.Time) (Snapshot, error) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return Snapshot{}, fmt.Errorf("decode free-games feed: %w", err)
 	}
+	// Epic reports problems (an unknown country code, a backend failure)
+	// with HTTP 200 and an empty catalogue. That is not "nothing is free".
+	if raw.Data == nil || raw.Data.Catalog == nil || raw.Data.Catalog.SearchStore == nil {
+		msg := "no catalogue in the reply"
+		if len(raw.Errors) > 0 && raw.Errors[0].Message != "" {
+			msg = raw.Errors[0].Message
+			if len(msg) > 200 {
+				msg = msg[:200]
+			}
+		}
+		return Snapshot{}, fmt.Errorf("free-games feed: %s (is the country code right?)", msg)
+	}
 	now = now.UTC()
 	var snap Snapshot
 	seenNow := map[string]bool{}
@@ -293,6 +328,11 @@ func Parse(data []byte, now time.Time) (Snapshot, error) {
 				// The promotion says "100% off"; the price must agree. A
 				// stale or inconsistent feed entry is skipped, never bought.
 				if o.DiscountPrice != 0 {
+					snap.Stale = true
+					continue
+				}
+				// An unrevealed mystery game has nothing to claim yet.
+				if o.Placeholder && o.Slug == "" {
 					continue
 				}
 				if !seenNow[o.Key()] {
@@ -309,6 +349,10 @@ func Parse(data []byte, now time.Time) (Snapshot, error) {
 				start, okS := parseTime(p.StartDate)
 				end, okE := parseTime(p.EndDate)
 				if !okS || !okE || !now.Before(end) {
+					continue
+				}
+				if !start.After(now) {
+					snap.Stale = true // started, yet still listed as upcoming
 					continue
 				}
 				noteChange(start)
@@ -333,31 +377,32 @@ type Client struct {
 	UserAgent string
 }
 
-// Fetch downloads and parses the feed for a country (ISO 3166-1 alpha-2).
-func (c *Client) Fetch(ctx context.Context, country, locale string, now time.Time) (Snapshot, error) {
-	if country == "" {
-		country = "US"
+// normalCountry maps what people type to the ISO code Epic expects.
+func normalCountry(c string) string {
+	c = strings.ToUpper(strings.TrimSpace(c))
+	switch c {
+	case "":
+		return "US"
+	case "UK":
+		return "GB"
 	}
-	if locale == "" {
-		locale = "en-US"
-	}
-	endpoint := c.Endpoint
-	if endpoint == "" {
-		endpoint = Endpoint
-	}
+	return c
+}
+
+func (c *Client) fetchFrom(ctx context.Context, endpoint, country, locale string) ([]byte, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		return Snapshot{}, err
+		return nil, err
 	}
 	q := u.Query()
 	q.Set("locale", locale)
-	q.Set("country", strings.ToUpper(country))
-	q.Set("allowCountries", strings.ToUpper(country))
+	q.Set("country", country)
+	q.Set("allowCountries", country)
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return Snapshot{}, err
+		return nil, err
 	}
 	ua := c.UserAgent
 	if ua == "" {
@@ -371,18 +416,47 @@ func (c *Client) Fetch(ctx context.Context, country, locale string, now time.Tim
 	}
 	res, err := hc.Do(req)
 	if err != nil {
-		return Snapshot{}, fmt.Errorf("fetch free-games feed: %w", err)
+		return nil, fmt.Errorf("fetch free-games feed: %w", err)
 	}
 	defer res.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(res.Body, 8<<20))
 	if err != nil {
-		return Snapshot{}, fmt.Errorf("read free-games feed: %w", err)
+		return nil, fmt.Errorf("read free-games feed: %w", err)
 	}
 	if res.StatusCode != http.StatusOK {
-		return Snapshot{}, fmt.Errorf("free-games feed returned HTTP %d", res.StatusCode)
+		return nil, fmt.Errorf("free-games feed returned HTTP %d", res.StatusCode)
 	}
 	if len(body) == 0 {
-		return Snapshot{}, errors.New("free-games feed returned an empty body")
+		return nil, errors.New("free-games feed returned an empty body")
 	}
-	return Parse(body, now)
+	return body, nil
+}
+
+// Fetch downloads and parses the feed for a country (ISO 3166-1 alpha-2).
+func (c *Client) Fetch(ctx context.Context, country, locale string, now time.Time) (Snapshot, error) {
+	country = normalCountry(country)
+	if locale == "" {
+		locale = "en-US"
+	}
+	endpoints := []string{Endpoint, FallbackEndpoint}
+	if c.Endpoint != "" {
+		endpoints = []string{c.Endpoint}
+	}
+	var firstErr error
+	for _, ep := range endpoints {
+		body, err := c.fetchFrom(ctx, ep, country, locale)
+		if err == nil {
+			var snap Snapshot
+			if snap, err = Parse(body, now); err == nil {
+				return snap, nil
+			}
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return Snapshot{}, firstErr
 }

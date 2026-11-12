@@ -54,6 +54,8 @@ type mockStore struct {
 	previews int
 	owned    bool
 	cookie   string
+	// lastOffers is the offers parameter of the last checkout opened.
+	lastOffers string
 }
 
 var mockSeq int
@@ -69,6 +71,10 @@ func newMockStore(t *testing.T, sc scenario) *mockStore {
 	mux.HandleFunc("/checkout/api/complete", m.handleConfirm)
 	mux.HandleFunc("/graphql", m.handleGraphQL)
 	mux.HandleFunc("/id/login", m.handleLogin)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, "<!doctype html><title>Store</title><body><h1>Store</h1></body>")
+	})
 	mux.HandleFunc("/frame", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = io.WriteString(w, "<!doctype html><body>frame</body>")
@@ -148,6 +154,15 @@ func (m *mockStore) handleConfirm(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *mockStore) handleGraphQL(w http.ResponseWriter, r *http.Request) {
+	if !m.sc.GraphQLDown && r.URL.Query().Get("operationName") == "getMappingByPageSlug" {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Query().Get("variables"), `"pageSlug":"revealed-game"`) {
+			_, _ = io.WriteString(w, `{"data":{"StorePageMapping":{"mapping":{"pageSlug":"revealed-game","pageType":"productHome","mappings":{"offer":{"id":"real-id","namespace":"real-ns"}}}}}}`)
+		} else {
+			_, _ = io.WriteString(w, `{"data":{"StorePageMapping":{"mapping":null}}}`)
+		}
+		return
+	}
 	if m.sc.GraphQLDown || r.URL.Query().Get("operationName") != "getOffersValidation" || !m.hasSession(r) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
@@ -179,6 +194,9 @@ func (m *mockStore) handleCheckout(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, errorPage)
 		return
 	}
+	m.mu.Lock()
+	m.lastOffers = r.URL.Query().Get("offers")
+	m.mu.Unlock()
 	if !strings.HasPrefix(r.URL.Query().Get("offers"), "1-") {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = io.WriteString(w, errorPage)

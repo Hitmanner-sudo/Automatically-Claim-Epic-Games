@@ -643,3 +643,61 @@ func TestDefinitiveAnswerStopsTheSearch(t *testing.T) {
 		t.Errorf("orders: %d, %d", first.orderCount(), second.orderCount())
 	}
 }
+
+// ---- holiday mystery games
+
+func TestMysteryGameIsLookedUpByItsPage(t *testing.T) {
+	base := sharedBrowser(t)
+	store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0)})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	s, err := Open(ctx, base, Options{CheckoutBases: []string{store.URL()}, LoginBase: store.URL(), SettleWait: 50 * time.Millisecond, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	o := testOffer()
+	o.Placeholder, o.Namespace, o.OfferID, o.Slug = true, "d5241c76f178492ea1540fce45616757", "slot-9", "revealed-game"
+	if res := s.Claim(ctx, o); res.Outcome != Claimed {
+		t.Fatalf("result = %v", res)
+	}
+	store.mu.Lock()
+	got := store.lastOffers
+	store.mu.Unlock()
+	if got != "1-real-ns-real-id" {
+		t.Fatalf("checkout was opened for %q; the stand-in identifiers must never be ordered", got)
+	}
+
+	// A slot whose page the store does not know is not ordered at all.
+	before := store.orderCount()
+	o.Slug = "unknown-page"
+	if res := s.Claim(ctx, o); res.Outcome != Failed || !strings.Contains(res.Detail, "mystery game") {
+		t.Fatalf("result = %v", res)
+	}
+	o.Slug = ""
+	if res := s.Claim(ctx, o); res.Outcome != Failed {
+		t.Fatalf("unrevealed slot: %v", res)
+	}
+	if store.orderCount() != before {
+		t.Fatal("an unresolved mystery game must not be ordered")
+	}
+}
+
+func TestParsePageMapping(t *testing.T) {
+	ns, id, ok := parsePageMapping([]byte(`{"data":{"StorePageMapping":{"mapping":{"pageSlug":"x","mappings":{"offer":{"id":"o","namespace":"n"}}}}}}`))
+	if !ok || ns != "n" || id != "o" {
+		t.Fatalf("got %q %q %v", ns, id, ok)
+	}
+	for _, body := range []string{
+		`{"data":{"StorePageMapping":{"mapping":null}}}`,
+		`{"data":{"StorePageMapping":{"mapping":{"mappings":{"offer":null}}}}}`,
+		`{"data":{"StorePageMapping":{"mapping":{"mappings":{"offer":{"id":"","namespace":"n"}}}}}}`,
+		`{"errors":[{"message":"PersistedQueryNotFound"}]}`,
+		`nope`,
+	} {
+		if _, _, ok := parsePageMapping([]byte(body)); ok {
+			t.Errorf("should not resolve: %s", body)
+		}
+	}
+}

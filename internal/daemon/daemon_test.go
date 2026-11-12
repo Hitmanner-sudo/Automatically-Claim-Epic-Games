@@ -87,8 +87,12 @@ func (r *rig) tick() time.Duration {
 }
 
 func (r *rig) entry(id string) state.Entry {
-	e, _ := r.d.State.Get("ns:" + id)
-	return e
+	for key, e := range r.d.State.All() {
+		if strings.HasPrefix(key, "ns:"+id+"@") {
+			return e
+		}
+	}
+	return state.Entry{}
 }
 
 func (r *rig) logged(sub string) bool {
@@ -292,20 +296,43 @@ func TestPaidLookingOfferIsNeverRetried(t *testing.T) {
 	}
 }
 
-func TestMobileOffersAndEndingPromotionsAreNotAttempted(t *testing.T) {
+func TestEndingPromotionsAreNotAttempted(t *testing.T) {
 	r := newRig(t)
-	mobile := r.offer("m", 6*24*time.Hour)
-	mobile.Mobile = true
 	ending := r.offer("e", 2*time.Minute)
 	ok := r.offer("k", 6*24*time.Hour)
-	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{mobile, ending, ok}}
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{ending, ok}}
 	r.claim.results[ok.Key()] = claim.Result{Outcome: claim.Claimed}
 	r.tick()
 	if len(r.claim.calls) != 1 || len(r.claim.calls[0]) != 1 || r.claim.calls[0][0] != "Game k" {
 		t.Fatalf("calls = %v", r.claim.calls)
 	}
-	if r.entry("m").Status != state.Skipped || r.entry("e").Status != state.Pending {
-		t.Fatalf("mobile=%+v ending=%+v", r.entry("m"), r.entry("e"))
+	if r.entry("e").Status != state.Pending {
+		t.Fatalf("ending=%+v", r.entry("e"))
+	}
+}
+
+func TestSameGameGivenAwayAgainIsANewGiveaway(t *testing.T) {
+	r := newRig(t)
+	a := r.offer("a", 5*24*time.Hour)
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a}}
+	r.claim.results[a.Key()] = claim.Result{Outcome: claim.Unavailable, Detail: "region"}
+	r.tick()
+	// A year later the same offer is free again.
+	r.now = r.now.Add(365 * 24 * time.Hour)
+	again := r.offer("a", 5*24*time.Hour)
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{again}}
+	r.claim.results[again.Key()] = claim.Result{Outcome: claim.Claimed}
+	r.tick()
+	if len(r.claim.calls) != 2 {
+		t.Fatalf("the repeat giveaway was not attempted: %v", r.claim.calls)
+	}
+}
+
+func TestStaleListIsReadAgainSoon(t *testing.T) {
+	r := newRig(t)
+	r.feed.snap = feed.Snapshot{Stale: true}
+	if next := r.tick(); next != 5*time.Minute {
+		t.Fatalf("next = %v", next)
 	}
 }
 
@@ -365,16 +392,16 @@ func TestFeedErrorsRetrySoonButNotForever(t *testing.T) {
 	}
 }
 
-func TestNeverSpinsFasterThanOncePerMinute(t *testing.T) {
+func TestNeverSpinsFasterThanEveryTwoMinutes(t *testing.T) {
 	r := newRig(t)
 	r.feed.snap = feed.Snapshot{NextChange: r.now.Add(-time.Hour)} // stale
-	if next := r.tick(); next < time.Minute {
+	if next := r.tick(); next < 2*time.Minute {
 		t.Fatalf("next = %v", next)
 	}
 	a := r.offer("a", 6*24*time.Hour)
 	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a}, NextChange: r.now.Add(time.Second)}
 	r.claim.err = &BusyError{Reason: "x"}
-	if next := r.tick(); next < time.Minute {
+	if next := r.tick(); next < 2*time.Minute {
 		t.Fatalf("next = %v", next)
 	}
 }

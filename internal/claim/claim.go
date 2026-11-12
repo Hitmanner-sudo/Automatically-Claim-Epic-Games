@@ -514,6 +514,87 @@ func parseOwnership(body []byte) ownership {
 	return ownNo
 }
 
+// parsePageMapping extracts the offer a store page sells.
+func parsePageMapping(body []byte) (namespace, offerID string, ok bool) {
+	var doc struct {
+		Data *struct {
+			StorePageMapping *struct {
+				Mapping *struct {
+					Mappings *struct {
+						Offer *struct {
+							ID        string `json:"id"`
+							Namespace string `json:"namespace"`
+						} `json:"offer"`
+					} `json:"mappings"`
+				} `json:"mapping"`
+			} `json:"StorePageMapping"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(body, &doc) != nil || doc.Data == nil || doc.Data.StorePageMapping == nil ||
+		doc.Data.StorePageMapping.Mapping == nil || doc.Data.StorePageMapping.Mapping.Mappings == nil ||
+		doc.Data.StorePageMapping.Mapping.Mappings.Offer == nil {
+		return "", "", false
+	}
+	of := doc.Data.StorePageMapping.Mapping.Mappings.Offer
+	if of.ID == "" || of.Namespace == "" {
+		return "", "", false
+	}
+	return of.Namespace, of.ID, true
+}
+
+// resolve finds the real offer behind a holiday "mystery game" slot, whose
+// identifiers in the free-games list are stand-ins, by asking the store
+// which offer the revealed game's page sells.
+func (s *Session) resolve(ctx context.Context, o feed.Offer) (feed.Offer, error) {
+	if o.Slug == "" {
+		return o, errors.New("the mystery game has not been revealed yet")
+	}
+	var lastErr error = errors.New("no store site is configured")
+	for _, base := range s.opt.CheckoutBases {
+		origin := storeOrigin(base+"/", s.opt.CheckoutBases)
+		if origin == "" || origin != base {
+			continue // only a store site itself can answer
+		}
+		nctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		_ = s.page.Navigate(nctx, origin+"/")
+		cancel()
+		deadline := time.Now().Add(25 * time.Second)
+		for {
+			st, err := s.inspect(ctx)
+			if err == nil && storeOrigin(st.URL, s.opt.CheckoutBases) == origin && st.Ready != "loading" {
+				var res struct {
+					Status int    `json:"status"`
+					Body   string `json:"body"`
+				}
+				cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+				err = s.page.Eval(cctx, pageMappingJS(origin, o.Slug), &res)
+				cancel()
+				if err == nil {
+					if ns, id, ok := parsePageMapping([]byte(res.Body)); ok {
+						o.Namespace, o.OfferID, o.Placeholder = ns, id, false
+						return o, nil
+					}
+					lastErr = fmt.Errorf("%s did not say which offer the page %q sells (HTTP %d)", origin, o.Slug, res.Status)
+				} else {
+					lastErr = err
+				}
+				break
+			}
+			if ctx.Err() != nil {
+				return o, ctx.Err()
+			}
+			if time.Now().After(deadline) {
+				lastErr = fmt.Errorf("%s did not load", origin)
+				break
+			}
+			if err := sleep(ctx, 500*time.Millisecond); err != nil {
+				return o, err
+			}
+		}
+	}
+	return o, lastErr
+}
+
 // Claim tries to add one free offer to the library.
 func (s *Session) Claim(ctx context.Context, o feed.Offer) Result {
 	if o.Namespace == "" || o.OfferID == "" {
@@ -524,6 +605,14 @@ func (s *Session) Claim(ctx context.Context, o feed.Offer) Result {
 	}
 	if !o.End.IsZero() && time.Until(o.End) < 2*time.Minute {
 		return Result{Failed, "the promotion is about to end; not starting an order"}
+	}
+	if o.Placeholder {
+		resolved, err := s.resolve(ctx, o)
+		if err != nil {
+			return Result{Failed, "could not look up the revealed mystery game: " + err.Error()}
+		}
+		s.opt.Logf("%s: the mystery game slot resolves to offer %s", o.Title, resolved.PurchaseToken())
+		o = resolved
 	}
 
 	w := newOrderWatch(s.opt.DryRun)

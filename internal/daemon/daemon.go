@@ -107,7 +107,10 @@ const (
 	dryRunRetry  = 24 * time.Hour
 	// Epic's own notice asks to wait 24 hours.
 	throttleRetry = 25 * time.Hour
-	minSleep      = time.Minute
+	staleRetry    = 5 * time.Minute
+	// The list is cached for about two minutes at Epic's edge; asking more
+	// often than that is pointless.
+	minSleep = 2 * time.Minute
 	// endMargin: no order is started this close to a promotion's end.
 	endMargin = 3 * time.Minute
 )
@@ -173,13 +176,6 @@ func (d *Daemon) Tick(ctx context.Context) time.Time {
 		if entry.Status.Done() {
 			continue
 		}
-		if o.Mobile {
-			d.logf("%s is a mobile-only giveaway and cannot be claimed from a PC; skipping", o.Title)
-			_ = d.State.Update(key, func(e *state.Entry) {
-				e.Status, e.DoneAt, e.LastResult = state.Skipped, now, "mobile-only offer"
-			})
-			continue
-		}
 		if o.End.Sub(now) < endMargin {
 			continue
 		}
@@ -197,6 +193,11 @@ func (d *Daemon) Tick(ctx context.Context) time.Time {
 		}
 	}
 
+	// Epic's servers lag a few minutes behind a changeover; look again soon
+	// while the list is visibly behind.
+	if snap.Stale {
+		sooner(now.Add(staleRetry))
+	}
 	// Wake up shortly after the list is due to change (a new giveaway
 	// starting), with a few minutes' grace for Epic's servers to catch up.
 	if !snap.NextChange.IsZero() && snap.NextChange.After(now) {

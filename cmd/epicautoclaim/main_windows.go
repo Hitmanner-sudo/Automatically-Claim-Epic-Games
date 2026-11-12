@@ -266,8 +266,8 @@ func cmdCheck(a *app) int {
 		if e, ok := a.st.Get(o.Key()); ok && e.Status.Done() {
 			note = "  [" + string(e.Status) + "]"
 		}
-		if o.Mobile {
-			note += "  [mobile only]"
+		if o.Placeholder {
+			note += "  [holiday mystery game]"
 		}
 		fmt.Fprintf(a.out, "  %s  (until %s)%s\n", o.Title, o.End.Local().Format("Mon 2 Jan 15:04"), note)
 	}

@@ -194,6 +194,27 @@ func ownershipJS(storeBase, namespace, offerID string) string {
 })()`, base, v, x)
 }
 
+// pageMappingHash identifies the store's "getMappingByPageSlug" query, which
+// tells which offer a store page sells.
+const pageMappingHash = "781fd69ec8116125fa8dc245c0838198cdf5283e31647d08dfa27f45ee8b1f30"
+
+// pageMappingJS asks the store which offer belongs to a page. Read-only.
+func pageMappingJS(origin, slug string) string {
+	variables, _ := json.Marshal(map[string]string{"pageSlug": slug, "locale": "en-US"})
+	extensions, _ := json.Marshal(map[string]any{"persistedQuery": map[string]any{"version": 1, "sha256Hash": pageMappingHash}})
+	base, _ := json.Marshal(origin)
+	v, _ := json.Marshal(string(variables))
+	x, _ := json.Marshal(string(extensions))
+	return fmt.Sprintf(`(async function () {
+  var u = %s + '/graphql?operationName=getMappingByPageSlug&variables=' + encodeURIComponent(%s) + '&extensions=' + encodeURIComponent(%s);
+  try {
+    var r = await fetch(u, { credentials: 'include', headers: { accept: 'application/json' } });
+    var t = await r.text();
+    return { status: r.status, body: t.slice(0, 20000) };
+  } catch (e) { return { status: 0, body: String(e) }; }
+})()`, base, v, x)
+}
+
 // clickJS is the fallback for when synthetic mouse input is unavailable.
 const clickJS = `(function (x, y) {
   var el = document.elementFromPoint(x, y);

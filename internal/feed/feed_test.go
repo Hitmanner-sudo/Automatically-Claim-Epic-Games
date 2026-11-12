@@ -112,26 +112,25 @@ func TestParseIgnoresPaidDiscountsAndBrokenEntries(t *testing.T) {
 	}
 }
 
+const freePromo = `"price":{"totalPrice":{"discountPrice":0,"originalPrice":1}},
+	  "promotions":{"promotionalOffers":[{"promotionalOffers":[{"startDate":"2026-01-01T00:00:00.000Z","endDate":"2026-12-31T00:00:00.000Z","discountSetting":{"discountPercentage":0}}]}]}`
+
 func TestSlugSelection(t *testing.T) {
 	doc := `{"data":{"Catalog":{"searchStore":{"elements":[
 	 {"title":"AddOn","id":"a","namespace":"n","offerType":"ADD_ON","urlSlug":"x",
 	  "catalogNs":{"mappings":[{"pageSlug":"base-game","pageType":"productHome"}]},
-	  "offerMappings":[{"pageSlug":"base-game-addon-123","pageType":"offer"}],
-	  "price":{"totalPrice":{"discountPrice":0,"originalPrice":1}},
-	  "promotions":{"promotionalOffers":[{"promotionalOffers":[{"startDate":"2026-01-01T00:00:00.000Z","endDate":"2026-12-31T00:00:00.000Z","discountSetting":{"discountPercentage":0}}]}]}},
-	 {"title":"OpaqueOnly","id":"b","namespace":"n","urlSlug":"3f18c54a6e00424ba6e8f4422167cac7",
-	  "price":{"totalPrice":{"discountPrice":0,"originalPrice":1}},
-	  "promotions":{"promotionalOffers":[{"promotionalOffers":[{"startDate":"2026-01-01T00:00:00.000Z","endDate":"2026-12-31T00:00:00.000Z","discountSetting":{"discountPercentage":0}}]}]}},
-	 {"title":"Mobile","id":"c","namespace":"n","urlSlug":"mobile-game",
-	  "categories":[{"path":"freegames"},{"path":"freegames/android"}],
-	  "price":{"totalPrice":{"discountPrice":0,"originalPrice":1}},
-	  "promotions":{"promotionalOffers":[{"promotionalOffers":[{"startDate":"2026-01-01T00:00:00.000Z","endDate":"2026-12-31T00:00:00.000Z","discountSetting":{"discountPercentage":0}}]}]}}
+	  "offerMappings":[{"pageSlug":"base-game-addon-123","pageType":"offer"}],` + freePromo + `},
+	 {"title":"Edition","id":"e","namespace":"n","offerType":"EDITION",
+	  "catalogNs":{"mappings":[{"pageSlug":"godfall","pageType":"productHome"}]},
+	  "offerMappings":[{"pageSlug":"godfall--challenger-edition","pageType":"productHome"}],` + freePromo + `},
+	 {"title":"OpaqueOnly","id":"b","namespace":"n","urlSlug":"3f18c54a6e00424ba6e8f4422167cac7",` + freePromo + `},
+	 {"title":"LegacyPath","id":"c","namespace":"n","productSlug":"some-game/standard-edition",` + freePromo + `}
 	]}}}}`
 	snap, err := Parse([]byte(doc), mustTime(t, "2026-06-01T00:00:00Z"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snap.FreeNow) != 3 {
+	if len(snap.FreeNow) != 4 {
 		t.Fatalf("free now = %v", titles(snap.FreeNow))
 	}
 	by := map[string]Offer{}
@@ -141,11 +140,82 @@ func TestSlugSelection(t *testing.T) {
 	if by["AddOn"].Slug != "base-game-addon-123" {
 		t.Errorf("add-on slug = %q", by["AddOn"].Slug)
 	}
+	if by["Edition"].Slug != "godfall--challenger-edition" {
+		t.Errorf("edition slug = %q (must be the edition's own page, not the parent game's)", by["Edition"].Slug)
+	}
 	if by["OpaqueOnly"].Slug != "" || by["OpaqueOnly"].ProductURL("") != "" {
 		t.Errorf("opaque slug = %q", by["OpaqueOnly"].Slug)
 	}
-	if !by["Mobile"].Mobile || by["AddOn"].Mobile {
-		t.Errorf("mobile flags wrong: %+v", by)
+	if by["LegacyPath"].Slug != "some-game" {
+		t.Errorf("legacy slug = %q", by["LegacyPath"].Slug)
+	}
+}
+
+func TestMysteryGamePlaceholders(t *testing.T) {
+	// Holiday "vault" slots: a stand-in namespace and id, productSlug "[]"
+	// until the game is revealed.
+	doc := `{"data":{"Catalog":{"searchStore":{"elements":[
+	 {"title":"Mystery Game","id":"slot1","namespace":"d5241c76f178492ea1540fce45616757","offerType":"OTHERS","isCodeRedemptionOnly":true,
+	  "productSlug":"[]","urlSlug":"mysterygame-10","categories":[{"path":"freegames/vaulted"},{"path":"freegames"}],
+	  "price":{"totalPrice":{"discountPrice":0,"originalPrice":0}},
+	  "promotions":{"promotionalOffers":[{"promotionalOffers":[{"startDate":"2026-01-01T00:00:00.000Z","endDate":"2026-12-31T00:00:00.000Z","discountSetting":{"discountPercentage":0}}]}]}},
+	 {"title":"Revealed Game","id":"slot2","namespace":"d5241c76f178492ea1540fce45616757","offerType":"OTHERS","isCodeRedemptionOnly":true,
+	  "productSlug":"revealed-game","urlSlug":"mysterygame-9","categories":[{"path":"freegames/vaulted"}],
+	  "price":{"totalPrice":{"discountPrice":0,"originalPrice":0}},
+	  "promotions":{"promotionalOffers":[{"promotionalOffers":[{"startDate":"2026-01-01T00:00:00.000Z","endDate":"2026-12-31T00:00:00.000Z","discountSetting":{"discountPercentage":0}}]}]}}
+	]}}}}`
+	snap, err := Parse([]byte(doc), mustTime(t, "2026-06-01T00:00:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := titles(snap.FreeNow); len(got) != 1 || got[0] != "Revealed Game" {
+		t.Fatalf("free now = %v (an unrevealed slot has nothing to claim)", got)
+	}
+	o := snap.FreeNow[0]
+	if !o.Placeholder || o.Slug != "revealed-game" {
+		t.Fatalf("offer = %+v", o)
+	}
+}
+
+func TestErrorDocumentIsNotAnEmptyList(t *testing.T) {
+	// What Epic answers (with HTTP 200) for an unknown country code.
+	doc := `{"errors":[{"message":"CatalogQuery/searchStore: Request failed with status code 400","correlationId":"x"}],"data":{"Catalog":{"searchStore":null}}}`
+	if _, err := Parse([]byte(doc), time.Now()); err == nil {
+		t.Fatal("an error document must not be read as \"nothing is free\"")
+	}
+	if _, err := Parse([]byte(`{}`), time.Now()); err == nil {
+		t.Fatal("a document without a catalogue is an error")
+	}
+	// A real, empty catalogue is fine.
+	if snap, err := Parse([]byte(`{"data":{"Catalog":{"searchStore":{"elements":[]}}}}`), time.Now()); err != nil || len(snap.FreeNow) != 0 {
+		t.Fatalf("empty catalogue: %v %v", snap, err)
+	}
+}
+
+func TestStaleDocumentIsFlagged(t *testing.T) {
+	// One minute after the changeover the edge still serves the old
+	// document: the new giveaway has started but is listed as upcoming.
+	snap, err := Parse(loadReal(t), mustTime(t, "2026-11-12T16:01:00Z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.Stale || len(snap.FreeNow) != 0 || len(snap.Upcoming) != 0 {
+		t.Fatalf("snap = %+v", snap)
+	}
+	snap, _ = Parse(loadReal(t), mustTime(t, "2026-11-12T04:00:00Z"))
+	if snap.Stale {
+		t.Fatal("a current document is not stale")
+	}
+}
+
+func TestKeyDistinguishesRepeatGiveaways(t *testing.T) {
+	a := Offer{Namespace: "n", OfferID: "o", Start: mustTime(t, "2025-11-06T16:00:00Z")}
+	b := Offer{Namespace: "n", OfferID: "o", Start: mustTime(t, "2026-11-05T16:00:00Z")}
+	if a.Key() == b.Key() {
+		t.Fatal("the same game given away in two different years must be two giveaways")
+	}
+	if a.Key() != "n:o@2025-11-06T16:00Z" {
+		t.Fatalf("key = %s", a.Key())
 	}
 }
 
@@ -172,6 +242,9 @@ func TestFetchSendsCountryAndRejectsErrors(t *testing.T) {
 	}
 	if gotQuery != "allowCountries=DE&country=DE&locale=en-US" {
 		t.Fatalf("query = %s", gotQuery)
+	}
+	if _, err := c.Fetch(context.Background(), "uk", "", mustTime(t, "2026-11-12T04:00:00Z")); err != nil || gotQuery != "allowCountries=GB&country=GB&locale=en-US" {
+		t.Fatalf("UK should be sent as GB: %v %s", err, gotQuery)
 	}
 	if _, err := c.Fetch(context.Background(), "ZZ", "", time.Now()); err == nil {
 		t.Fatal("expected an error for HTTP 403")
