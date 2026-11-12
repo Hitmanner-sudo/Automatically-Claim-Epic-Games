@@ -44,7 +44,7 @@ If you start the launcher yourself while a claim is in progress, the program sto
 It is built to be unnoticeable on the weakest PC that can run the Epic Games Launcher at all.
 
 - One file of under 8 MB. No installer, no service, no runtime to install, no tray icon.
-- Between looks it sleeps: it gives its memory back to Windows, drops to the lowest priority for the processor, the disk and memory (what Windows 11 calls efficiency mode), and does nothing but look at the clock once a minute.
+- Between looks it sleeps: it gives its memory back to Windows, drops to the lowest priority for the processor, the disk and memory (what Windows 11 calls efficiency mode), and does nothing but look at the clock once a minute. Measured on a GitHub Windows machine after half a minute of waiting: 0.8 MB of memory actually in use and 0.09 seconds of processor time since it started. (Windows also counts about 49 MB as set aside for it; that is room it may use, not memory it occupies.)
 - An hourly look is one small download from Epic (the list is about 30 kB) and a glance at what it already knows.
 - Once an hour Windows also starts a second copy, which sees the first one and is gone again in a fraction of a second. That is all the Task Scheduler task does, and it is what brings the program back if it was ever ended.
 - The only real work is the claim itself, about half a minute per giveaway, and nearly all of that is the Epic Games Launcher running hidden, not this program.
@@ -106,6 +106,7 @@ Tested on real Windows machines (GitHub's Windows runners) with a real Epic Game
 - starting it hidden, including the case where it first wants to update itself;
 - bringing up its interface on the hidden desktop, with **no launcher window on the visible desktop** at any moment of the trial (the test fails if one shows up even briefly);
 - recognising that a launcher is signed out;
+- installing: the start-up entry and the hourly task as Windows holds them, a second copy leaving at once, installing again starting the program afresh, the Task Scheduler bringing it back after a stop, and uninstalling leaving nothing behind;
 - shutting everything down again with nothing left running.
 
 Tested in a real browser against a stand-in for Epic's store (about 70 scenarios): placing a free order directly and through the store page, a checkout window opened by the launcher itself, a checkout shown inside the store page, the EU consent dialog, both the older and the 2026 checkout layout, holiday mystery games, already-owned games, region locks, CAPTCHAs, signed-out sessions, and every case found so far in which a price above zero appears anywhere (on the page, in Epic's order preview, in the order itself however it is written or encoded, sent through a service worker, a frame from another site or a worker, including ones that only come into being at the moment of the click, or re-sent by the page after the claim has ended), none of which may result in an order.
