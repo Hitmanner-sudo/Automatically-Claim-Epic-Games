@@ -55,11 +55,38 @@ func Start(t testing.TB) string {
 		}
 		t.Skip("no Chromium/Chrome found; set CHROMIUM_PATH to run browser tests")
 	}
-	// Not t.TempDir(): Chromium's helper processes keep writing for a moment
-	// after the main process is killed, which would fail the test on cleanup.
+	// A browser that does not come up is started afresh: on a busy machine
+	// (a CI runner at the wrong moment) one start in a great many hangs.
+	const attempts = 3
+	for attempt := 1; attempt <= attempts; attempt++ {
+		base, stop, err := launch(bin)
+		if err != nil {
+			if required {
+				t.Fatalf("cannot start %s: %v", bin, err)
+			}
+			t.Skipf("cannot start %s: %v", bin, err)
+		}
+		if base != "" {
+			t.Cleanup(stop)
+			return base
+		}
+		stop()
+		t.Logf("Chromium did not expose a DevTools port (attempt %d of %d)", attempt, attempts)
+	}
+	t.Fatalf("Chromium did not expose a DevTools port in %d attempts (%s)", attempts, bin)
+	return ""
+}
+
+// launch starts the browser and waits for its DevTools endpoint. base is
+// empty if it did not come up in time; stop ends the browser and removes
+// its profile either way.
+func launch(bin string) (base string, stop func(), err error) {
+	// Not a test's TempDir: Chromium's helper processes keep writing for a
+	// moment after the main process is killed, which would fail the test
+	// on cleanup.
 	profile, err := os.MkdirTemp("", "cdptest-")
 	if err != nil {
-		t.Fatal(err)
+		return "", nil, err
 	}
 	cmd := exec.Command(bin,
 		"--headless=new",
@@ -74,12 +101,10 @@ func Start(t testing.TB) string {
 		"about:blank",
 	)
 	if err := cmd.Start(); err != nil {
-		if required {
-			t.Fatalf("cannot start %s: %v", bin, err)
-		}
-		t.Skipf("cannot start %s: %v", bin, err)
+		_ = os.RemoveAll(profile)
+		return "", nil, err
 	}
-	t.Cleanup(func() {
+	stop = func() {
 		if runtime.GOOS == "windows" {
 			// Chrome's helper processes outlive a plain kill there.
 			_ = exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(cmd.Process.Pid)).Run()
@@ -92,27 +117,26 @@ func Start(t testing.TB) string {
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
-	})
+	}
 
 	portFile := filepath.Join(profile, "DevToolsActivePort")
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(40 * time.Second)
 	for time.Now().Before(deadline) {
 		if data, err := os.ReadFile(portFile); err == nil {
 			line := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)[0]
 			if port, err := strconv.Atoi(strings.TrimSpace(line)); err == nil && port > 0 {
-				base := cdp.Base(port)
+				b := cdp.Base(port)
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				_, err := cdp.Version(ctx, base)
+				_, err := cdp.Version(ctx, b)
 				cancel()
 				if err == nil {
-					return base
+					return b, stop, nil
 				}
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("Chromium did not expose a DevTools port within 30s (%s)", bin)
-	return ""
+	return "", stop, nil
 }
 
 // FirstPage returns the first page target of the browser.

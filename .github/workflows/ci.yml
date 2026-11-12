@@ -104,6 +104,9 @@ jobs:
           $s = $xml.Task.Settings
           if ($s.StartWhenAvailable -ne 'true' -or $s.DisallowStartIfOnBatteries -ne 'false' -or $s.StopIfGoingOnBatteries -ne 'false' -or $s.ExecutionTimeLimit -ne 'PT0S') { throw 'the task lost a setting on the way in' }
           if (-not $xml.Task.Triggers.CalendarTrigger.ScheduleByDay) { throw 'the task has no daily trigger' }
+          if ($xml.Task.Triggers.CalendarTrigger.Repetition.Interval -ne 'PT1H') { throw 'the task is not started again every hour' }
+          if ($s.Priority -ne '5') { throw "the task runs at priority $($s.Priority), not 5" }
+          if ($xml.Task.RegistrationInfo.Version -notlike 'eac*') { throw "the task carries no marker: $($xml.Task.RegistrationInfo.Version)" }
           if ($xml.Task.Actions.Exec.Command -ne $exe -or $xml.Task.Actions.Exec.Arguments -ne 'run --scheduled') { throw "unexpected action: $($xml.Task.Actions.Exec.Command) $($xml.Task.Actions.Exec.Arguments)" }
           $run = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue
           if ($run.EpicAutoClaim) { throw 'a start-up entry was written although the daily task exists' }

@@ -31,6 +31,14 @@ type scenario struct {
 	CaptchaFirst bool   `json:"captchaFirst"` // shows a challenge before the button is ready
 	SlowMs       int    `json:"slowMs"`       // how long the button stays disabled
 	ConfirmError string `json:"confirmError"` // Epic rejects the order with this message
+	// ConfirmStatus and ConfirmRaw make the order endpoint answer with this
+	// HTTP status and body, verbatim (as recorded from the real service).
+	ConfirmStatus int    `json:"-"`
+	ConfirmRaw    string `json:"-"`
+	// Real2026 makes the 2026 layout talk to the addresses Epic's real
+	// free checkout was seen to use on a signed-in launcher in November
+	// 2026: /v2/purchase/order-preview and /v2/purchase/confirm-order.
+	Real2026     bool   `json:"real2026"`
 	GraphQLDown  bool   `json:"graphqlDown"`  // ownership query unavailable
 	German       bool   `json:"german"`       // non-English labels
 	OwnedMessage bool   `json:"ownedMessage"` // checkout itself says "already own"
@@ -122,6 +130,8 @@ window.addEventListener('message', function (ev) {
 		m.mu.Unlock()
 	})
 	mux.HandleFunc("/purchase/order-preview", m.handlePreview)
+	mux.HandleFunc("/v2/purchase/order-preview", m.handlePreview)
+	mux.HandleFunc("/v2/purchase/confirm-order", m.handleConfirm)
 	mux.HandleFunc("/purchase/confirm-order", m.handleConfirm)
 	mux.HandleFunc("/checkout/api/complete", m.handleConfirm)
 	mux.HandleFunc("/graphql", m.handleGraphQL)
@@ -213,11 +223,16 @@ func (m *mockStore) handleConfirm(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	m.mu.Lock()
 	m.orders = append(m.orders, string(body))
-	if m.sc.ConfirmError == "" {
+	if m.sc.ConfirmError == "" && m.sc.ConfirmRaw == "" {
 		m.owned = true
 	}
 	m.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
+	if m.sc.ConfirmRaw != "" {
+		w.WriteHeader(m.sc.ConfirmStatus)
+		_, _ = io.WriteString(w, m.sc.ConfirmRaw)
+		return
+	}
 	if m.sc.ConfirmError != "" {
 		_ = json.NewEncoder(w).Encode(map[string]any{"error": "errors.com.epicgames.purchase", "message": m.sc.ConfirmError})
 		return
@@ -340,12 +355,23 @@ setTimeout(function () { btn.disabled = false; }, S.slowMs || 0);
 btn.addEventListener('click', function (ev) {
   window.clicks.push({ what: 'place', trusted: ev.isTrusted });
   fetch('/hit?what=place');
-  fetch(S.submitPath || '/checkout/api/complete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ purchaseToken: 'tok', offers: offers }) })
-    .then(function (r) { return r.json(); }).then(function (c) {
-      if (c.error) document.getElementById('extra').innerHTML = '<div role="alert">' + c.message + '</div>';
+  var order = { purchaseToken: 'tok', offers: offers };
+  if (S.real2026) order = { useDefault: true, setDefault: false, namespace: 'ns', country: 'US', countryName: 'United States', orderId: null, orderComplete: null, orderError: null, orderPending: null, offers: offers, includeAccountBalance: false, totalAmount: 0, affiliateId: '', creatorSource: '', syncToken: 'tok' };
+  fetch(S.submitPath || (S.real2026 ? '/v2/purchase/confirm-order' : '/checkout/api/complete'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(order) })
+    .then(function (r) { return r.json().then(function (c) { return { ok: r.ok, c: c }; }); }).then(function (x) {
+      var c = x.c;
+      if (S.real2026 && (!x.ok || c.errorCode)) {
+        // The real page shows a notice at the bottom that fades after a few seconds.
+        var toast = document.createElement('div');
+        toast.className = '_toast_z1';
+        toast.textContent = "Sorry, you already own this item, or it's still being processed.";
+        document.body.appendChild(toast);
+        setTimeout(function () { toast.remove(); }, 4000);
+      } else if (c.error) document.getElementById('extra').innerHTML = '<div role="alert">' + c.message + '</div>';
       else document.querySelector('section').innerHTML = '<h1>' + (S.german ? 'Alles deins' : "It's all yours") + '</h1><p>Download the Epic Games Launcher to play</p>';
     });
 });
+if (S.real2026) fetch('/v2/purchase/order-preview', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ offers: offers, namespace: 'ns', lineOffers: [{ offerId: 'id', quantity: 1 }] }) }).then(function (r) { return r.json(); }).then(function (p) { window.preview = p; });
 </script></body></html>`
 
 const checkoutPage = `<!doctype html><html><head><title>Payment by Epic Games</title>

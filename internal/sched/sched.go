@@ -7,7 +7,9 @@
 package sched
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"unicode/utf16"
@@ -33,13 +35,28 @@ type Spec struct {
 }
 
 // Slot names the time of day of a Spec in a short form ("16:30Z" or
-// "18:00"), used to tell whether a registered task is still the wanted one.
+// "18:00").
 func (s Spec) Slot() string {
 	z := ""
 	if s.UTC {
 		z = "Z"
 	}
 	return fmt.Sprintf("%02d:%02d%s", s.Hour, s.Minute, z)
+}
+
+// layout is raised whenever the task definition below changes in a way
+// that an already registered task should pick up.
+const layout = 2
+
+// Marker is a short plain-ASCII string written into the task (as its
+// version) that says which time of day, program location and layout it was
+// registered for. A registered task whose definition contains the wanted
+// marker is up to date. (Comparing paths in the definition's text would not
+// do: the tool that prints it re-encodes them.)
+func (s Spec) Marker() string {
+	sum := sha256.Sum256([]byte(strings.ToLower(s.Exe)))
+	slot := strings.Replace(s.Slot(), ":", "", 1)
+	return fmt.Sprintf("eac%d-%s-%s", layout, slot, hex.EncodeToString(sum[:4]))
 }
 
 func xmlText(s string) string {
@@ -62,10 +79,18 @@ func (s Spec) XML() string {
 	b.WriteString(`<?xml version="1.0" encoding="UTF-16"?>` + "\r\n")
 	b.WriteString(`<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">` + "\r\n")
 	b.WriteString("  <RegistrationInfo>\r\n")
+	b.WriteString("    <Version>" + xmlText(s.Marker()) + "</Version>\r\n")
 	b.WriteString("    <Description>Looks for the Epic Games Store's free games once a day and claims them through the Epic Games Launcher, without showing anything. To remove it, run EpicAutoClaim.exe uninstall.</Description>\r\n")
 	b.WriteString("  </RegistrationInfo>\r\n")
 	b.WriteString("  <Triggers>\r\n")
 	b.WriteString("    <CalendarTrigger>\r\n")
+	// Besides its daily time the task is started again every hour. The
+	// program then only looks at its own timetable and ends at once unless
+	// a round is due, so nothing is fetched or started because of this. It
+	// is what lets a retry that fell due while the PC was off (or after the
+	// program was ended by a shutdown) happen the same day instead of
+	// waiting for the next daily time.
+	b.WriteString("      <Repetition>\r\n        <Interval>PT1H</Interval>\r\n        <Duration>P1D</Duration>\r\n        <StopAtDurationEnd>false</StopAtDurationEnd>\r\n      </Repetition>\r\n")
 	b.WriteString("      <StartBoundary>" + boundary + "</StartBoundary>\r\n")
 	b.WriteString("      <Enabled>true</Enabled>\r\n")
 	b.WriteString("      <ScheduleByDay>\r\n        <DaysInterval>1</DaysInterval>\r\n      </ScheduleByDay>\r\n")
@@ -92,7 +117,11 @@ func (s Spec) XML() string {
 	b.WriteString("    <RunOnlyIfIdle>false</RunOnlyIfIdle>\r\n")
 	b.WriteString("    <WakeToRun>false</WakeToRun>\r\n")
 	b.WriteString("    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n")
-	b.WriteString("    <Priority>7</Priority>\r\n")
+	// 7, the default for tasks, means below-normal priority (and low disk
+	// priority), which everything the program starts would inherit: the
+	// hidden launcher, and the user's own launcher when it is put back in
+	// the tray. 5 is ordinary priority.
+	b.WriteString("    <Priority>5</Priority>\r\n")
 	b.WriteString("  </Settings>\r\n")
 	b.WriteString(`  <Actions Context="Author">` + "\r\n")
 	b.WriteString("    <Exec>\r\n")
@@ -121,9 +150,11 @@ func UTF16File(text string) []byte {
 	return out
 }
 
-// TaskName is the task's name for a user: the program's name and the last
-// part of the user's security identifier (plain digits, unique per user on
-// a PC), so that two Windows users each get a task of their own.
+// TaskName is the task's name for a user, so that two Windows users each
+// get a task of their own: the program's name, the last part of the user's
+// security identifier (plain digits) and, because that part alone is not
+// unique between a PC's own accounts and those of a domain, a few
+// characters derived from the whole identifier.
 func TaskName(app, userSID string) string {
 	tail := userSID
 	if i := strings.LastIndexByte(userSID, '-'); i >= 0 {
@@ -135,8 +166,9 @@ func TaskName(app, userSID string) string {
 			clean = append(clean, c)
 		}
 	}
-	if len(clean) == 0 {
+	if len(clean) == 0 || !strings.HasPrefix(userSID, "S-") {
 		return app
 	}
-	return app + "-" + string(clean)
+	sum := sha256.Sum256([]byte(userSID))
+	return app + "-" + string(clean) + "-" + hex.EncodeToString(sum[:2])
 }

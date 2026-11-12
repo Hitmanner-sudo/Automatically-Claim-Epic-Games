@@ -100,7 +100,9 @@ type Snapshot struct {
 
 type rawFeed struct {
 	Errors []struct {
-		Message string `json:"message"`
+		Message         string `json:"message"`
+		Status          int    `json:"status"`
+		ServiceResponse string `json:"serviceResponse"`
 	} `json:"errors"`
 	Data *struct {
 		Catalog *struct {
@@ -298,13 +300,24 @@ func Parse(data []byte, now time.Time) (Snapshot, error) {
 	// with HTTP 200 and an empty catalogue. That is not "nothing is free".
 	if raw.Data == nil || raw.Data.Catalog == nil || raw.Data.Catalog.SearchStore == nil {
 		msg := "no catalogue in the reply"
-		if len(raw.Errors) > 0 && raw.Errors[0].Message != "" {
-			msg = raw.Errors[0].Message
-			if len(msg) > 200 {
-				msg = msg[:200]
+		refused := false
+		if len(raw.Errors) > 0 {
+			e := raw.Errors[0]
+			if e.Message != "" {
+				msg = e.Message
+				if len(msg) > 200 {
+					msg = msg[:200]
+				}
 			}
+			// Epic's answer to a country it does not know: a refusal that
+			// asking again will not change. Anything else of this shape is
+			// a failure on Epic's side that may well pass.
+			refused = e.Status == 400 || strings.Contains(e.ServiceResponse, "invalid_country_code") || strings.Contains(e.Message, "status code 400")
 		}
-		return Snapshot{}, fmt.Errorf("free-games feed: %s (is the country code right?)", msg)
+		if refused {
+			return Snapshot{}, permanentError{fmt.Errorf("free-games feed: %s (is the country code right?)", msg)}
+		}
+		return Snapshot{}, fmt.Errorf("free-games feed: %s", msg)
 	}
 	// Epic always has something on offer. A list with nothing in it at all
 	// is a hiccup on their side, not news.
@@ -548,9 +561,6 @@ func (c *Client) fetchCountry(ctx context.Context, country, locale string, now t
 				if snap, err = Parse(body, when); err == nil {
 					snap.ClockSkew, snap.Country = skew, country
 					return snap, nil
-				}
-				if strings.Contains(err.Error(), "country code") {
-					err = permanentError{err}
 				}
 			}
 			if firstErr == nil {

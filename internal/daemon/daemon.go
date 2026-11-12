@@ -204,8 +204,9 @@ func (d *Daemon) Due() time.Time {
 		return now
 	case sc.NextDue.Sub(now) > 26*time.Hour:
 		// Further away than any round is ever planned: the clock must have
-		// been wrong when it was written down.
-		return d.regular(now)
+		// been wrong when it was written down. Look now; that round writes
+		// a sound timetable again.
+		return now
 	}
 	return sc.NextDue
 }
@@ -214,6 +215,10 @@ func (d *Daemon) Due() time.Time {
 // the list: soon at first (a PC that has just woken up may not be online
 // yet), then more slowly, and after a few hours not before the next regular
 // check.
+// rememberAfter is how many reads in a row must have failed before the
+// list as last read is gone by.
+const rememberAfter = 3
+
 var feedRetry = []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute, 20 * time.Minute, 30 * time.Minute, time.Hour, time.Hour, time.Hour}
 
 // lastList is the free-games list as last read, kept in the state file.
@@ -259,48 +264,78 @@ func (d *Daemon) round(ctx context.Context) (next time.Time, read bool) {
 			return time.Time{}, false
 		}
 		failures := 0
+		var gaveUpUntil time.Time
 		_ = d.State.SetSchedule(func(sc *state.Schedule) {
+			if !sc.FeedGaveUpUntil.IsZero() && !now.Before(sc.FeedGaveUpUntil) {
+				// This is the regular check the retries were left to: a
+				// failure now is the first of a new series.
+				sc.FeedFailures, sc.FeedGaveUpUntil = 0, time.Time{}
+			}
 			sc.FeedFailures++
-			failures = sc.FeedFailures
+			failures, gaveUpUntil = sc.FeedFailures, sc.FeedGaveUpUntil
 		})
 		// Meanwhile, giveaways known from the last time the list was read
 		// can still be claimed.
 		known, readAt := d.remembered(now)
+		if failures < rememberAfter {
+			// A PC that has just woken up is often simply not online yet;
+			// the list is asked for again in a minute or two anyway.
+			known = nil
+		}
 		meanwhile := ""
 		if len(known) > 0 {
 			meanwhile = "; meanwhile going by the list as read on " + readAt.Local().Format("Mon 2 Jan 15:04") + " for what is still open"
 		}
 		listRetry = d.regular(now)
 		if failures > len(feedRetry) {
+			if gaveUpUntil.IsZero() {
+				gaveUpUntil = listRetry
+				_ = d.State.SetSchedule(func(sc *state.Schedule) { sc.FeedGaveUpUntil = gaveUpUntil })
+			}
+			if gaveUpUntil.After(now) {
+				listRetry = gaveUpUntil
+			}
 			d.notice("feed-giving-up", "the free-games list could still not be read after %d tries; leaving it until the next regular check%s", failures, meanwhile)
 		} else {
 			if at := now.Add(feedRetry[failures-1]); at.Before(listRetry) {
 				listRetry = at
 			}
-			d.notice("feed:"+err.Error(), "could not read the free-games list (%v); trying again in %v%s", err, listRetry.Sub(now).Round(time.Minute), meanwhile)
+			key := "feed:" + err.Error()
+			if meanwhile != "" {
+				key += "+memory" // said once more when it starts going by memory
+			}
+			d.notice(key, "could not read the free-games list (%v); trying again in %v%s", err, listRetry.Sub(now).Round(time.Minute), meanwhile)
 		}
 		if len(known) == 0 {
 			return listRetry, false
 		}
 		snap = feed.Snapshot{FreeNow: known}
 	} else {
-		if d.State.Schedule().FeedFailures != 0 {
-			_ = d.State.SetSchedule(func(sc *state.Schedule) { sc.FeedFailures = 0 })
+		if sc := d.State.Schedule(); sc.FeedFailures != 0 || !sc.FeedGaveUpUntil.IsZero() {
+			_ = d.State.SetSchedule(func(sc *state.Schedule) { sc.FeedFailures, sc.FeedGaveUpUntil = 0, time.Time{} })
 		}
 		_ = d.State.Prune(now, 60*24*time.Hour)
+		// With a PC clock that is far off, Epic's time has decided what is
+		// running. From here on every time is in the PC's own clock, which
+		// is what everything else (and everything stored) is compared with.
+		// A giveaway's start stays as it is: it is part of its identity.
+		if skew := snap.ClockSkew; skew != 0 {
+			free := make([]feed.Offer, len(snap.FreeNow))
+			for i, o := range snap.FreeNow {
+				o.End = o.End.Add(-skew)
+				free[i] = o
+			}
+			snap.FreeNow = free
+			if !snap.NextChange.IsZero() {
+				snap.NextChange = snap.NextChange.Add(-skew)
+			}
+			d.notice("clock", "this PC's clock differs from Epic's by %v; going by Epic's time to tell what is free", (-skew).Round(time.Minute))
+		}
 		d.remember(snap, now)
 		if snap.Country != "" && d.Country != "" && !strings.EqualFold(snap.Country, d.Country) && !(strings.EqualFold(d.Country, "UK") && snap.Country == "GB") {
 			d.notice("feed-country", "Epic has no free-games list for country %q; going by the one for %s (set \"country\" in config.json to your Epic account's country)", d.Country, snap.Country)
 		}
 	}
-	// With a PC clock that is far off, Epic's time decides what is running
-	// and what has ended; times to wake up at are turned back into the
-	// PC's own.
-	skew := snap.ClockSkew
-	if skew != 0 {
-		d.notice("clock", "this PC's clock differs from Epic's by %v; going by Epic's time to tell what is free", (-skew).Round(time.Minute))
-	}
-
 	var due []feed.Offer
 	next = d.regular(now)
 	if !read {
@@ -316,7 +351,7 @@ func (d *Daemon) round(ctx context.Context) (next time.Time, read bool) {
 		key := o.Key()
 		entry, known := d.State.Get(key)
 		if !known {
-			d.logf("free now: %s (until %s)", o.Title, o.End.Add(-skew).Local().Format("Mon 2 Jan 15:04"))
+			d.logf("free now: %s (until %s)", o.Title, o.End.Local().Format("Mon 2 Jan 15:04"))
 			_ = d.State.Update(key, func(e *state.Entry) {
 				e.Title, e.FirstSeen, e.Ends = o.Title, now, o.End
 			})
@@ -325,9 +360,6 @@ func (d *Daemon) round(ctx context.Context) (next time.Time, read bool) {
 		if entry.Status.Done() {
 			continue
 		}
-		// From here on the offer's end is in the PC's own time, which is
-		// what everything downstream compares it with.
-		o.End = o.End.Add(-skew)
 		if o.End.Sub(now) < endMargin {
 			continue
 		}
@@ -354,8 +386,8 @@ func (d *Daemon) round(ctx context.Context) (next time.Time, read bool) {
 	}
 	// Wake up shortly after the list is due to change (a new giveaway
 	// starting), with a few minutes' grace for Epic's servers to catch up.
-	if change := snap.NextChange.Add(-skew); !snap.NextChange.IsZero() && change.After(now) {
-		sooner(change.Add(2*time.Minute + d.jitter(5*time.Minute)))
+	if !snap.NextChange.IsZero() && snap.NextChange.After(now) {
+		sooner(snap.NextChange.Add(2*time.Minute + d.jitter(5*time.Minute)))
 	}
 	if earliest := now.Add(minSleep); next.Before(earliest) {
 		next = earliest

@@ -697,8 +697,22 @@ func TestARestartDoesNotCauseACheck(t *testing.T) {
 func TestATimetableFromAWrongClockIsNotTrusted(t *testing.T) {
 	r := slotRig(t)
 	_ = r.d.State.SetSchedule(func(sc *state.Schedule) { sc.NextDue = r.now.Add(400 * 24 * time.Hour) })
-	if due := r.d.Due(); due.Sub(r.now) > 25*time.Hour {
-		t.Fatalf("due in %v", due.Sub(r.now))
+	if due := r.d.Due(); !due.Equal(r.now) {
+		t.Fatalf("due in %v, want now", due.Sub(r.now))
+	}
+	// Started by Windows exactly at the daily time (when "the next daily
+	// time" is a whole day away), it must not leave without looking: the
+	// round is what puts the timetable right.
+	r.now = time.Date(2026, 11, 12, 16, 30, 0, 0, time.UTC)
+	_ = r.d.State.SetSchedule(func(sc *state.Schedule) { sc.NextDue = r.now.Add(30 * 24 * time.Hour) })
+	if !r.d.Due().Equal(r.now) {
+		t.Fatalf("at the daily time: due %v", r.d.Due())
+	}
+	if wait := r.tick(); wait != 24*time.Hour {
+		t.Fatalf("after the repairing round the next look is in %v", wait)
+	}
+	if sc := r.d.State.Schedule(); sc.NextDue.Sub(r.now) != 24*time.Hour {
+		t.Fatalf("timetable not repaired: %v", sc.NextDue.Sub(r.now))
 	}
 }
 
@@ -835,8 +849,19 @@ func TestGoesByTheLastListWhenTheListCannotBeRead(t *testing.T) {
 	// An hour later Epic's list cannot be read. The giveaway that failed
 	// earlier is due again and is still running: it is tried all the same.
 	r.now = r.now.Add(time.Hour)
+	readAt := r.now.Add(-time.Hour)
 	r.feed.err = errors.New("no such host")
 	r.claim.results[a.Key()] = claim.Result{Outcome: claim.Claimed}
+	// Not at the first failed read, though: a PC that has just woken up is
+	// often simply not online yet, and the list is asked for again in a
+	// minute or two.
+	for i := 0; i < 2; i++ {
+		wait := r.tick()
+		if len(r.claim.calls) != 1 {
+			t.Fatalf("a session was started from memory after only %d failed read(s)", i+1)
+		}
+		r.now = r.now.Add(wait)
+	}
 	wait := r.tick()
 	if len(r.claim.calls) != 2 || len(r.claim.calls[1]) != 1 || r.claim.calls[1][0] != "Game a" {
 		t.Fatalf("sessions = %v", r.claim.calls)
@@ -852,7 +877,7 @@ func TestGoesByTheLastListWhenTheListCannotBeRead(t *testing.T) {
 		t.Errorf("logs = %q", r.logs)
 	}
 	// The timetable does not count this as a successful look.
-	if sc := r.d.State.Schedule(); !sc.LastCheck.Equal(r.now.Add(-time.Hour)) {
+	if sc := r.d.State.Schedule(); !sc.LastCheck.Equal(readAt) {
 		t.Errorf("last successful read = %v", sc.LastCheck)
 	}
 	// With nothing left to go by, nothing is started.
@@ -906,5 +931,67 @@ func TestSaysWhenAnotherCountrysListWasUsed(t *testing.T) {
 	r.tick()
 	if !r.logged("no free-games list for country") {
 		t.Errorf("logs = %q", r.logs)
+	}
+}
+
+func TestListRetriesStartAfreshAtTheCheckTheyWereLeftTo(t *testing.T) {
+	// A long outage uses the quick retries up; the rest is left to the
+	// next daily check. If the read fails then as well (the PC has only
+	// just woken up, say), it is the first failure of a new series and is
+	// retried after a minute, not a day later.
+	r := slotRig(t) // 10:00 UTC, daily slot 16:30 UTC
+	r.feed.err = errors.New("no network")
+	slot := r.now.Add(6*time.Hour + 30*time.Minute)
+	for i := 0; i < 30; i++ {
+		next := r.d.Tick(context.Background())
+		if !next.After(r.now) {
+			t.Fatalf("next round not in the future: %v", next.Sub(r.now))
+		}
+		if next.After(slot) {
+			t.Fatalf("round %d planned beyond the daily check: %v", i, next.Sub(r.now))
+		}
+		r.now = next
+		if r.now.Equal(slot) {
+			break
+		}
+	}
+	if !r.now.Equal(slot) {
+		t.Fatalf("never arrived at the daily check; now %v", r.now)
+	}
+	if wait := r.tick(); wait != time.Minute {
+		t.Fatalf("a failure at the daily check is retried in %v, want 1m", wait)
+	}
+	// And one success clears everything.
+	r.feed.err = nil
+	r.tick()
+	if sc := r.d.State.Schedule(); sc.FeedFailures != 0 || !sc.FeedGaveUpUntil.IsZero() {
+		t.Fatalf("after a success: %+v", sc)
+	}
+}
+
+func TestStoredTimesAreInThePCsClock(t *testing.T) {
+	// PC three days behind Epic. The giveaway runs for another twelve
+	// hours. What is written down (the record's end, the remembered list)
+	// must be in the PC's time, because that is what it is compared with
+	// later, also when the list cannot be read and no difference is known.
+	r := slotRig(t)
+	skew := 3 * 24 * time.Hour
+	epicNow := r.now.Add(skew)
+	a := feed.Offer{Title: "Game a", Namespace: "ns", OfferID: "a", Start: epicNow.Add(-time.Hour), End: epicNow.Add(12 * time.Hour)}
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a}, ClockSkew: skew}
+	r.claim.results[a.Key()] = claim.Result{Outcome: claim.Failed, Detail: "x"}
+	r.tick()
+	if e := r.entry("a"); e.Ends.Sub(r.now) != 12*time.Hour {
+		t.Fatalf("recorded end is %v from now, want 12h", e.Ends.Sub(r.now))
+	}
+	// Thirteen hours later the giveaway is over. The list cannot be read:
+	// nothing is attempted from memory.
+	r.now = r.now.Add(13 * time.Hour)
+	r.feed.err = errors.New("no network")
+	for i := 0; i < 5; i++ {
+		r.now = r.now.Add(r.tick())
+	}
+	if len(r.claim.calls) != 1 {
+		t.Fatalf("an ended giveaway was attempted from memory: %v", r.claim.calls)
 	}
 }

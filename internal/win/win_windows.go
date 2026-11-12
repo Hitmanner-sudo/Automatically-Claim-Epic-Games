@@ -264,7 +264,10 @@ func create(exe string, args []string, dir, desktop string, env []string, job wi
 			return pi, err
 		}
 	}
-	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_UNICODE_ENVIRONMENT | windows.CREATE_NEW_PROCESS_GROUP)
+	// Ordinary priority, stated outright: a program started by a scheduled
+	// task may itself be running below normal, and what it starts would
+	// otherwise inherit that.
+	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_UNICODE_ENVIRONMENT | windows.CREATE_NEW_PROCESS_GROUP | windows.NORMAL_PRIORITY_CLASS)
 	if err := windows.CreateProcess(exePtr, cmdPtr, nil, nil, false, flags, envBlock(env), dirPtr, &si, &pi); err != nil {
 		if errors.Is(err, windows.ERROR_ELEVATION_REQUIRED) {
 			return pi, fmt.Errorf("start %s: it requires administrator rights, which this program does not have", filepath.Base(exe))
@@ -551,7 +554,7 @@ func StartDetached(exe string, args []string, dir string) error {
 	si := windows.StartupInfo{}
 	si.Cb = uint32(unsafe.Sizeof(si))
 	var pi windows.ProcessInformation
-	flags := uint32(windows.CREATE_UNICODE_ENVIRONMENT | windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_BREAKAWAY_FROM_JOB)
+	flags := uint32(windows.CREATE_UNICODE_ENVIRONMENT | windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_BREAKAWAY_FROM_JOB | windows.NORMAL_PRIORITY_CLASS)
 	err = windows.CreateProcess(exePtr, cmdPtr, nil, nil, false, flags, nil, dirPtr, &si, &pi)
 	if err != nil {
 		// Breaking away is refused when this program itself runs inside a

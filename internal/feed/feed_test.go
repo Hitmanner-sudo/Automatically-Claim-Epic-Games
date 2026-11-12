@@ -347,3 +347,47 @@ func TestEpicsClockIsUsedWhenThePCsIsFarOff(t *testing.T) {
 		t.Fatalf("cached answer: skew %v, %v", snap.ClockSkew, err)
 	}
 }
+
+func TestBackendFailureIsNotTakenForAnUnknownCountry(t *testing.T) {
+	// Epic answers HTTP 200 with an error document both for a country it
+	// does not know (status 400: asking again is pointless, the US list is
+	// used) and when its own catalogue service fails for a moment (which
+	// passes: ask again, and do not switch countries).
+	unknown := `{"errors":[{"message":"CatalogQuery/searchStore: Request failed with status code 400","status":400,"serviceResponse":"{\"errorCode\":\"errors.com.epicgames.catalog.invalid_country_code\"}"}],"data":{"Catalog":{"searchStore":null}}}`
+	hiccup := `{"errors":[{"message":"CatalogQuery/searchStore: Request failed with status code 503","status":503}],"data":{"Catalog":{"searchStore":null}}}`
+	var asked []string
+	fail := 1
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c := r.URL.Query().Get("country")
+		asked = append(asked, c)
+		switch {
+		case c == "ZZ":
+			_, _ = w.Write([]byte(unknown))
+		case fail > 0:
+			fail--
+			_, _ = w.Write([]byte(hiccup))
+		default:
+			_, _ = w.Write(loadReal(t))
+		}
+	}))
+	defer srv.Close()
+	c := &Client{Endpoint: srv.URL, Pause: time.Millisecond}
+	at := mustTime(t, "2026-11-12T04:00:00Z")
+
+	snap, err := c.Fetch(context.Background(), "DE", "", at)
+	if err != nil || snap.Country != "DE" || len(snap.FreeNow) != 2 {
+		t.Fatalf("after a hiccup: country %q, %d free, %v (asked: %v)", snap.Country, len(snap.FreeNow), err, asked)
+	}
+	if len(asked) != 2 || asked[0] != "DE" || asked[1] != "DE" {
+		t.Fatalf("requests = %v, want the same country asked again", asked)
+	}
+
+	asked = nil
+	snap, err = c.Fetch(context.Background(), "ZZ", "", at)
+	if err != nil || snap.Country != "US" {
+		t.Fatalf("unknown country: %q, %v", snap.Country, err)
+	}
+	if len(asked) != 2 || asked[0] != "ZZ" || asked[1] != "US" {
+		t.Fatalf("requests = %v, want one refusal and then the US list", asked)
+	}
+}

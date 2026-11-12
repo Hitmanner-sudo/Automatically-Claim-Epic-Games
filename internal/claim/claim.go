@@ -890,8 +890,12 @@ func (s *Session) Claim(ctx context.Context, o feed.Offer) Result {
 
 var (
 	reCaptchaText = regexp.MustCompile(`(?i)captcha|security check|human`)
-	reOwnedText   = regexp.MustCompile(`(?i)already own`)
-	reRegionText  = regexp.MustCompile(`(?i)unavailable in your region|not available in your (region|country)`)
+	// "purchase_limit_error" is what Epic's order service answers when the
+	// account has the item already (seen on a real account, together with
+	// the page's notice "Sorry, you already own this item, or it's still
+	// being processed.").
+	reOwnedText  = regexp.MustCompile(`(?i)already own|purchase_limit`)
+	reRegionText = regexp.MustCompile(`(?i)unavailable in your region|not available in your (region|country)`)
 )
 
 func classifyError(msg string) (Outcome, bool) {
@@ -1178,6 +1182,9 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 			return Result{Claimed, "order confirmed by Epic"}, last, false
 		} else if msg != "" {
 			if oc, known := classifyError(msg); known {
+				if oc == Owned {
+					return Result{Owned, "Epic says the account has this already (" + msg + ")"}, last, false
+				}
 				return Result{oc, msg}, last, false
 			}
 			return Result{Failed, "Epic rejected the order: " + msg}, last, false

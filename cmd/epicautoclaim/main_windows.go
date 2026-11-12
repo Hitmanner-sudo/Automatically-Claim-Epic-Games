@@ -273,14 +273,23 @@ func registerTask(p paths, cfg config.Config) (sched.Spec, error) {
 	}
 	err = sched.Register(spec)
 	if err != nil && spec.UTC {
-		local := dailySlot(cfg)(time.Now()).Local()
-		alt := spec
-		alt.Hour, alt.Minute, alt.UTC = local.Hour(), local.Minute(), false
-		if sched.Register(alt) == nil {
+		if alt := localSpec(spec, cfg); sched.Register(alt) == nil {
 			return alt, nil
 		}
 	}
 	return spec, err
+}
+
+// localSpec is a task given in UTC restated as the same moment in this PC's
+// local time (it then moves by an hour with daylight saving time, which is
+// better than no task).
+func localSpec(spec sched.Spec, cfg config.Config) sched.Spec {
+	if !spec.UTC {
+		return spec
+	}
+	local := dailySlot(cfg)(time.Now()).Local()
+	spec.Hour, spec.Minute, spec.UTC = local.Hour(), local.Minute(), false
+	return spec
 }
 
 // taskName is the name of this user's daily task ("" if it cannot be told).
@@ -372,14 +381,20 @@ func cmdRun(a *app, scheduled bool, afterPID uint32) int {
 	opt := daemon.RunOptions{Settle: settle}
 	if scheduled {
 		opt.ExitWhenIdleFor = idleExit
-		keepTaskCurrent(a)
 	}
 	due := d.Due()
 	if wait := time.Until(due); scheduled && wait > idleExit {
-		// The usual case when Windows starts it and everything is done:
-		// say so in one line and leave.
-		a.log.Printf("%s %s: nothing to do before %s", appName, version, due.Local().Format("Mon 2 Jan 15:04"))
+		// The usual case: Windows starts the program every hour, and
+		// nearly always there is nothing to do. It leaves at once, and
+		// says so in the log no more than once a day.
+		if noted := a.st.Schedule().IdleNoted; time.Since(noted) > 23*time.Hour || time.Since(noted) < 0 {
+			a.log.Printf("%s %s: nothing to do before %s", appName, version, due.Local().Format("Mon 2 Jan 15:04"))
+			_ = a.st.SetSchedule(func(sc *state.Schedule) { sc.IdleNoted = time.Now() })
+		}
 		return 0
+	}
+	if scheduled {
+		keepTaskCurrent(a)
 	}
 	a.log.Printf("%s %s started%s; country %s; daily at %s; next round %s", appName, version, mode, country(a.cfg), slotLocal(a.cfg), describeDue(due))
 	d.Run(ctx, opt)
@@ -399,6 +414,9 @@ func describeDue(due time.Time) string {
 // location. Windows has just started the program through that task, so it
 // exists; if it cannot be read, it is left alone.
 func keepTaskCurrent(a *app) {
+	if a.cfgErr != nil {
+		return // the settings could not be read: do not act on guesses
+	}
 	spec, err := taskSpec(a.p, a.cfg)
 	if err != nil {
 		return
@@ -407,9 +425,13 @@ func keepTaskCurrent(a *app) {
 	if def == "" {
 		return
 	}
-	want := fmt.Sprintf("T%02d:%02d:00", spec.Hour, spec.Minute)
-	if strings.Contains(def, want) && strings.Contains(strings.ToLower(def), strings.ToLower(a.p.exe)) {
+	// The task carries a marker saying what it was registered for (time of
+	// day, UTC or local, program location, layout of the definition).
+	if strings.Contains(def, spec.Marker()) {
 		return
+	}
+	if local := localSpec(spec, a.cfg); strings.Contains(def, local.Marker()) {
+		return // registered in local time because Windows would not take UTC
 	}
 	if got, err := registerTask(a.p, a.cfg); err != nil {
 		a.log.Printf("the daily task could not be brought in line with the settings: %v", err)
@@ -452,9 +474,14 @@ func cmdOnce(a *app, args []string) int {
 	// ends (even if this window is closed half-way through): its successor
 	// is started as soon as the old one has been told to stop, and waits
 	// for this process to end.
+	// (With the daily task there is normally no background process between
+	// rounds. One is started all the same when the program is installed, so
+	// that what this run leaves due is taken up at its time and not only at
+	// the next daily start; it ends by itself if nothing is due for hours.)
+	installed := wasRunning || autostartValue() != "" || (taskName() != "" && sched.Exists(taskName()))
 	successorStarted := false
 	startSuccessor := func() {
-		if !wasRunning || successorStarted {
+		if !installed || successorStarted {
 			return
 		}
 		successorStarted = true
@@ -505,6 +532,7 @@ func cmdOnce(a *app, args []string) int {
 		}
 	}
 	next := d.Tick(ctx)
+	releasedByTrial := false
 	for key, cur := range a.st.All() {
 		if cur.Status.Done() {
 			continue
@@ -520,7 +548,12 @@ func cmdOnce(a *app, args []string) int {
 			// background process may claim this as soon as it looks. (What
 			// the trial ran into, a CAPTCHA for instance, keeps its wait.)
 			_ = a.st.Update(key, func(e *state.Entry) { e.NextAttempt = time.Time{} })
+			releasedByTrial = true
 		}
+	}
+	if releasedByTrial && ctx.Err() == nil {
+		// ...and it looks soon, not at the next daily time.
+		_ = a.st.SetSchedule(func(sc *state.Schedule) { sc.NextDue = time.Now().Add(time.Minute) })
 	}
 	switch {
 	case ctx.Err() != nil:

@@ -1397,3 +1397,34 @@ func TestStorePageWithItsCheckoutInsideThePage(t *testing.T) {
 		t.Fatalf("other offer: orders = %d", n)
 	}
 }
+
+// ---- what Epic's real checkout was seen to do on a signed-in launcher (November 2026)
+
+func TestRealFreeCheckoutFlowOf2026(t *testing.T) {
+	// The page: "Checkout", the game, "$0.00", "This is free. Add it to
+	// your library to get started.", one button "Add to library". Behind
+	// it: an order preview and the order itself under /v2/purchase/.
+	r := runScenario(t, scenario{SignedIn: true, NewLayout: true, Real2026: true, GraphQLDown: true}, nil)
+	wantOutcome(t, r, Claimed, 1)
+	if !strings.Contains(r.res.Detail, "confirmed by Epic") {
+		t.Errorf("detail = %q", r.res.Detail)
+	}
+	if !strings.Contains(r.store.lastOrder(), `"totalAmount":0`) {
+		t.Errorf("order = %s", r.store.lastOrder())
+	}
+}
+
+func TestPurchaseLimitAnswerMeansAlreadyOwned(t *testing.T) {
+	// A free-to-play game the account has already: the checkout looks like
+	// any other, and only the order itself is answered with HTTP 404 and
+	// "purchase_limit_error" (the page then says "Sorry, you already own
+	// this item, or it's still being processed."). That settles it: it is
+	// not a failure to be tried again.
+	r := runScenario(t, scenario{SignedIn: true, NewLayout: true, Real2026: true, GraphQLDown: true,
+		ConfirmStatus: 404,
+		ConfirmRaw:    `{"errorCode":"errors.com.epicgames.ecommerce.orderprocessor.purchase_limit_error","errorMessage":"Sorry, you already own this item, or it's still being processed.","numericErrorCode":20203,"correlationId":"x"}`}, nil)
+	wantOutcome(t, r, Owned, 1)
+	if !strings.Contains(r.res.Detail, "already") {
+		t.Errorf("detail = %q", r.res.Detail)
+	}
+}
