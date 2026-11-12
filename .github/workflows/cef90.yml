@@ -18,7 +18,7 @@ jobs:
   cef90:
     name: Stand-in store in the launcher's Chromium 90
     runs-on: windows-latest
-    timeout-minutes: 50
+    timeout-minutes: 80
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -26,7 +26,11 @@ jobs:
           go-version-file: go.mod
       - name: Build
         shell: pwsh
-        run: go build -trimpath -ldflags "-X main.version=cef90" -o "$env:RUNNER_TEMP/eac-console.exe" ./cmd/epicautoclaim
+        run: |
+          go build -trimpath -ldflags "-X main.version=cef90" -o "$env:RUNNER_TEMP/eac-console.exe" ./cmd/epicautoclaim
+          # The tests are built before the launcher is started: without a
+          # graphics card it keeps the runner's processors busy.
+          go test -c -o "$env:RUNNER_TEMP/claim.test.exe" ./internal/claim/
       - name: Install the Epic Games Launcher
         shell: pwsh
         run: |
@@ -75,10 +79,13 @@ jobs:
             Invoke-RestMethod "$base/json/list" -TimeoutSec 30 | Select-Object type, title, url | Format-Table -AutoSize -Wrap
             try { Invoke-RestMethod "$base/json/version" -TimeoutSec 30 | Format-List } catch { "no /json/version: $($_.Exception.Message)" }
             $env:CDP_BASE = $base
-            $only = 'TestClaimsFreeOffer|TestRealFreeCheckoutFlowOf2026|TestDryRunPlacesNoOrder|TestFrameFromAnotherSite|TestFrameCreatedAtTheClick|TestWorkersCannot|TestServiceWorker|TestPaidTotalOnPage|TestOrderRequestWithPaidTotal|TestConsentDialog|TestNewCheckoutLayout|TestCoveredButton|TestPurchaseLimit|TestOrderButtonIsPressedOnce'
-            go test ./internal/claim/ -run $only -count=1 -timeout 25m -v 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\cef90.txt" | Select-String -Pattern '^(--- |FAIL|ok|PASS|panic)' | ForEach-Object { $_.Line }
+            Push-Location internal/claim
+            & "$env:RUNNER_TEMP/claim.test.exe" '-test.v' '-test.count=1' '-test.timeout=55m' 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\cef90.txt" | Select-String -Pattern '^(--- |FAIL|ok|PASS|panic)' | ForEach-Object { $_.Line }
             $code = $LASTEXITCODE
-            if ($code -ne 0) { '--- everything the tests said'; Get-Content "$env:RUNNER_TEMP\cef90.txt" | Select-Object -First 900 }
+            Pop-Location
+            $all = Get-Content "$env:RUNNER_TEMP\cef90.txt"
+            "passed: $(($all | Select-String -Pattern '^--- PASS').Count); failed: $(($all | Select-String -Pattern '^--- FAIL').Count); skipped: $(($all | Select-String -Pattern '^--- SKIP').Count)"
+            if ($code -ne 0) { '--- everything the tests said'; $all | Select-Object -First 1500 }
           } finally {
             Get-CimInstance Win32_Process | Where-Object { $_.Name -in 'EpicGamesLauncher.exe', 'EpicWebHelper.exe' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
           }
