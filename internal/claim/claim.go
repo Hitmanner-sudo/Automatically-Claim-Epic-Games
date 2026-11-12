@@ -39,6 +39,9 @@ const (
 	Captcha Outcome = "captcha"
 	// Throttled: Epic says the account must wait before claiming more.
 	Throttled Outcome = "throttled"
+	// Later: not possible right now, though it may be in a day (a base game
+	// is missing from the library, the page says "coming soon").
+	Later Outcome = "later"
 	// NotSignedIn: the launcher (or its web session) is signed out.
 	NotSignedIn Outcome = "not-signed-in"
 	// NotFree: the checkout showed a price above zero. Nothing was ordered.
@@ -94,6 +97,8 @@ type Options struct {
 	// to pass by itself.
 	BrowserCheckWait time.Duration
 
+	StorePageWait time.Duration // for "Get" on a store page to open a checkout
+
 	UIWait       time.Duration // for the launcher's interface to come up
 	LoginGrace   time.Duration // how long a lone sign-in page is tolerated
 	SettleWait   time.Duration // how long to hold out for an Epic web page
@@ -129,6 +134,9 @@ func (o *Options) fill() {
 	}
 	if o.CheckoutWait == 0 {
 		o.CheckoutWait = 50 * time.Second
+	}
+	if o.StorePageWait == 0 {
+		o.StorePageWait = 90 * time.Second
 	}
 	if o.BrowserCheckWait == 0 {
 		o.BrowserCheckWait = 150 * time.Second
@@ -260,17 +268,23 @@ type tab struct {
 	id   string
 	page *cdp.Page
 	done chan struct{}
+	// swBypassed: the browser was told to keep service workers out of this
+	// page's network traffic, so that every request is seen here.
+	swBypassed bool
 }
 
 // fetchPatterns select the requests that pass through this program before
 // they leave the browser (see orderWatch).
 func fetchPatterns() []map[string]any {
 	patterns := []map[string]any{}
+	// On the way out: everything a script, a form or a navigation sends,
+	// whatever its address, so that no order can leave unseen.
+	for _, kind := range []string{"XHR", "Fetch", "Document", "Ping", "Other"} {
+		patterns = append(patterns, map[string]any{"urlPattern": "*", "resourceType": kind, "requestStage": "Request"})
+	}
+	// On the way back: the replies to order previews and submissions.
 	for _, p := range []string{"*order*", "*Order*", "*checkout*", "*purchase*"} {
-		patterns = append(patterns,
-			map[string]any{"urlPattern": p, "requestStage": "Request"},
-			map[string]any{"urlPattern": p, "requestStage": "Response"},
-		)
+		patterns = append(patterns, map[string]any{"urlPattern": p, "requestStage": "Response"})
 	}
 	return patterns
 }
@@ -296,6 +310,12 @@ func (s *Session) attach(ctx context.Context, t cdp.Target) (*tab, error) {
 		<-nt.done
 		return nil, fmt.Errorf("cannot supervise the checkout's network requests, so nothing will be ordered: %w", err)
 	}
+	// A service worker would relay the page's requests from outside this
+	// supervision. Ask the browser to leave it out; if it will not, the
+	// order button is not pressed on a page a service worker controls.
+	if err := page.Call(pctx, "Network.enable", nil, nil); err == nil {
+		nt.swBypassed = page.Call(pctx, "Network.setBypassServiceWorker", map[string]any{"bypass": true}, nil) == nil
+	}
 	s.mu.Lock()
 	s.tabs = append(s.tabs, nt)
 	s.mu.Unlock()
@@ -313,18 +333,61 @@ func (s *Session) attached(id string) *tab {
 	return nil
 }
 
+// blank takes whatever is loaded off a page. A checkout must not stay open
+// (free to retry a request on its own) once nobody supervises it any more.
+func blank(page *cdp.Page) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	_ = page.Navigate(ctx, "about:blank")
+}
+
 // goHome drops every page adopted along the way and returns to the page the
 // session started on.
 func (s *Session) goHome() {
 	s.mu.Lock()
-	extra := append([]*tab(nil), s.tabs[1:]...)
-	s.tabs = s.tabs[:1]
+	var extra []*tab
+	if len(s.tabs) > 1 {
+		extra = append(extra, s.tabs[1:]...)
+		s.tabs = s.tabs[:1]
+	}
 	s.mu.Unlock()
 	for _, t := range extra {
+		blank(t.page)
 		_ = t.page.Close()
 		<-t.done
 	}
-	s.page = s.home.page
+	if s.home != nil {
+		s.page = s.home.page
+	}
+}
+
+// currentTab is the attached page being driven.
+func (s *Session) currentTab() *tab {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, t := range s.tabs {
+		if t.page == s.page {
+			return t
+		}
+	}
+	return nil
+}
+
+// superviseFrames puts the frames that run in processes of their own
+// (frames from other sites) under the same request supervision as the page.
+func (s *Session) superviseFrames(ctx context.Context) {
+	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	targets, err := cdp.Targets(tctx, s.base)
+	cancel()
+	if err != nil {
+		return
+	}
+	for _, t := range targets {
+		if t.Type != "iframe" || t.WebSocketDebuggerURL == "" || s.attached(t.ID) != nil {
+			continue
+		}
+		_, _ = s.attach(ctx, t)
+	}
 }
 
 // isCheckoutURL reports whether an address is one of Epic's checkout pages.
@@ -361,9 +424,7 @@ func (s *Session) targetIDs(ctx context.Context) map[string]bool {
 
 // adoptCheckout looks for a checkout window the launcher has opened by
 // itself (it does so when its store asks for a purchase) and, if there is
-// one for this offer, continues there. known holds the pages that existed
-// before; a page from an earlier attempt is only taken if it shows this
-// very offer.
+// one whose address names this offer, continues there.
 func (s *Session) adoptCheckout(ctx context.Context, o feed.Offer, known map[string]bool) bool {
 	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	targets, err := cdp.Targets(tctx, s.base)
@@ -375,7 +436,9 @@ func (s *Session) adoptCheckout(ctx context.Context, o feed.Offer, known map[str
 		if t.Type != "page" || t.WebSocketDebuggerURL == "" || s.attached(t.ID) != nil || !isCheckoutURL(t.URL, s.opt.CheckoutBases) {
 			continue
 		}
-		if known[t.ID] && !strings.Contains(t.URL, o.OfferID) {
+		// Only a window that shows this very offer: what is ordered in it
+		// is recorded for this giveaway.
+		if !strings.Contains(t.URL, o.OfferID) {
 			continue
 		}
 		nt, err := s.attach(ctx, t)
@@ -480,6 +543,9 @@ func (s *Session) Close() {
 	s.tabs = nil
 	s.mu.Unlock()
 	for _, t := range tabs {
+		if t.id != "" {
+			blank(t.page)
+		}
 		_ = t.page.Close()
 		<-t.done
 	}
@@ -554,9 +620,13 @@ func (s *Session) answer(page *cdp.Page, p pausedRequest) {
 		return
 	}
 
-	allow := true
+	var allow bool
 	if w != nil {
 		allow = w.onRequest(p.Request.Method, p.Request.URL, p.Request.PostData, p.Request.HasPostData)
+	} else {
+		// No claim is in progress, so nothing should be ordering. A page
+		// left over from one must not get an order out on its own.
+		allow = !mayPlaceOrder(p.Request.Method, p.Request.URL, p.Request.PostData)
 	}
 	if allow {
 		_ = page.Call(ctx, "Fetch.continueRequest", id, nil)
@@ -755,10 +825,14 @@ func (s *Session) Claim(ctx context.Context, o feed.Offer) Result {
 
 	w := newOrderWatch(s.opt.DryRun)
 	s.setWatch(w)
-	defer s.setWatch(nil)
-	// Whatever window the launcher opens for this offer is left behind
-	// afterwards; the next offer starts from the first page again.
-	defer s.goHome()
+	defer func() {
+		// Whatever window the launcher opened for this offer is left
+		// behind, and every checkout is taken off the screen, before this
+		// claim's supervision of the network ends.
+		s.goHome()
+		blank(s.home.page)
+		s.setWatch(nil)
+	}()
 
 	// 1. Open Epic's checkout for the offer directly, at each of the
 	//    addresses it is served under.
@@ -833,8 +907,16 @@ func (s *Session) checkout(ctx context.Context, o feed.Offer, w *orderWatch, add
 
 // priceEvidence weighs everything a checkout page and its network traffic
 // say about the total of the order.
+//
+// Free needs a statement of the total itself: the checkout's own total line,
+// Epic's order preview, or (on the 2026 free checkout, which has no total
+// line) the page showing no amount other than zero. Paid is anything that
+// states a total above zero, and it outweighs everything.
 func priceEvidence(st pageState, w *orderWatch) (Verdict, []string) {
 	var evidence []string
+	if w.sawPaid() {
+		return Paid, []string{"a total above zero was seen on the network"}
+	}
 	dom := Unknown
 	for _, t := range st.Totals {
 		v := JudgeTotalText(t)
@@ -843,32 +925,43 @@ func priceEvidence(st pageState, w *orderWatch) (Verdict, []string) {
 			evidence = append(evidence, fmt.Sprintf("page shows %q (%v)", t, v))
 		}
 	}
+	// The data a page was built from can only speak against an order: a
+	// zero under some key named "total" may be anything.
 	preload := Unknown
 	if st.Preload != "" {
-		var facts []PriceFact
-		preload, facts = JudgeJSON([]byte(st.Preload))
-		if preload != Unknown {
-			evidence = append(evidence, fmt.Sprintf("page data totals %v (%v)", facts, preload))
+		if v, facts := JudgeJSON([]byte(st.Preload)); v == Paid {
+			preload = Paid
+			evidence = append(evidence, fmt.Sprintf("page data totals %v (%v)", facts, v))
 		}
 	}
 	preview := w.previewVerdict()
 	if preview != Unknown {
 		evidence = append(evidence, fmt.Sprintf("order preview (%v)", preview))
 	}
-	// Epic's newer free checkout has no "total" line: it shows the price
+	// Epic's 2026 free checkout has no "total" line: it shows the price
 	// (zero) and says "This is free".
+	anyZero := false
+	for _, p := range st.Prices {
+		if JudgeTotalText(p) == Free {
+			anyZero = true
+		}
+	}
 	shown := JudgePrices(st.Prices)
 	if shown == Free {
 		evidence = append(evidence, fmt.Sprintf("the only price on the page is %q", st.Prices[0]))
 	}
-	// Epic's sentence "This is free" counts only while no amount above zero
-	// appears anywhere on the page.
+	// The sentence "This is free" only counts next to a visible zero amount.
 	stated := Unknown
-	if st.SaysFree && (len(st.Prices) == 0 || shown == Free) {
+	if st.SaysFree && anyZero {
 		stated = Free
 		evidence = append(evidence, "the page says it is free")
 	}
-	return Combine(dom, preload, preview, shown, stated), evidence
+	v := Combine(dom, preload, preview, shown, stated)
+	if v == Free && len(st.Prices) > 0 && !anyZero {
+		// Amounts are on the page and none of them is zero.
+		return Unknown, evidence
+	}
+	return v, evidence
 }
 
 // order takes it from a checkout that is loading (in the current page, or
@@ -929,7 +1022,14 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 			}
 			if st.Place.clickable() && !st.BrowserCheck {
 				sawButton = true
+				if st.SW {
+					if t := s.currentTab(); t == nil || !t.swBypassed {
+						return Result{Failed, "the checkout is run through a service worker that this program cannot look into; nothing was ordered"}, last, false
+					}
+				}
 				if !ownChecked {
+					// Frames from other sites get the same supervision.
+					s.superviseFrames(ctx)
 					// What does the account already have? (Asked once; it
 					// takes a moment, so the page is read afresh afterwards.)
 					ownChecked = true
@@ -937,7 +1037,7 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 					case ownYes:
 						return Result{Owned, "already in the library"}, last, false
 					case ownBlocked:
-						return Result{Unavailable, "the store says this account cannot get the offer (a required base game is missing, or it conflicts with something owned)"}, last, false
+						return Result{Later, "the store says this account cannot get the offer right now (a required base game is missing, or it conflicts with something owned)"}, last, false
 					}
 					continue
 				}
@@ -1019,16 +1119,28 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 	clicks := 1
 	deadline = time.Now().Add(s.opt.OrderWait)
 	var lastConsent, lastOwnCheck, errSeen, thanksSince time.Time
+	lastFrames := time.Now()
 	var errText string
 	for {
 		if ctx.Err() != nil {
 			return Result{Failed, "interrupted after the order button was pressed; the library will be checked next time"}, last, false
+		}
+		// Frames that appear only now are put under supervision as well.
+		if time.Since(lastFrames) > time.Second {
+			lastFrames = time.Now()
+			s.superviseFrames(ctx)
 		}
 		if reason := w.blockedReason(); reason != "" {
 			if w.sawPaid() {
 				return Result{NotFree, reason}, last, false
 			}
 			return Result{Failed, reason}, last, false
+		}
+		if w.sawPaid() {
+			// A total above zero turned up after the press (a re-priced
+			// preview, for instance). Nothing more is pressed, and the
+			// network watch refuses any order from here on.
+			return Result{NotFree, "a total above zero appeared after the order button was pressed; nothing further was done and no order was let out"}, last, false
 		}
 		if ok, msg := w.confirmation(); ok {
 			return Result{Claimed, "order confirmed by Epic"}, last, false
@@ -1073,9 +1185,14 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 			}
 			if st.Consent.clickable() && time.Since(lastConsent) > 2*time.Second {
 				// EU/UK accounts must confirm they waive the withdrawal
-				// period before the order is accepted.
-				lastConsent = time.Now()
-				_ = s.click(ctx, st.Consent)
+				// period before the order is accepted. Pressed only while
+				// nothing speaks of a price above zero.
+				if v, _ := priceEvidence(st, w); v != Paid {
+					lastConsent = time.Now()
+					_ = s.click(ctx, st.Consent)
+				} else {
+					return Result{NotFree, "the checkout showed a total above zero before the final confirmation; nothing was confirmed"}, last, false
+				}
 			}
 			if len(st.Errors) > 0 {
 				if errSeen.IsZero() || st.Errors[0] != errText {

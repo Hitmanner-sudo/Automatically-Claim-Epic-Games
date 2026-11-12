@@ -11,7 +11,9 @@ import (
 // inspectJS reports the state of whatever page is showing, with emphasis on
 // Epic's checkout ("purchase app"). It only reads; it changes nothing.
 const inspectJS = `(function () {
-  function text(el) { return ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim(); }
+  // innerText is what is rendered; textContent would also return the text
+  // of inline scripts and data, which says nothing about what is on screen.
+  function text(el) { return ((el && (typeof el.innerText === 'string' ? el.innerText : el.textContent)) || '').replace(/\s+/g, ' ').trim(); }
   function box(el) { var r = el.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height }; }
   function shown(el, min) {
     if (!el) return false;
@@ -109,7 +111,7 @@ const inspectJS = `(function () {
   if (/select all (images|squares)/i.test(body)) out.captcha = true;
   out.throttled = /unable to download any more free games|wait 24 hours before trying to redeem/i.test(body);
 
-  out.pin = !!scope.querySelector('.payment-pin-code, [class*="pin-code"]');
+  out.pin = shown(scope.querySelector('.payment-pin-code, [class*="pin-code"]'), 8);
 
   out.errors = [];
   var errs = scope.querySelectorAll('.payment__errors, [class*="payment-alert--ERROR"], [class*="alert--error"], [class*="alert--ERROR"], [role="alert"]');
@@ -118,28 +120,39 @@ const inspectJS = `(function () {
     if (t && shown(errs[e], 2)) out.errors.push(t.slice(0, 300));
   }
 
-  // What the buyer is shown as the total.
-  out.totals = [];
-  var tot = scope.querySelectorAll('[class*="total" i]');
-  for (var m = 0; m < tot.length && out.totals.length < 12; m++) {
-    if (!shown(tot[m], 2)) continue;
-    if (tot[m].querySelector('[class*="total" i]')) continue; // keep the innermost only
-    var tt = text(tot[m]);
-    if (tt && tt.length < 120) out.totals.push(tt);
-  }
-
   // Every amount of money mentioned on the page. A number only counts when
   // a currency sign or code stands next to it ("over 18" is not a price).
   out.prices = [];
-  var CUR = '(?:R\\$|[$\u20ac\u00a3\u00a5\u20b9\u20bd\u20a9\u20ba\u20b4\u20ab\u0e3f\u20aa]|z\u0142|K\u010d|kr|Ft|lei|TL|' +
-    'USD|EUR|GBP|CAD|AUD|NZD|BRL|RUB|TRY|PLN|JPY|KRW|INR|CNY|MXN|ARS|CLP|COP|PEN|UAH|KZT|CHF|SEK|NOK|DKK|CZK|HUF|RON|BGN|ILS|SAR|AED|QAR|ZAR|THB|IDR|MYR|PHP|SGD|HKD|TWD|VND)';
+  var CUR = '(?:[A-Z]{0,3}\\$|[\u20ac\u00a3\u00a5\u20b9\u20bd\u20a9\u20ba\u20b4\u20ab\u0e3f\u20aa\u20b1\u20a6\u20b2\u20a1\u20b8\u20bc\u20be\u20ae\u20ad\u17db\ufdfc]|z\u0142|K\u010d|kr|Ft|lei|TL|RM|Rp|S\\/|\u043b\u0432|' +
+    'USD|EUR|GBP|CAD|AUD|NZD|BRL|RUB|TRY|PLN|JPY|KRW|INR|CNY|MXN|ARS|CLP|COP|PEN|UAH|KZT|CHF|SEK|NOK|DKK|CZK|HUF|RON|BGN|ILS|SAR|AED|QAR|KWD|ZAR|THB|IDR|MYR|PHP|SGD|HKD|TWD|VND|UYU|CRC|GEL)';
   var NUM = '\\d{1,3}(?:[ .,\u00a0\u202f]\\d{3})+(?:[.,]\\d{1,2})?|\\d+(?:[.,]\\d{1,2})?';
-  var priceRe = new RegExp('(?:^|[^A-Za-z0-9])(' + CUR + '\\s?-?(?:' + NUM + ')|-?(?:' + NUM + ')\\s?' + CUR + ')(?![A-Za-z0-9])', 'g');
-  var checkoutText = app && app.innerText ? text(app) : body;
+  var PRICE = '(?:^|[^A-Za-z0-9])(' + CUR + '\\s?-?(?:' + NUM + ')|-?(?:' + NUM + ')\\s?' + CUR + ')(?![A-Za-z0-9])';
+  var checkoutText = app && typeof app.innerText === 'string' && app.innerText ? text(app) : body;
+  var priceRe = new RegExp(PRICE, 'g');
   var pm;
   while ((pm = priceRe.exec(checkoutText)) && out.prices.length < 40) out.prices.push(pm[1]);
   // Epic's own statement on the free checkout.
   out.saysFree = /\bthis (game |product |item |add-on |bundle )?is free\b/i.test(checkoutText);
+
+  // What the buyer is shown as the total: an element whose class names it
+  // ("total" as a word of its own, so not "subtotal") and whose text is an
+  // amount of money or a word for free.
+  out.totals = [];
+  var hasMoney = new RegExp(PRICE);
+  var freeWord = /\b(free|gratis|gratuit|kostenlos)\b/i;
+  var tot = scope.querySelectorAll('[class*="total" i]');
+  for (var m = 0; m < tot.length && out.totals.length < 12; m++) {
+    if (!/(^|[\s_-])total([\s_-]|$)/i.test(cls(tot[m]))) continue;
+    if (!shown(tot[m], 2)) continue;
+    if (tot[m].querySelector('[class*="total" i]')) continue; // keep the innermost only
+    var tt = text(tot[m]);
+    if (tt && tt.length < 120 && (hasMoney.test(tt) || freeWord.test(tt))) out.totals.push(tt);
+  }
+
+  // A service worker in control of the page could relay requests out of
+  // this program's sight.
+  out.sw = false;
+  try { out.sw = !!(navigator.serviceWorker && navigator.serviceWorker.controller); } catch (errSw) {}
 
   var pre = null;
   try { pre = window.__epic_web_purchase_dataPreload; } catch (err) {}
@@ -171,6 +184,7 @@ type pageState struct {
 	Totals       []string `json:"totals"`
 	Prices       []string `json:"prices"`
 	SaysFree     bool     `json:"saysFree"`
+	SW           bool     `json:"sw"`
 	Throttled    bool     `json:"throttled"`
 	Preload      string   `json:"preload"`
 	Success      bool     `json:"success"`

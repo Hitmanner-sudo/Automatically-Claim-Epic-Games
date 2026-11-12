@@ -669,6 +669,23 @@ func (s *StopSignal) Wait() {
 // Close releases the handle.
 func (s *StopSignal) Close() { _ = windows.CloseHandle(s.h) }
 
+// WaitExitOrStop blocks until the process with the given id has ended or the
+// stop flag is raised, whichever comes first. It reports whether it was the
+// stop flag. A process that cannot be opened is taken to have ended already.
+func WaitExitOrStop(pid uint32, stop *StopSignal) (stopped bool) {
+	h, err := windows.OpenProcess(windows.SYNCHRONIZE, false, pid)
+	if err != nil || h == 0 {
+		return false
+	}
+	defer windows.CloseHandle(h)
+	handles := []windows.Handle{h}
+	if stop != nil {
+		handles = append(handles, stop.h)
+	}
+	ev, err := windows.WaitForMultipleObjects(handles, false, windows.INFINITE)
+	return err == nil && ev == windows.WAIT_OBJECT_0+1
+}
+
 // RaiseStopSignal raises the flag if a process is listening for it. It
 // reports whether there was one.
 func RaiseStopSignal(name string) bool {

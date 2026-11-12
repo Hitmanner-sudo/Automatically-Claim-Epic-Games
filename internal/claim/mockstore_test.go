@@ -44,8 +44,16 @@ type scenario struct {
 	// DirectBlocked makes the checkout refuse to open unless it is reached
 	// from the store page (as when only the launcher's own flow works).
 	DirectBlocked bool   `json:"directBlocked"`
-	ProductLabel  string `json:"productLabel"` // the store page's main button (default "Get")
-	ProductGate   bool   `json:"productGate"`  // a "Continue" notice covers the store page first
+	ProductLabel  string `json:"productLabel"`  // the store page's main button (default "Get")
+	ProductGate   bool   `json:"productGate"`   // a "Continue" notice covers the store page first
+	SubmitPath    string `json:"submitPath"`    // where the 2026 layout sends its order (default /checkout/api/complete)
+	FrameOrder    bool   `json:"frameOrder"`    // the order is sent by a frame from another site
+	FrameOrigin   string `json:"frameOrigin"`   // that frame's origin (filled in by the store)
+	RetryOnError  bool   `json:"retryOnError"`  // the page re-sends a failed order by itself
+	ServiceWorker bool   `json:"serviceWorker"` // a service worker relays the page's requests
+	ExtraHTML     string `json:"-"`             // added to the checkout page
+	ProductExtra  string `json:"-"`             // added to the store page
+	ProductOpens  string `json:"-"`             // offer the store page's button opens (default 1-ns-id)
 	// ChallengeFor makes the checkout answer with a Cloudflare-style
 	// "One more step" page for this long before the real page is served
 	// (the challenge page reloads itself, as the real one does).
@@ -69,6 +77,7 @@ type mockStore struct {
 	// lastOffers is the offers parameter of the last checkout opened.
 	lastOffers string
 	firstHit   time.Time
+	hits       []string // what pages reported through /hit
 }
 
 var mockSeq int
@@ -80,6 +89,37 @@ func newMockStore(t *testing.T, sc scenario) *mockStore {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/purchase", m.handleCheckout)
 	mux.HandleFunc("/store/product/", m.handleProduct)
+	mux.HandleFunc("/sw.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		_, _ = io.WriteString(w, `self.addEventListener('install', function (e) { self.skipWaiting(); });
+self.addEventListener('activate', function (e) { e.waitUntil(self.clients.claim()); });
+self.addEventListener('fetch', function (e) { e.respondWith(fetch(e.request)); });`)
+	})
+	mux.HandleFunc("/api/v9/acquire", m.handleConfirm)
+	mux.HandleFunc("/payframe", func(w http.ResponseWriter, r *http.Request) {
+		// A frame from another site that sends the order when told to.
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		total := "null"
+		if m.sc.ConfirmTotal != nil {
+			total = fmt.Sprint(*m.sc.ConfirmTotal)
+		}
+		_, _ = io.WriteString(w, `<!doctype html><body><script>
+window.addEventListener('message', function (ev) {
+  if (!ev.data || ev.data.what !== 'order') return;
+  var payload = { offers: ev.data.offers, syncToken: 'tok' };
+  if (`+total+` !== null) payload.totalAmount = `+total+`;
+  fetch('/purchase/confirm-order', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) })
+    .then(function (r) { return r.json(); })
+    .then(function (c) { ev.source.postMessage({ what: 'done', error: c.error ? c.message : '' }, '*'); })
+    .catch(function () { ev.source.postMessage({ what: 'done', error: 'Sorry, there was an error placing your order.' }, '*'); });
+});
+</script></body>`)
+	})
+	mux.HandleFunc("/hit", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		m.hits = append(m.hits, r.URL.Query().Get("what"))
+		m.mu.Unlock()
+	})
 	mux.HandleFunc("/purchase/order-preview", m.handlePreview)
 	mux.HandleFunc("/purchase/confirm-order", m.handleConfirm)
 	mux.HandleFunc("/checkout/api/complete", m.handleConfirm)
@@ -95,6 +135,9 @@ func newMockStore(t *testing.T, sc scenario) *mockStore {
 	})
 	m.srv = httptest.NewServer(mux)
 	t.Cleanup(m.srv.Close)
+	// "localhost" is another site than "127.0.0.1" as far as a browser is
+	// concerned, though it is the same server.
+	m.sc.FrameOrigin = strings.Replace(m.srv.URL, "127.0.0.1", "localhost", 1)
 	return m
 }
 
@@ -245,6 +288,7 @@ func (m *mockStore) handleCheckout(w http.ResponseWriter, r *http.Request) {
 	if m.sc.NewLayout {
 		page = newCheckoutPage
 	}
+	page = strings.ReplaceAll(page, "<!--EXTRA-->", m.sc.ExtraHTML)
 	_, _ = io.WriteString(w, strings.ReplaceAll(page, "__SCENARIO__", string(sc)))
 }
 
@@ -265,6 +309,7 @@ const newCheckoutPage = `<!doctype html><html><head><title>Checkout</title>
   <button class="_btn_q9 _primary_aa" id="go" disabled>Add to library</button>
   <p>By selecting 'Add to library', you certify that you are over 18 and an authorized user.</p>
   <div id="extra"></div>
+  <!--EXTRA-->
 </section></div>
 <iframe src="/frame" title="hCaptcha" style="display:none"></iframe>
 <script>
@@ -279,7 +324,7 @@ if (S.throttled) document.getElementById('extra').textContent = 'Your account is
 setTimeout(function () { btn.disabled = false; }, S.slowMs || 0);
 btn.addEventListener('click', function (ev) {
   window.clicks.push({ what: 'place', trusted: ev.isTrusted });
-  fetch('/checkout/api/complete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ purchaseToken: 'tok', offers: offers }) })
+  fetch(S.submitPath || '/checkout/api/complete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ purchaseToken: 'tok', offers: offers }) })
     .then(function (r) { return r.json(); }).then(function (c) {
       if (c.error) document.getElementById('extra').innerHTML = '<div role="alert">' + c.message + '</div>';
       else document.querySelector('section').innerHTML = '<h1>' + (S.german ? 'Alles deins' : "It's all yours") + '</h1><p>Download the Epic Games Launcher to play</p>';
@@ -307,6 +352,7 @@ const checkoutPage = `<!doctype html><html><head><title>Payment by Epic Games</t
     <button class="payment-btn payment-order-confirm__btn payment-btn--primary" disabled><span class="payment-loading payment-loading--loading"></span><span id="place-label">Place Order</span></button>
   </div>
   <div id="extra"></div>
+  <!--EXTRA-->
   <!-- the real checkout always carries invisible captcha frames -->
   <iframe src="/frame" title="hCaptcha" data-hcaptcha-widget-id="x" style="display:none"></iframe>
   <div id="h_captcha_challenge_checkout_free_prod" style="position:absolute;left:0;top:0;width:0;height:0;overflow:hidden"><iframe src="/frame?hcaptcha=challenge" style="width:0;height:0;border:0"></iframe></div>
@@ -331,12 +377,33 @@ function challenge() {
   box.style.cssText = 'position:absolute;left:300px;top:100px;width:400px;height:500px;background:#fff';
   box.querySelector('iframe').style.cssText = 'width:400px;height:500px;border:0';
 }
+var swPending = !!(S.serviceWorker && navigator.serviceWorker && !sessionStorage.getItem('sw'));
+var payFrame = null;
+if (S.frameOrder) {
+  payFrame = document.createElement('iframe');
+  payFrame.id = 'payframe';
+  payFrame.src = S.frameOrigin + '/payframe';
+  payFrame.style.cssText = 'position:absolute;left:0;top:0;width:10px;height:10px;border:0';
+  document.body.appendChild(payFrame);
+  window.addEventListener('message', function (ev) {
+    if (!ev.data || ev.data.what !== 'done') return;
+    if (ev.data.error) fail(ev.data.error);
+    else document.getElementById('purchase-app').innerHTML = '<h1>Thanks for your order!</h1>';
+  });
+}
 function ready() {
+  if (swPending) return; // the page reloads once its service worker is in control
   setTimeout(function () {
     btn.disabled = false;
     var l = btn.querySelector('.payment-loading');
     if (l) l.remove();
   }, S.slowMs || 0);
+}
+if (swPending) {
+  navigator.serviceWorker.register('/sw.js').then(function () { return navigator.serviceWorker.ready; }).then(function () {
+    sessionStorage.setItem('sw', '1');
+    location.reload();
+  });
 }
 if (S.captchaFirst) challenge();
 if (S.noPreview) ready();
@@ -345,6 +412,7 @@ else fetch('/purchase/order-preview', { method: 'POST', headers: { 'content-type
 
 function fail(text) { extra.innerHTML = '<div class="payment__errors">' + text + '</div>'; }
 function send() {
+  if (payFrame) { payFrame.contentWindow.postMessage({ what: 'order', offers: offers }, '*'); return; }
   var payload = { useDefault: true, offers: offers, syncToken: 'tok', includeAccountBalance: false };
   if (S.confirmTotal !== null && S.confirmTotal !== undefined) payload.totalAmount = S.confirmTotal;
   var init = { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) };
@@ -356,7 +424,12 @@ function send() {
   fetch('/purchase/confirm-order', init).then(function (r) { return r.json(); }).then(function (c) {
     if (c.error) fail(c.message);
     else document.getElementById('purchase-app').innerHTML = '<h1>' + (S.german ? 'Vielen Dank!' : 'Thanks for your order!') + '</h1>';
-  }).catch(function () { fail(S.german ? 'Fehler' : 'Sorry, there was an error placing your order.'); });
+  }).catch(function () {
+    fail(S.german ? 'Fehler' : 'Sorry, there was an error placing your order.');
+    // Some checkouts try again by themselves after a network error.
+    window.retries = (window.retries || 0) + 1;
+    if (S.retryOnError && window.retries <= 4) setTimeout(send, 1000);
+  });
 }
 function submit() {
   if (S.eu && !window.consented) {
@@ -390,6 +463,10 @@ func (m *mockStore) handleProduct(w http.ResponseWriter, r *http.Request) {
 	if label == "" {
 		label = "Get"
 	}
+	opens := m.sc.ProductOpens
+	if opens == "" {
+		opens = "1-ns-id"
+	}
 	gate := ""
 	if m.sc.ProductGate {
 		gate = `<div id="gate" style="position:fixed;left:0;top:0;right:0;bottom:0;background:#000;z-index:5"><p>This game contains mature content recommended only for ages 18+</p><button id="gate-ok" style="width:160px;height:40px">Continue</button></div>
@@ -399,12 +476,13 @@ func (m *mockStore) handleProduct(w http.ResponseWriter, r *http.Request) {
 <h1>Flotsam</h1>
 <aside><button data-testid="purchase-cta-button" id="cta" style="width:220px;height:48px">`+label+`</button>
 <button aria-label="Add to Cart" style="width:220px;height:48px">Add To Cart</button></aside>
+`+m.sc.ProductExtra+`
 `+gate+`
 <script>
 window.presses = 0;
 document.getElementById('cta').addEventListener('click', function () {
   window.presses++;
-  if (/^get$/i.test(this.textContent)) window.open('/purchase?highlightColor=0078f2&offers=1-ns-id&via=store');
+  if (/^get$/i.test(this.textContent)) window.open('/purchase?highlightColor=0078f2&offers=`+opens+`&via=store');
 });
 </script></body></html>`)
 }

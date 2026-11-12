@@ -108,6 +108,7 @@ const (
 	busyRetry    = 10 * time.Minute
 	yieldRetry   = 30 * time.Minute
 	dryRunRetry  = 24 * time.Hour
+	laterRetry   = 24 * time.Hour
 	// Epic's own notice asks to wait 24 hours.
 	throttleRetry = 25 * time.Hour
 	staleRetry    = 5 * time.Minute
@@ -194,6 +195,8 @@ func (d *Daemon) Tick(ctx context.Context) time.Time {
 		if t := d.claim(ctx, due); !t.IsZero() {
 			sooner(t)
 		}
+		// A session can take many minutes; what follows counts from its end.
+		now = d.now()
 	}
 
 	// Epic's servers lag a few minutes behind a changeover; look again soon
@@ -228,6 +231,9 @@ func (d *Daemon) claim(ctx context.Context, due []feed.Offer) time.Time {
 	}
 
 	results, err := d.Claimer.ClaimAll(ctx, due)
+	// Waiting periods count from the end of the session, which may have
+	// taken a good while.
+	now = d.now()
 
 	var busy *BusyError
 	if errors.As(err, &busy) {
@@ -242,9 +248,21 @@ func (d *Daemon) claim(ctx context.Context, due []feed.Offer) time.Time {
 
 	// A session-level problem applies to every offer the session did not
 	// reach.
-	sessionWait, sessionNote, countAttempt := time.Duration(0), "", false
+	sessionWait, sessionNote, countAttempt, cancelled := time.Duration(0), "", false, false
 	switch {
 	case err == nil:
+		// An answer that concerns the account rather than one offer ends
+		// the session early; the offers behind it wait just as long.
+		for _, res := range results {
+			switch res.Outcome {
+			case claim.NotSignedIn:
+				sessionWait, sessionNote = signInRetry, res.String()
+			case claim.Throttled:
+				sessionWait, sessionNote = throttleRetry, res.String()
+			case claim.Captcha:
+				sessionWait, sessionNote = captchaBackoff[0], res.String()
+			}
+		}
 	case errors.Is(err, ErrNotInstalled), errors.Is(err, ErrUnsupported):
 		sessionWait, sessionNote = missingRetry, err.Error()
 		d.notice("missing", "%v; will look again in %v", err, missingRetry)
@@ -255,7 +273,9 @@ func (d *Daemon) claim(ctx context.Context, due []feed.Offer) time.Time {
 		sessionWait, sessionNote = yieldRetry, err.Error()
 		d.logf("%v; will try again in %v", err, yieldRetry)
 	case ctx.Err() != nil:
-		return time.Time{}
+		// Asked to stop half-way: what the session did find out is still
+		// recorded; the offers it never reached are left as they were.
+		cancelled = true
 	default:
 		sessionNote, countAttempt = err.Error(), true
 		d.logf("claim session failed: %v", err)
@@ -268,6 +288,9 @@ func (d *Daemon) claim(ctx context.Context, due []feed.Offer) time.Time {
 		key := o.Key()
 		res, reached := results[key]
 		if !reached {
+			if cancelled {
+				continue
+			}
 			_ = d.State.Update(key, func(e *state.Entry) {
 				wait := sessionWait
 				if countAttempt {
@@ -295,10 +318,15 @@ func (d *Daemon) claim(ctx context.Context, due []feed.Offer) time.Time {
 				e.Status, e.DoneAt = state.Skipped, now
 				d.logf("%s cannot be claimed on this account: %s", o.Title, res.Detail)
 			case claim.NotFree:
-				// Never retried within this promotion: the checkout
-				// disagreed with the free-games list about the price.
-				e.Status, e.DoneAt = state.Skipped, now
-				d.logf("%s was NOT ordered: %s", o.Title, res.Detail)
+				// The checkout disagreed with the free-games list about
+				// the price. Nothing was ordered, and looking again costs
+				// nothing, so it is retried, but only rarely.
+				e.Attempts++
+				e.NextAttempt = now.Add(pick(captchaBackoff, e.Attempts))
+				d.logf("%s was NOT ordered: %s; will look again %s", o.Title, res.Detail, e.NextAttempt.Local().Format("Mon 15:04"))
+			case claim.Later:
+				e.NextAttempt = now.Add(laterRetry)
+				d.logf("%s: %s; will look again in %v", o.Title, res.Detail, laterRetry)
 			case claim.Captcha:
 				e.Attempts++
 				e.NextAttempt = now.Add(pick(captchaBackoff, e.Attempts))

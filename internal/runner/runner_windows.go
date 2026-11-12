@@ -305,8 +305,8 @@ func (r *Runner) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]
 				break // never got anywhere; do not record it as an attempt
 			}
 			results[o.Key()] = res
-			if res.Outcome == claim.NotSignedIn {
-				break // the same would happen for every other offer
+			if res.Outcome == claim.NotSignedIn || res.Outcome == claim.Captcha || res.Outcome == claim.Throttled {
+				break // these concern the account: every other offer would end the same way
 			}
 		}
 		sess.Close()

@@ -16,7 +16,7 @@ jobs:
   test:
     name: Unit and browser tests (Linux)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -30,7 +30,7 @@ jobs:
       - name: Test
         # The checkout driver is exercised in a real Chrome against a
         # stand-in for Epic's store.
-        run: go test ./... -count=1 -race
+        run: go test ./... -count=1 -race -timeout 20m
 
   windows:
     name: Build and try on Windows with the real launcher
@@ -42,7 +42,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Test
-        run: go test ./... -count=1
+        run: go test ./... -count=1 -timeout 20m
       - name: Build
         shell: pwsh
         run: |

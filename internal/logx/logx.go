@@ -16,6 +16,7 @@ type Logger struct {
 	mu       sync.Mutex
 	path     string
 	maxBytes int64
+	limit    int64 // size at which the next rotation is tried
 	keep     int
 	f        *os.File
 	size     int64
@@ -55,11 +56,22 @@ func (l *Logger) open() error {
 func (l *Logger) rotate() {
 	l.f.Close()
 	l.f = nil
+	// The current file is moved aside first. On Windows that fails while
+	// another process has it open (a second command, or somebody following
+	// the log); the older files are then left as they are and the next try
+	// comes after the file has grown some more, not on every line.
+	staging := l.path + ".rot"
+	if err := os.Rename(l.path, staging); err != nil {
+		_ = l.open()
+		l.limit = l.size + l.maxBytes/16
+		return
+	}
+	_ = os.Remove(fmt.Sprintf("%s.%d", l.path, l.keep))
 	for i := l.keep - 1; i >= 1; i-- {
 		_ = os.Rename(fmt.Sprintf("%s.%d", l.path, i), fmt.Sprintf("%s.%d", l.path, i+1))
 	}
-	_ = os.Rename(l.path, l.path+".1")
-	_ = os.Remove(fmt.Sprintf("%s.%d", l.path, l.keep+1))
+	_ = os.Rename(staging, l.path+".1")
+	l.limit = l.maxBytes
 	_ = l.open()
 }
 
@@ -79,7 +91,10 @@ func (l *Logger) Printf(format string, args ...any) {
 			return
 		}
 	}
-	if l.size+int64(len(line)) > l.maxBytes {
+	if l.limit == 0 {
+		l.limit = l.maxBytes
+	}
+	if l.size+int64(len(line)) > l.limit {
 		l.rotate()
 		if l.f == nil {
 			return

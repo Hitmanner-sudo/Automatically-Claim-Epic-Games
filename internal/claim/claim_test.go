@@ -141,8 +141,10 @@ func TestOwnedMessageContradictedByStoreIsRetriedLater(t *testing.T) {
 }
 
 func TestMissingBaseGame(t *testing.T) {
+	// May become possible during the week, so it is looked at again later
+	// rather than written off.
 	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), MissingBase: true}, nil)
-	wantOutcome(t, r, Unavailable, 0)
+	wantOutcome(t, r, Later, 0)
 }
 
 func TestRegionLocked(t *testing.T) {
@@ -214,10 +216,17 @@ func TestNewCheckoutLayout(t *testing.T) {
 }
 
 func TestNewCheckoutLayoutWithoutOwnershipQuery(t *testing.T) {
-	// Success is then read from the page ("It's all yours").
-	r := runScenario(t, scenario{SignedIn: true, NewLayout: true, GraphQLDown: true}, nil)
+	// The order goes to an address this program does not know as an order
+	// address, so success is read from the page ("It's all yours").
+	r := runScenario(t, scenario{SignedIn: true, NewLayout: true, GraphQLDown: true, SubmitPath: "/api/v9/acquire"}, nil)
 	wantOutcome(t, r, Claimed, 1)
 	if !strings.Contains(r.res.Detail, "confirmation") {
+		t.Errorf("detail = %q", r.res.Detail)
+	}
+	// At its usual address, Epic's own reply settles it.
+	r = runScenario(t, scenario{SignedIn: true, NewLayout: true, GraphQLDown: true}, nil)
+	wantOutcome(t, r, Claimed, 1)
+	if !strings.Contains(r.res.Detail, "confirmed by Epic") {
 		t.Errorf("detail = %q", r.res.Detail)
 	}
 }
@@ -786,7 +795,8 @@ func storePageOptions(t *testing.T, base string, store *mockStore) Options {
 	return Options{
 		CheckoutBases: []string{store.URL()}, LoginBase: store.URL(),
 		SettleWait: 50 * time.Millisecond, CheckoutWait: 20 * time.Second, OrderWait: 14 * time.Second,
-		Logf: t.Logf,
+		StorePageWait: 10 * time.Second,
+		Logf:          t.Logf,
 		OpenProduct: func(ctx context.Context, o feed.Offer, try int) error {
 			if try == 0 {
 				return errors.New("the launcher did not understand the first link form")
@@ -853,12 +863,14 @@ func TestStorePageStates(t *testing.T) {
 		{"In Library", Owned, "in the library"},
 		{"Buy Now", Failed, "Buy Now"},
 		{"$19.99", Failed, "$19.99"},
-		{"Requires Base Game", Unavailable, "base game"},
-		{"Coming Soon", Unavailable, "unavailable"},
+		{"Requires Base Game", Later, "base game"},
+		{"Coming Soon", Later, "right now"},
 	}
 	for _, c := range cases {
 		before := pageIDs(base)
-		store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), DirectBlocked: true, ProductLabel: c.label})
+		// "In Library" is only believed when the store confirms it for
+		// this very offer.
+		store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), DirectBlocked: true, ProductLabel: c.label, Owned: c.want == Owned})
 		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 		s, err := Open(ctx, base, storePageOptions(t, base, store))
 		if err != nil {
@@ -932,12 +944,20 @@ func TestCoveredButtonIsNotClicked(t *testing.T) {
 	// Something lies on top of the order button: a mouse click would land
 	// on the cover, so none is made.
 	base := sharedBrowser(t)
+	var mu sync.Mutex
+	var hits []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/hit" {
+			mu.Lock()
+			hits = append(hits, r.URL.Query().Get("what"))
+			mu.Unlock()
+			return
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(`<!doctype html><title>x</title><body style="margin:0"><div id="purchase-app">
 <div class="payment-price payment-price--total">Total $0.00</div>
-<button class="payment-btn payment-order-confirm__btn" style="position:absolute;left:100px;top:100px;width:200px;height:40px" onclick="window.pressed=true">Place Order</button>
-<div id="cover" style="position:absolute;left:0;top:0;width:600px;height:400px;background:#000;opacity:0.9" onclick="window.coverHit=true"></div>
+<button class="payment-btn payment-order-confirm__btn" style="position:absolute;left:100px;top:100px;width:200px;height:40px" onclick="fetch('/hit?what=button')">Place Order</button>
+<div id="cover" style="position:absolute;left:0;top:0;width:600px;height:400px;background:#000;opacity:0.9" onclick="fetch('/hit?what=cover')"></div>
 </div></body>`))
 	}))
 	defer srv.Close()
@@ -952,14 +972,281 @@ func TestCoveredButtonIsNotClicked(t *testing.T) {
 	if res.Outcome != Failed {
 		t.Fatalf("result = %v", res)
 	}
-	var state struct {
-		Pressed  bool `json:"pressed"`
-		CoverHit bool `json:"coverHit"`
+	time.Sleep(300 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(hits) != 0 {
+		t.Fatalf("something was clicked: %v", hits)
 	}
-	if err := s.page.Eval(ctx, `({pressed: !!window.pressed, coverHit: !!window.coverHit})`, &state); err != nil {
+}
+
+// ---- regression tests for the money-safety review
+
+func TestLeftoverPageCannotOrderAfterTheClaimEnds(t *testing.T) {
+	// The order is refused at the network (it states a price). The page
+	// then keeps trying by itself. Nothing may get out once the claim has
+	// returned and nobody is looking any more.
+	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(1999), RetryOnError: true}, nil)
+	wantOutcome(t, r, NotFree, 0)
+	time.Sleep(4 * time.Second)
+	if n := r.store.orderCount(); n != 0 {
+		t.Fatalf("%d order(s) reached the store after the claim had ended: %s", n, r.store.lastOrder())
+	}
+}
+
+func TestRequestsWithoutAClaimInProgressCannotOrder(t *testing.T) {
+	// The same rule, at its root: with no claim in progress, a supervised
+	// page cannot get an order out, whatever the order says.
+	base := sharedBrowser(t)
+	store := newMockStore(t, scenario{SignedIn: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	s, err := Open(ctx, base, Options{CheckoutBases: []string{store.URL()}, LoginBase: store.URL(), SettleWait: 50 * time.Millisecond, Logf: t.Logf})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Pressed || state.CoverHit {
-		t.Fatalf("something was clicked: %+v", state)
+	defer s.Close()
+	if err := s.page.Navigate(ctx, store.URL()+"/"); err != nil {
+		t.Fatal(err)
+	}
+	var out string
+	js := `(async function () {
+  var res = [];
+  var tries = [['/purchase/confirm-order', '{"totalAmount":0}'], ['/checkout/api/complete', '{}'], ['/api/v9/acquire', '{"totalPrice":499}']];
+  for (var i = 0; i < tries.length; i++) {
+    try { await fetch(tries[i][0], { method: 'POST', headers: { 'content-type': 'application/json' }, body: tries[i][1] }); res.push('sent'); }
+    catch (e) { res.push('blocked'); }
+  }
+  return res.join(',');
+})()`
+	if err := s.page.Eval(ctx, js, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out != "blocked,blocked,blocked" || store.orderCount() != 0 {
+		t.Fatalf("requests = %s, orders at the store = %d", out, store.orderCount())
+	}
+}
+
+func TestOnlyTheCheckoutsOwnTotalCounts(t *testing.T) {
+	cases := []struct {
+		name string
+		sc   scenario
+	}{
+		// A cart badge in the page header, which happens to carry "total" in
+		// its class name and shows a bare zero.
+		{"header badge", scenario{SignedIn: true, NewLayout: true, NewPrice: "$19.99", NoFreeText: true,
+			ExtraHTML: `<span class="nav-cart-total">0</span>`}},
+		// A zero under a key named "total" in the data the page was built from.
+		{"page data", scenario{SignedIn: true, NewLayout: true, NewPrice: "$19.99", NoFreeText: true,
+			ExtraHTML: `<script>window.__epic_web_purchase_dataPreload = { wishlist: { total: 0 }, cart: { totalPrice: 0 } };</script>`}},
+		// A currency this program has no list entry for, next to Epic's
+		// "This is free" sentence.
+		{"prefixed dollar", scenario{SignedIn: true, NewLayout: true, NewPrice: "CA$19.99"}},
+		{"unlisted currency", scenario{SignedIn: true, NewLayout: true, NewPrice: "19.99 XYZ"}},
+		// "Free shipping" somewhere on a page that charges.
+		{"free word elsewhere", scenario{SignedIn: true, NewLayout: true, NewPrice: "$19.99", NoFreeText: true,
+			ExtraHTML: `<div class="order-total-note">Free returns</div><div class="grand-total">$19.99</div>`}},
+	}
+	for _, c := range cases {
+		r := runScenario(t, c.sc, func(o *Options) { o.CheckoutWait = 5 * time.Second })
+		if r.res.Outcome == Claimed || r.res.Outcome == Owned || r.res.Outcome == DryRun {
+			t.Errorf("%s: outcome = %v", c.name, r.res)
+		}
+		time.Sleep(150 * time.Millisecond)
+		if n := r.store.orderCount(); n != 0 {
+			t.Errorf("%s: %d order(s) reached the store", c.name, n)
+		}
+	}
+}
+
+func TestSubtotalNextToAZeroTotalIsStillClaimed(t *testing.T) {
+	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0),
+		ExtraHTML: `<div class="payment-price payment-price--subtotal"><span>Subtotal</span> <span>$24.99</span></div>`}, nil)
+	wantOutcome(t, r, Claimed, 1)
+}
+
+func TestWordsInsideScriptsAreNotRead(t *testing.T) {
+	// The page's scripts carry every message the checkout could ever show.
+	// Only what is on screen counts: this offer is neither owned nor ordered
+	// until the page says so.
+	extra := `<script>var MESSAGES = { owned: "You already own this item.", thanks: "Thanks for your order!", region: "This product is unavailable in your region.", busy: "Please wait 24 hours before trying to redeem a free game again." };</script>`
+	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), GraphQLDown: true, ExtraHTML: extra}, nil)
+	wantOutcome(t, r, Claimed, 1)
+	r = runScenario(t, scenario{SignedIn: true, NewLayout: true, GraphQLDown: true, ExtraHTML: extra}, nil)
+	wantOutcome(t, r, Claimed, 1)
+}
+
+func TestHiddenPinPromptDoesNotBlock(t *testing.T) {
+	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0),
+		ExtraHTML: `<div class="payment-pin-code" style="display:none"><input class="payment-pin-code__input"></div>`}, nil)
+	wantOutcome(t, r, Claimed, 1)
+}
+
+func TestPaidEvidenceAfterThePressStopsTheOrder(t *testing.T) {
+	const confirm = "https://payment-website-pci.ol.epicgames.com/purchase/confirm-order"
+	const preview = "https://payment-website-pci.ol.epicgames.com/purchase/order-preview"
+	// The page showed zero and the button was pressed; then a re-priced
+	// preview arrives. No order may follow, whatever it says of itself.
+	for _, body := range []string{`{"offers":["x"]}`, `{"totalAmount":0}`} {
+		w := newOrderWatch(false)
+		w.setPreClick(Free)
+		w.onResponse("POST", preview, 200, []byte(`{"orderResponse":{"totalPrice":1999}}`))
+		if w.onRequest("POST", confirm, body, true) || w.submitted() || w.blockedReason() == "" {
+			t.Errorf("order %s was let out after a paid preview", body)
+		}
+	}
+	// A zero preview does not undo a paid one.
+	w := newOrderWatch(false)
+	w.onResponse("POST", preview, 200, []byte(`{"orderResponse":{"totalPrice":1999}}`))
+	w.onResponse("POST", preview, 200, []byte(`{"orderResponse":{"totalPrice":0}}`))
+	if w.onRequest("POST", confirm, `{"totalAmount":0}`, true) {
+		t.Error("a later zero preview must not clear an earlier paid one")
+	}
+	// An order whose content the browser will not show is not sent.
+	w = newOrderWatch(false)
+	w.setPreClick(Free)
+	if w.onRequest("POST", confirm, "", true) {
+		t.Error("an order that cannot be inspected must be refused")
+	}
+	// Order addresses are recognised by their path, in the forms seen so far.
+	for u, want := range map[string]bool{
+		"https://x/checkout/api/complete":  true,
+		"https://x/purchase/api/confirm":   true,
+		"https://x/checkout/submit":        true,
+		"https://x/purchase/finalize":      true,
+		"https://x/checkout/api/completed": false,
+		"https://x/purchase":               false,
+	} {
+		if got := isOrderSubmit("POST", u); got != want {
+			t.Errorf("isOrderSubmit(%q) = %v, want %v", u, got, want)
+		}
+	}
+	if !isOrderSubmit("PATCH", "https://x/v1/orders") || !isOrderSubmit("PUT", "https://x/purchase/confirm-order") {
+		t.Error("PUT and PATCH can place orders too")
+	}
+	// With no claim in progress, nothing that could order or that states a
+	// price is let out.
+	if !mayPlaceOrder("POST", confirm, `{"totalAmount":0}`) || !mayPlaceOrder("POST", "https://x/anything", `{"totalPrice":499}`) {
+		t.Error("orders and priced requests must be held back when no claim is in progress")
+	}
+	if mayPlaceOrder("GET", confirm, "") || mayPlaceOrder("POST", "https://x/telemetry", `{"event":"view"}`) {
+		t.Error("ordinary requests must pass")
+	}
+}
+
+func TestPriceEvidenceRules(t *testing.T) {
+	free := func(st pageState, w *orderWatch) Verdict { v, _ := priceEvidence(st, w); return v }
+	if v := free(pageState{Totals: []string{"Total $0.00"}, Prices: []string{"$24.99", "-$24.99", "$0.00"}}, newOrderWatch(false)); v != Free {
+		t.Errorf("zero total line: %v", v)
+	}
+	if v := free(pageState{Prices: []string{"$0.00"}, SaysFree: true}, newOrderWatch(false)); v != Free {
+		t.Errorf("2026 layout: %v", v)
+	}
+	// Page data cannot prove a zero total...
+	if v := free(pageState{Preload: `{"wishlist":{"total":0}}`, Prices: []string{"$19.99"}}, newOrderWatch(false)); v == Free {
+		t.Errorf("page data alone: %v", v)
+	}
+	if v := free(pageState{Preload: `{"order":{"totalPrice":0}}`}, newOrderWatch(false)); v == Free {
+		t.Errorf("page data with no amount on the page: %v", v)
+	}
+	// ...but it can speak against one.
+	if v := free(pageState{Totals: []string{"Total $0.00"}, Prices: []string{"$0.00"}, Preload: `{"order":{"totalPrice":1999}}`}, newOrderWatch(false)); v != Paid {
+		t.Errorf("paid page data: %v", v)
+	}
+	// "This is free" next to amounts none of which is zero proves nothing.
+	if v := free(pageState{Prices: []string{"CA$19.99"}, SaysFree: true}, newOrderWatch(false)); v == Free {
+		t.Errorf("free sentence next to a price: %v", v)
+	}
+	if v := free(pageState{SaysFree: true}, newOrderWatch(false)); v == Free {
+		t.Errorf("free sentence with no amount: %v", v)
+	}
+	// A zero preview does not make a page that shows only a price free.
+	w := newOrderWatch(false)
+	w.onResponse("POST", "https://x/purchase/order-preview", 200, []byte(`{"orderResponse":{"totalPrice":0}}`))
+	if v := free(pageState{Prices: []string{"$19.99"}}, w); v == Free {
+		t.Errorf("zero preview against a page showing only a price: %v", v)
+	}
+	// Anything paid on the network wins.
+	w = newOrderWatch(false)
+	w.onResponse("POST", "https://x/purchase/order-preview", 200, []byte(`{"orderResponse":{"totalPrice":499}}`))
+	if v := free(pageState{Totals: []string{"Total $0.00"}, Prices: []string{"$0.00"}, SaysFree: true}, w); v != Paid {
+		t.Errorf("paid preview: %v", v)
+	}
+}
+
+func TestServiceWorkerCannotCarryAnOrderOut(t *testing.T) {
+	// The page's requests are relayed by a service worker. An order that
+	// states a price must still not reach the store.
+	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(1999), ServiceWorker: true}, nil)
+	if r.res.Outcome != NotFree && r.res.Outcome != Failed {
+		t.Errorf("outcome = %v", r.res)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if n := r.store.orderCount(); n != 0 {
+		t.Fatalf("%d order(s) reached the store through the service worker", n)
+	}
+}
+
+func TestFrameFromAnotherSiteCannotCarryAnOrderOut(t *testing.T) {
+	// The order is sent by a frame from another site, which runs in a
+	// process of its own.
+	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(1999), FrameOrder: true}, nil)
+	if r.res.Outcome != NotFree && r.res.Outcome != Failed {
+		t.Errorf("outcome = %v", r.res)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if n := r.store.orderCount(); n != 0 {
+		t.Fatalf("%d order(s) reached the store through the frame", n)
+	}
+	// A free order sent the same way goes through.
+	r = runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), FrameOrder: true}, nil)
+	wantOutcome(t, r, Claimed, 1)
+}
+
+func TestStorePageLibraryTileIsNotTheOffersState(t *testing.T) {
+	// The page offers "Get" for this game and, further down, shows another
+	// edition that is "In Library". The offer is not owned.
+	base := sharedBrowser(t)
+	before := pageIDs(base)
+	defer closeNewTabs(t, base, before)
+	store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), DirectBlocked: true,
+		ProductExtra: `<section><h2>Editions</h2><div class="edition"><span>Deluxe Edition</span> <button style="width:160px;height:40px" disabled>In Library</button></div><p>You already own this item.</p></section>`})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	s, err := Open(ctx, base, storePageOptions(t, base, store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	res := s.Claim(ctx, testOffer())
+	if res.Outcome != Claimed {
+		t.Fatalf("result = %v", res)
+	}
+	if store.orderCount() != 1 {
+		t.Fatalf("orders = %d", store.orderCount())
+	}
+}
+
+func TestCheckoutWindowForAnotherOfferIsNotUsed(t *testing.T) {
+	// "Get" opens a checkout for something other than this giveaway (a
+	// bundle or an edition the page promotes). It is left alone.
+	base := sharedBrowser(t)
+	before := pageIDs(base)
+	defer closeNewTabs(t, base, before)
+	store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), DirectBlocked: true, ProductOpens: "1-ns-other"})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	s, err := Open(ctx, base, storePageOptions(t, base, store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	res := s.Claim(ctx, testOffer())
+	if res.Outcome == Claimed || res.Outcome == Owned {
+		t.Fatalf("result = %v", res)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if store.orderCount() != 0 {
+		t.Fatalf("orders = %d", store.orderCount())
 	}
 }

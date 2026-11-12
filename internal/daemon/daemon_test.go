@@ -31,6 +31,7 @@ type fakeClaimer struct {
 	calls   [][]string
 	results map[string]claim.Result
 	err     error
+	during  func() // runs while the "session" is under way
 }
 
 func (c *fakeClaimer) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]claim.Result, error) {
@@ -43,6 +44,9 @@ func (c *fakeClaimer) ClaimAll(ctx context.Context, offers []feed.Offer) (map[st
 		}
 	}
 	c.calls = append(c.calls, titles)
+	if c.during != nil {
+		c.during()
+	}
 	return out, c.err
 }
 
@@ -252,7 +256,8 @@ func TestOutcomes(t *testing.T) {
 	}{
 		{claim.Owned, state.Owned, 0},
 		{claim.Unavailable, state.Skipped, 0},
-		{claim.NotFree, state.Skipped, 0},
+		{claim.NotFree, state.Pending, 6 * time.Hour},
+		{claim.Later, state.Pending, 24 * time.Hour},
 		{claim.Captcha, state.Pending, 6 * time.Hour},
 		{claim.NotSignedIn, state.Pending, 6 * time.Hour},
 		{claim.DryRun, state.Pending, 24 * time.Hour},
@@ -279,21 +284,51 @@ func TestOutcomes(t *testing.T) {
 	}
 }
 
-func TestPaidLookingOfferIsNeverRetried(t *testing.T) {
+func TestPaidLookingOfferIsLookedAtAgainOnlyRarely(t *testing.T) {
+	// The checkout showed a price: nothing was ordered. Epic's pages do
+	// misstate things now and then, so it is looked at again, but on the
+	// slow schedule (6 h, 12 h, then daily) and never marked as done.
 	r := newRig(t)
 	a := r.offer("a", 6*24*time.Hour)
 	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a}}
 	r.claim.results[a.Key()] = claim.Result{Outcome: claim.NotFree, Detail: "the checkout does not show a zero total"}
 	r.tick()
-	for i := 0; i < 10; i++ {
-		r.now = r.now.Add(13 * time.Hour)
-		r.tick()
-	}
-	if len(r.claim.calls) != 1 {
-		t.Fatalf("calls = %d", len(r.claim.calls))
+	if e := r.entry("a"); e.Status != state.Pending || e.NextAttempt.Sub(r.now) != 6*time.Hour {
+		t.Fatalf("after the first look: %+v", e)
 	}
 	if !r.logged("was NOT ordered") {
 		t.Errorf("logs = %q", r.logs)
+	}
+	// Hourly rounds in between change nothing.
+	for i := 0; i < 5; i++ {
+		r.now = r.now.Add(time.Hour)
+		r.tick()
+	}
+	if len(r.claim.calls) != 1 {
+		t.Fatalf("looked again too soon: %d calls", len(r.claim.calls))
+	}
+	r.now = r.now.Add(time.Hour)
+	r.tick()
+	if len(r.claim.calls) != 2 {
+		t.Fatalf("calls after six hours = %d", len(r.claim.calls))
+	}
+	if e := r.entry("a"); e.NextAttempt.Sub(r.now) != 12*time.Hour {
+		t.Fatalf("second wait = %v", e.NextAttempt.Sub(r.now))
+	}
+	// Over the following four days: about one look a day.
+	for i := 0; i < 4*24; i++ {
+		r.now = r.now.Add(time.Hour)
+		r.tick()
+	}
+	if n := len(r.claim.calls); n < 5 || n > 7 {
+		t.Fatalf("calls over the week = %d", n)
+	}
+	// And when the checkout comes round, the claim goes through.
+	r.claim.results[a.Key()] = claim.Result{Outcome: claim.Claimed}
+	r.now = r.now.Add(24 * time.Hour)
+	r.tick()
+	if e := r.entry("a"); e.Status != state.Claimed {
+		t.Fatalf("final status = %s", e.Status)
 	}
 }
 
@@ -444,5 +479,93 @@ func TestRunStopsWithItsContext(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not stop")
+	}
+}
+
+func TestWaitsCountFromTheEndOfALongSession(t *testing.T) {
+	// A session can take a long time (the launcher updating itself, slow
+	// pages). The pause before the next try starts when it is over.
+	r := newRig(t)
+	a := r.offer("a", 6*24*time.Hour)
+	b := r.offer("b", 6*24*time.Hour)
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a, b}}
+	r.claim.results[a.Key()] = claim.Result{Outcome: claim.Failed, Detail: "the checkout did not become ready"}
+	r.claim.during = func() { r.now = r.now.Add(25 * time.Minute) }
+	next := r.d.Tick(context.Background())
+	if wait := next.Sub(r.now); wait != 10*time.Minute {
+		t.Fatalf("next round %v after the session ended, want 10m (the offer the session did not reach)", wait)
+	}
+	if e := r.entry("a"); e.NextAttempt.Sub(r.now) != 20*time.Minute || !e.LastAttempt.Equal(r.now) {
+		t.Fatalf("failed offer: next try in %v", e.NextAttempt.Sub(r.now))
+	}
+	// A busy launcher is looked at again ten minutes after it was found busy.
+	r = newRig(t)
+	a = r.offer("a", 6*24*time.Hour)
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a}}
+	r.claim.err = &BusyError{Reason: "the launcher window is open"}
+	r.claim.during = func() { r.now = r.now.Add(time.Minute) }
+	if wait := r.d.Tick(context.Background()).Sub(r.now); wait != 10*time.Minute {
+		t.Fatalf("busy: next round in %v", wait)
+	}
+	// Whatever happens, the next round is never due in the past.
+	r = newRig(t)
+	a = r.offer("a", 6*24*time.Hour)
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a}, Stale: true}
+	r.claim.results[a.Key()] = claim.Result{Outcome: claim.Claimed}
+	r.claim.during = func() { r.now = r.now.Add(3 * time.Hour) }
+	if wait := r.d.Tick(context.Background()).Sub(r.now); wait < 2*time.Minute {
+		t.Fatalf("next round in %v", wait)
+	}
+}
+
+func TestAnAnswerAboutTheAccountAppliesToTheWholeBatch(t *testing.T) {
+	// The session stops at the first offer when Epic's answer is about the
+	// account. The offers behind it wait as long as that one, instead of
+	// starting session after session ten minutes apart.
+	for _, c := range []struct {
+		outcome claim.Outcome
+		wait    time.Duration
+	}{
+		{claim.NotSignedIn, 6 * time.Hour},
+		{claim.Throttled, 25 * time.Hour},
+		{claim.Captcha, 6 * time.Hour},
+	} {
+		r := newRig(t)
+		a := r.offer("a", 5*24*time.Hour)
+		b := r.offer("b", 6*24*time.Hour)
+		r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a, b}}
+		r.claim.results[a.Key()] = claim.Result{Outcome: c.outcome, Detail: "x"}
+		r.tick()
+		if e := r.entry("b"); e.NextAttempt.Sub(r.now) != c.wait || e.Attempts != 0 {
+			t.Errorf("%s: the offer behind it waits %v (attempts %d), want %v", c.outcome, e.NextAttempt.Sub(r.now), e.Attempts, c.wait)
+		}
+		r.now = r.now.Add(time.Hour)
+		r.tick()
+		if len(r.claim.calls) != 1 {
+			t.Errorf("%s: a second session ran an hour later", c.outcome)
+		}
+	}
+}
+
+func TestAStopHalfWayKeepsWhatWasFoundOut(t *testing.T) {
+	r := newRig(t)
+	a := r.offer("a", 5*24*time.Hour)
+	b := r.offer("b", 6*24*time.Hour)
+	c := r.offer("c", 6*24*time.Hour+time.Hour)
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a, b, c}}
+	r.claim.results[a.Key()] = claim.Result{Outcome: claim.Claimed}
+	r.claim.results[b.Key()] = claim.Result{Outcome: claim.Failed, Detail: "interrupted after the order button was pressed; the library will be checked next time"}
+	ctx, cancel := context.WithCancel(context.Background())
+	r.claim.during = cancel
+	r.claim.err = context.Canceled
+	r.d.Tick(ctx)
+	if e := r.entry("a"); e.Status != state.Claimed {
+		t.Errorf("the claim made before the stop was not recorded: %+v", e)
+	}
+	if e := r.entry("b"); e.Attempts != 1 || e.NextAttempt.Sub(r.now) != 20*time.Minute {
+		t.Errorf("the interrupted order was not recorded: %+v", e)
+	}
+	if e := r.entry("c"); e.Attempts != 0 || !e.NextAttempt.IsZero() || !e.LastAttempt.IsZero() {
+		t.Errorf("the offer that was never reached was touched: %+v", e)
 	}
 }

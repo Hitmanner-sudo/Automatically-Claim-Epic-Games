@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf16"
 )
 
 // Config is the content of config.json.
@@ -69,14 +70,45 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return c, fmt.Errorf("read settings: %w", err)
 	}
-	// Tolerate a UTF-8 byte-order mark: Notepad adds one.
-	raw = []byte(strings.TrimPrefix(string(raw), "\ufeff"))
+	raw = decodeText(raw)
 	if err := json.Unmarshal(raw, &c); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) {
+			// One value is of the wrong kind; everything else in the file
+			// was read and applies.
+			c.Normalize()
+			return c, fmt.Errorf("settings file %s: the value of %q is not of the expected kind and was ignored", path, typeErr.Field)
+		}
+		// The file exists because something other than the defaults was
+		// wanted, and it cannot be read. The cautious reading is to order
+		// nothing and to leave a running launcher alone until it is fixed.
 		d := Default()
-		return d, fmt.Errorf("settings file %s is not valid JSON (%v); using defaults", path, err)
+		d.DryRun, d.RestartIdleLauncher = true, false
+		return d, fmt.Errorf("settings file %s is not valid JSON (%v); until it is fixed NOTHING WILL BE ORDERED (dry run)", path, err)
 	}
 	c.Normalize()
 	return c, nil
+}
+
+// decodeText turns what Notepad may have saved (UTF-8 with a byte-order mark,
+// or "Unicode", which is UTF-16) into plain UTF-8.
+func decodeText(raw []byte) []byte {
+	switch {
+	case len(raw) >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF:
+		return raw[3:]
+	case len(raw) >= 2 && (raw[0] == 0xFF && raw[1] == 0xFE || raw[0] == 0xFE && raw[1] == 0xFF):
+		big := raw[0] == 0xFE
+		units := make([]uint16, 0, len(raw)/2)
+		for i := 2; i+1 < len(raw); i += 2 {
+			if big {
+				units = append(units, uint16(raw[i])<<8|uint16(raw[i+1]))
+			} else {
+				units = append(units, uint16(raw[i+1])<<8|uint16(raw[i]))
+			}
+		}
+		return []byte(string(utf16.Decode(units)))
+	}
+	return raw
 }
 
 // Save writes the settings.

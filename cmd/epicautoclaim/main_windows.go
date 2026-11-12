@@ -10,13 +10,17 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/windows/registry"
 
+	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/claim"
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/config"
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/daemon"
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/feed"
@@ -109,26 +113,31 @@ func daemonRunning() bool {
 	return true
 }
 
-func stopDaemon() bool {
+// stopDaemon asks the background process to exit and waits for it. It
+// reports whether one was running, and whether it is gone now. (In the
+// middle of a claim it first shuts the hidden launcher down, which can take
+// most of a minute.)
+func stopDaemon() (was, gone bool) {
 	if !daemonRunning() {
-		return false
+		return false, true
 	}
 	win.RaiseStopSignal(stopName)
-	deadline := time.Now().Add(25 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) && daemonRunning() {
 		time.Sleep(200 * time.Millisecond)
 	}
-	return true
+	return true, !daemonRunning()
 }
 
 // ---------------------------------------------------------------- pieces
 
 type app struct {
-	p   paths
-	cfg config.Config
-	log *logx.Logger
-	st  *state.Store
-	out io.Writer
+	p      paths
+	cfgErr error // why the settings file could not be used as written
+	cfg    config.Config
+	log    *logx.Logger
+	st     *state.Store
+	out    io.Writer
 }
 
 func country(cfg config.Config) string {
@@ -162,7 +171,7 @@ func newApp(out io.Writer, mirror bool) (*app, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &app{p: p, cfg: cfg, log: log, st: st, out: out}, nil
+	return &app{p: p, cfg: cfg, cfgErr: cfgErr, log: log, st: st, out: out}, nil
 }
 
 func (a *app) runner() *runner.Runner {
@@ -191,20 +200,45 @@ func (a *app) daemon() *daemon.Daemon {
 
 // ---------------------------------------------------------------- commands
 
-func cmdRun(a *app, atLogin bool) int {
-	release, ok, err := win.SingleInstance(mutexName)
-	if err != nil {
-		a.log.Printf("cannot start: %v", err)
-		return 1
+// cmdRun is the background process. afterPID, when set, is a manual run
+// ("once") that stopped the background process and started this one to take
+// over as soon as it has ended, however it ends.
+func cmdRun(a *app, atLogin bool, afterPID uint32) int {
+	var stop *win.StopSignal
+	if afterPID != 0 {
+		stop, _ = win.NewStopSignal(stopName)
+		if win.WaitExitOrStop(afterPID, stop) {
+			return 0 // told to stop while waiting
+		}
+		// The manual run recorded what it did; start from that.
+		if st, err := state.Open(a.p.state); err == nil {
+			a.st = st
+		}
 	}
-	if !ok {
-		return 0 // already running
+	var release func()
+	for try := 0; ; try++ {
+		r, ok, err := win.SingleInstance(mutexName)
+		if err != nil {
+			a.log.Printf("cannot start: %v", err)
+			return 1
+		}
+		if ok {
+			release = r
+			break
+		}
+		if afterPID == 0 || try >= 25 {
+			return 0 // already running
+		}
+		time.Sleep(200 * time.Millisecond) // the manual run is still letting go
 	}
 	defer release()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if stop, err := win.NewStopSignal(stopName); err == nil {
+	if stop == nil {
+		stop, _ = win.NewStopSignal(stopName)
+	}
+	if stop != nil {
 		defer stop.Close()
 		go func() {
 			stop.Wait()
@@ -224,6 +258,9 @@ func cmdRun(a *app, atLogin bool) int {
 	if a.cfg.DryRun {
 		mode = " (dry run: no orders will be placed)"
 	}
+	if a.cfgErr != nil {
+		a.log.Printf("%v", a.cfgErr)
+	}
 	a.log.Printf("%s %s started%s; country %s; first check in %v", appName, version, mode, country(a.cfg), delay)
 	a.daemon().Run(ctx, delay)
 	a.log.Printf("stopped")
@@ -231,36 +268,101 @@ func cmdRun(a *app, atLogin bool) int {
 }
 
 func cmdOnce(a *app, args []string) int {
-	trial := false
+	dry := false
 	for _, arg := range args {
-		if (arg == "--dry-run" || arg == "-n") && !a.cfg.DryRun {
-			a.cfg.DryRun = true
-			trial = true
+		switch arg {
+		case "--dry-run", "-n":
+			dry = true
+		default:
+			// A mistyped "--dry-run" must not turn into a real run.
+			fmt.Fprintf(a.out, "Unknown option %q for \"once\"; nothing was done.\n\n%s", arg, usage)
+			return 2
 		}
 	}
-	if daemonRunning() {
-		fmt.Fprintln(a.out, "The background process is running; stopping it for this manual run.")
-		stopDaemon()
-		defer func() { _ = win.StartDetached(a.p.exe, []string{"run"}, a.p.dir) }()
+	trial := dry && !a.cfg.DryRun
+	if dry {
+		a.cfg.DryRun = true
 	}
+
+	wasRunning := daemonRunning()
+	if wasRunning {
+		fmt.Fprintln(a.out, "The background process is running; stopping it for this manual run.")
+		if _, gone := stopDaemon(); !gone {
+			fmt.Fprintln(a.out, "It is in the middle of something and has not stopped yet. Nothing was done; try again in a minute.")
+			return 1
+		}
+	}
+	// For its duration this run is the background process: no second copy
+	// starts next to it, and "stop" reaches it.
+	release, ok, err := win.SingleInstance(mutexName)
+	if err != nil || !ok {
+		fmt.Fprintln(a.out, "Another copy has just started; nothing was done.")
+		return 1
+	}
+	defer release()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if stop, err := win.NewStopSignal(stopName); err == nil {
+		defer stop.Close()
+		go func() {
+			stop.Wait()
+			cancel()
+		}()
+	}
+	// Ctrl+C winds the run down properly (the hidden launcher is closed and
+	// a launcher that was in the tray is put back) instead of cutting it off.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sig
+		fmt.Fprintln(a.out, "\nInterrupted; winding down ...")
+		cancel()
+	}()
+	if wasRunning {
+		// The background process comes back when this run is over, even if
+		// this window is closed half-way through: its successor is started
+		// now and waits for this process to end.
+		if err := win.StartDetached(a.p.exe, []string{"run", "--after-pid=" + strconv.Itoa(os.Getpid())}, a.p.dir); err != nil {
+			fmt.Fprintf(a.out, "Could not arrange for the background process to come back (%v); double-click %s afterwards.\n", err, exeName)
+		}
+		// Start from what the background process last wrote.
+		if st, err := state.Open(a.p.state); err == nil {
+			a.st = st
+		}
+	}
+
 	d := a.daemon()
 	// A manual run retries offers whose waiting period has not passed.
-	for key, e := range a.st.All() {
+	before := a.st.All()
+	for key, e := range before {
 		if !e.Status.Done() {
 			_ = a.st.Update(key, func(e *state.Entry) { e.NextAttempt = time.Time{} })
 		}
 	}
-	next := d.Tick(context.Background())
-	if trial {
-		// A one-off trial must not hold up the real thing: the background
-		// process may claim these as soon as it looks.
-		for key, e := range a.st.All() {
-			if !e.Status.Done() {
-				_ = a.st.Update(key, func(e *state.Entry) { e.NextAttempt = time.Time{} })
-			}
+	next := d.Tick(ctx)
+	for key, cur := range a.st.All() {
+		if cur.Status.Done() {
+			continue
 		}
+		old, known := before[key]
+		switch {
+		case known && cur.LastAttempt.Equal(old.LastAttempt):
+			// This run did not get to it (the launcher was in use, the
+			// list could not be read): its waiting period stands.
+			_ = a.st.Update(key, func(e *state.Entry) { e.NextAttempt = old.NextAttempt })
+		case trial && strings.HasPrefix(cur.LastResult, string(claim.DryRun)):
+			// A trial that went well must not hold up the real thing: the
+			// background process may claim this as soon as it looks. (What
+			// the trial ran into, a CAPTCHA for instance, keeps its wait.)
+			_ = a.st.Update(key, func(e *state.Entry) { e.NextAttempt = time.Time{} })
+		}
+	}
+	switch {
+	case ctx.Err() != nil:
+		fmt.Fprintln(a.out, "\nStopped before the round was finished.")
+	case trial || dry:
 		fmt.Fprintln(a.out, "\nTrial finished; nothing was ordered.")
-	} else {
+	default:
 		fmt.Fprintf(a.out, "\nDone. The background process would check again at %s.\n", next.Local().Format("Mon 2 Jan 15:04"))
 	}
 	printState(a)
@@ -337,6 +439,9 @@ func cmdStatus(a *app) int {
 		fmt.Fprintf(a.out, "Epic Games Launcher: %s (%s)\n", inst.Exe, inst.Gen)
 	}
 	fmt.Fprintf(a.out, "Country for the free-games list: %s\n", country(a.cfg))
+	if a.cfgErr != nil {
+		fmt.Fprintf(a.out, "SETTINGS PROBLEM: %v\n", a.cfgErr)
+	}
 	if a.cfg.DryRun {
 		fmt.Fprintln(a.out, "Dry run is ON: nothing will be ordered.")
 	}
@@ -357,8 +462,12 @@ func describeWindow(w win.Window) string {
 func cmdDoctor(a *app, args []string) int {
 	launch := false
 	for _, arg := range args {
-		if arg == "--launch" {
+		switch arg {
+		case "--launch":
 			launch = true
+		default:
+			fmt.Fprintf(a.out, "Unknown option %q for \"doctor\".\n\n%s", arg, usage)
+			return 2
 		}
 	}
 	cmdStatus(a)
@@ -486,7 +595,9 @@ func cmdInstall(interactive bool, out io.Writer) int {
 		return fail(err)
 	}
 	if !samePath(self, p.exe) {
-		stopDaemon()
+		if _, gone := stopDaemon(); !gone {
+			return fail(fmt.Errorf("the copy that is already installed is busy and has not stopped yet; try again in a minute"))
+		}
 		if err := copyFile(self, p.exe); err != nil {
 			return fail(err)
 		}
@@ -526,7 +637,10 @@ func cmdUninstall(out io.Writer) int {
 		return 1
 	}
 	removeAutostart()
-	stopDaemon()
+	if _, gone := stopDaemon(); !gone {
+		fmt.Fprintf(out, "Removed from Windows start-up. The background process is finishing something and has not stopped yet; it will not start again.\nYou can delete the folder %s once it is gone.\n", p.dir)
+		return 0
+	}
 	if self, err := os.Executable(); err == nil && !samePath(self, p.exe) {
 		_ = os.Remove(p.exe)
 	}
@@ -556,12 +670,18 @@ func main() {
 			os.Exit(1)
 		}
 		atLogin := false
+		var afterPID uint32
 		for _, arg := range args[1:] {
 			if arg == "--login" {
 				atLogin = true
 			}
+			if v, ok := strings.CutPrefix(arg, "--after-pid="); ok {
+				if n, err := strconv.ParseUint(v, 10, 32); err == nil {
+					afterPID = uint32(n)
+				}
+			}
 		}
-		code := cmdRun(a, atLogin)
+		code := cmdRun(a, atLogin, afterPID)
 		a.log.Close()
 		os.Exit(code)
 	}
@@ -591,10 +711,13 @@ func main() {
 	case "uninstall":
 		os.Exit(cmdUninstall(out))
 	case "stop":
-		if stopDaemon() {
-			fmt.Fprintln(out, "Stopped.")
-		} else {
+		switch was, gone := stopDaemon(); {
+		case !was:
 			fmt.Fprintln(out, "It was not running.")
+		case gone:
+			fmt.Fprintln(out, "Stopped.")
+		default:
+			fmt.Fprintln(out, "Asked to stop; it is finishing what it was doing and will exit shortly.")
 		}
 		os.Exit(0)
 	case "version", "--version", "-v":

@@ -38,7 +38,7 @@ If you start the launcher yourself while a claim is in progress, the program sto
 
 ### What it will not do
 
-- **Pay for anything.** The order button is pressed only when the checkout page itself shows that the total is zero. On top of that, every order request is checked before it leaves your PC and is dropped if it states a price.
+- **Pay for anything.** The order button is pressed only when the checkout page itself shows that the total is zero. On top of that, every request the checkout sends is checked before it leaves your PC: one that states a price is dropped, and so is any order once a price above zero has shown up anywhere. When the claim is over, the checkout page is closed, so nothing can be sent afterwards.
 - **Solve CAPTCHAs.** If Epic asks for a human check, the program leaves the game alone and tries again hours later.
 - **Touch your password.** It never signs in. It relies on the launcher already being signed in, and it does not read the launcher's saved credentials.
 - **Send anything anywhere** except to Epic. There is no telemetry and no account with this project.
@@ -60,7 +60,7 @@ From a terminal in that folder:
 |---|---|
 | `EpicAutoClaim.exe status` | What has been claimed and what is waiting |
 | `EpicAutoClaim.exe check` | Lists what is free right now; claims nothing |
-| `EpicAutoClaim.exe once` | Does one round now instead of waiting |
+| `EpicAutoClaim.exe once` | Does one round now instead of waiting (Ctrl+C stops it cleanly) |
 | `EpicAutoClaim.exe once --dry-run` | Same, but stops just before placing the order |
 | `EpicAutoClaim.exe doctor --launch` | Starts the launcher hidden for a moment and reports what it found; claims nothing |
 | `EpicAutoClaim.exe stop` | Stops the background process until the next login |
@@ -70,7 +70,7 @@ A good first test on your own PC is `EpicAutoClaim.exe doctor --launch` followed
 
 ## Settings
 
-Edit `config.json` and restart the program (`EpicAutoClaim.exe stop`, then double-click it again). Every setting is optional.
+Edit `config.json` and restart the program (`EpicAutoClaim.exe stop`, then double-click it again). Every setting is optional. If the file cannot be read after an edit (a stray comma, say), the program orders nothing until it is fixed, and `EpicAutoClaim.exe status` says so.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -91,7 +91,7 @@ Tested on real Windows machines (GitHub's Windows runners) with a real Epic Game
 - recognising that a launcher is signed out;
 - shutting everything down again with nothing left running.
 
-Tested in a real browser against a stand-in for Epic's store (about 50 scenarios): placing a free order directly and through the store page, a checkout window opened by the launcher itself, the EU consent dialog, both the older and the 2026 checkout layout, holiday mystery games, already-owned games, region locks, CAPTCHAs, signed-out sessions, and every case in which a price above zero appears anywhere, none of which may result in an order.
+Tested in a real browser against a stand-in for Epic's store (about 65 scenarios): placing a free order directly and through the store page, a checkout window opened by the launcher itself, the EU consent dialog, both the older and the 2026 checkout layout, holiday mystery games, already-owned games, region locks, CAPTCHAs, signed-out sessions, and every case found so far in which a price above zero appears anywhere (on the page, in Epic's order preview, in the order itself, sent through a service worker or a frame from another site, or re-sent by the page after the claim has ended), none of which may result in an order.
 
 **Not yet tested:** the last step on a real, signed-in account, that is, Epic's actual checkout inside a signed-in launcher. That needs a real account and could not be done from where this was built. The program is written to fail safely there: if the checkout does not look the way it expects, it places no order, saves what it saw under `diagnostics\`, and tries again later. If your first giveaway is not claimed, the log and that folder say why.
 

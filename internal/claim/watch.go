@@ -48,12 +48,12 @@ type netRecord struct {
 
 func newOrderWatch(dryRun bool) *orderWatch { return &orderWatch{dryRun: dryRun} }
 
-var reSubmit = regexp.MustCompile(`(?i)(confirm|place|submit|create|complete|finali[sz]e)[-_/]?order|quickpurchase|/orders/?$`)
+var reSubmit = regexp.MustCompile(`(?i)(confirm|place|submit|create|complete|finali[sz]e)[-_/]?order|quickpurchase|/orders/?$|/(checkout|purchase)/(api/)?(complete|confirm|submit|place|finali[sz]e)\b`)
 
 // isOrderSubmit reports whether a request address is one that places an order
 // (as opposed to previewing or looking one up).
 func isOrderSubmit(method, raw string) bool {
-	if method != "POST" && method != "PUT" {
+	if method != "POST" && method != "PUT" && method != "PATCH" {
 		return false
 	}
 	path := raw
@@ -65,6 +65,20 @@ func isOrderSubmit(method, raw string) bool {
 
 func isOrderPreview(raw string) bool {
 	return strings.Contains(strings.ToLower(raw), "order-preview") || strings.Contains(strings.ToLower(raw), "orderpreview")
+}
+
+// mayPlaceOrder reports whether a request, seen while no claim is in
+// progress, could place an order or states a price: such a request is never
+// let out unsupervised.
+func mayPlaceOrder(method, rawURL, postData string) bool {
+	if method != "POST" && method != "PUT" && method != "PATCH" {
+		return false
+	}
+	if isOrderSubmit(method, rawURL) {
+		return true
+	}
+	v, _ := judgeBody([]byte(postData))
+	return v == Paid
 }
 
 // judgeBody reads the totals out of a request or response body, whether it
@@ -126,14 +140,17 @@ func (w *orderWatch) onRequest(method, rawURL, postData string, hasPostData bool
 		return true
 	case w.dryRun:
 		w.blocked = "refused to send an order during a dry run"
+	case w.paid || w.preview == Paid:
+		// Something said "costs money" earlier in this claim. Nothing the
+		// order itself says can outweigh that.
+		w.blocked = "refused to send an order after a total above zero was seen; nothing was ordered"
+	case hasPostData && postData == "":
+		w.blocked = "refused to send an order whose content could not be inspected; nothing was ordered"
 	case verdict == Free:
 		// The order itself says its total is zero.
 	case w.preClick == Free || w.preview == Free:
 		// The order does not state a total, but the checkout did, and it
 		// was zero.
-		if hasPostData && postData == "" {
-			rec.Note = "request body was not available for inspection"
-		}
 	default:
 		w.blocked = "refused to send an order whose total could not be confirmed to be zero; nothing was ordered"
 	}

@@ -14,7 +14,7 @@ import (
 // productJS reports the state of a game's store page: its main button and
 // whatever stands between the visitor and the checkout. It only reads.
 const productJS = `(function () {
-  function text(el) { return ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim(); }
+  function text(el) { return ((el && (typeof el.innerText === 'string' ? el.innerText : el.textContent)) || '').replace(/\s+/g, ' ').trim(); }
   function shown(el, min) {
     if (!el) return false;
     var r = el.getBoundingClientRect();
@@ -54,9 +54,12 @@ const productJS = `(function () {
   if (!cta) cta = find(/^(get|free|claim)$/i);
   out.cta = cta ? button(cta) : null;
   var label = cta ? text(cta) : '';
-  out.owned = /^(in library|owned)$/i.test(label) || !!find(/^(in library|owned)$/i);
-  out.needsBase = /requires base game/i.test(label) || !!find(/^requires base game$/i);
-  out.unavailable = /^(unavailable|coming soon)$/i.test(label) || /unavailable in your platform or region/i.test(body);
+  // Read from the page's main button only: other buttons on the page
+  // belong to other editions and add-ons.
+  out.owned = /^(in library|owned)$/i.test(label);
+  out.needsBase = /requires base game/i.test(label);
+  out.notYet = /^(unavailable|coming soon)$/i.test(label);
+  out.region = /unavailable in your platform or region/i.test(body);
   var gate = find(/^continue$/i);
   out.gate = gate ? button(gate) : null;
   var yes = find(/^yes, buy now$/i);
@@ -77,7 +80,8 @@ type productState struct {
 	CTA          *btn     `json:"cta"`
 	Owned        bool     `json:"owned"`
 	NeedsBase    bool     `json:"needsBase"`
-	Unavailable  bool     `json:"unavailable"`
+	NotYet       bool     `json:"notYet"`
+	Region       bool     `json:"region"`
 	Gate         *btn     `json:"gate"`
 	Confirm      *btn     `json:"confirm"`
 	EULA         bool     `json:"eula"`
@@ -145,7 +149,7 @@ func (s *Session) viaStorePage(ctx context.Context, o feed.Offer, w *orderWatch)
 		return Result{Failed, "the launcher did not show the game's store page"}, last
 	}
 
-	deadline := time.Now().Add(90 * time.Second)
+	deadline := time.Now().Add(s.opt.StorePageWait)
 	var pressedAt, lastGate time.Time
 	presses := 0
 	var ps productState
@@ -176,11 +180,25 @@ func (s *Session) viaStorePage(ctx context.Context, o feed.Offer, w *orderWatch)
 				}
 				continue
 			case ps.Owned:
-				return Result{Owned, "the store page shows it is in the library"}, last
+				// The page may be that of the main game while the giveaway
+				// is an add-on or an edition of it, so the store is asked
+				// about this very offer. Without its answer, the button is
+				// only believed for a game or bundle, whose page is its own.
+				switch s.ownership(ctx, pageState{URL: ps.URL}, o) {
+				case ownYes:
+					return Result{Owned, "the store page shows it is in the library"}, last
+				case ownUnknown:
+					if o.OfferType == "" || o.OfferType == "BASE_GAME" || o.OfferType == "BUNDLE" {
+						return Result{Owned, "the store page shows it is in the library"}, last
+					}
+				}
+				return Result{Failed, "the store page says \"In Library\", but that could not be confirmed for this very offer; will look again later"}, last
 			case ps.NeedsBase:
-				return Result{Unavailable, "it needs a base game that is not in the library"}, last
-			case ps.Unavailable:
-				return Result{Unavailable, "the store page says it is unavailable"}, last
+				return Result{Later, "it needs a base game that is not in the library"}, last
+			case ps.NotYet:
+				return Result{Later, "the store page does not offer it right now"}, last
+			case ps.Region:
+				return Result{Unavailable, "the store page says it is unavailable in this region"}, last
 			case ps.EULA:
 				return Result{Failed, "the game asks you to accept its licence agreement first; get it once by hand in the launcher"}, last
 			case ps.InPage:

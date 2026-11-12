@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -55,8 +56,59 @@ func TestNormalizeAndBadInput(t *testing.T) {
 	if err == nil {
 		t.Fatal("broken file should be reported")
 	}
-	if c != Default() {
-		t.Fatalf("broken file should fall back to defaults, got %+v", c)
+	// A file that cannot be read falls back to the cautious settings: it
+	// was written because something other than the defaults was wanted.
+	want := Default()
+	want.DryRun, want.RestartIdleLauncher = true, false
+	if c != want {
+		t.Fatalf("broken file should fall back to the cautious settings, got %+v", c)
+	}
+	if !strings.Contains(err.Error(), "NOTHING WILL BE ORDERED") {
+		t.Fatalf("error = %v", err)
+	}
+
+	// The slip Notepad users make most: a trailing comma.
+	if err := os.WriteFile(path, []byte(`{"dryRun": true, "restartIdleLauncher": false,}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c, err = Load(path); err == nil || !c.DryRun || c.RestartIdleLauncher {
+		t.Fatalf("trailing comma: %+v, %v", c, err)
+	}
+
+	// One value of the wrong kind: the rest of the file still applies.
+	if err := os.WriteFile(path, []byte(`{"dryRun": true, "checkEveryMinutes": "30", "restartIdleLauncher": false, "country": "de"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err = Load(path)
+	if err == nil || !strings.Contains(err.Error(), "checkEveryMinutes") {
+		t.Fatalf("type error should name the setting: %v", err)
+	}
+	if !c.DryRun || c.RestartIdleLauncher || c.Country != "DE" || c.CheckEveryMinutes != 60 {
+		t.Fatalf("type error: %+v", c)
+	}
+}
+
+func TestNotepadEncodings(t *testing.T) {
+	const text = `{"dryRun": true, "country": "fr"}`
+	utf16le := []byte{0xFF, 0xFE}
+	utf16be := []byte{0xFE, 0xFF}
+	for _, r := range text {
+		utf16le = append(utf16le, byte(r), 0)
+		utf16be = append(utf16be, 0, byte(r))
+	}
+	for name, raw := range map[string][]byte{
+		"UTF-8 with BOM": append([]byte{0xEF, 0xBB, 0xBF}, text...),
+		"UTF-16 LE":      utf16le,
+		"UTF-16 BE":      utf16be,
+	} {
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if err != nil || !c.DryRun || c.Country != "FR" || !c.RestartIdleLauncher {
+			t.Errorf("%s: %+v, %v", name, c, err)
+		}
 	}
 }
 
