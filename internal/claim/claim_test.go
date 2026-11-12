@@ -1250,3 +1250,65 @@ func TestCheckoutWindowForAnotherOfferIsNotUsed(t *testing.T) {
 		t.Fatalf("orders = %d", store.orderCount())
 	}
 }
+
+// ---- regression tests for the session-lifecycle review
+
+func TestNoClickOnceTheClaimIsCalledOff(t *testing.T) {
+	// The user starts the launcher (or the program is told to stop) at the
+	// very moment the checkout has been found ready. Nothing is pressed,
+	// by mouse or by script, and the attempt is not counted as a failure
+	// of the checkout.
+	for _, sc := range []scenario{
+		{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0)},
+		{SignedIn: true, NewLayout: true},
+	} {
+		base := sharedBrowser(t)
+		store := newMockStore(t, sc)
+		ctx, cancel := context.WithCancel(context.Background())
+		opt := Options{CheckoutBases: []string{store.URL()}, LoginBase: store.URL(), SettleWait: 50 * time.Millisecond, CheckoutWait: 12 * time.Second, OrderWait: 14 * time.Second}
+		opt.Logf = func(f string, a ...any) {
+			t.Logf(f, a...)
+			if strings.Contains(f, "checkout ready") {
+				cancel()
+			}
+		}
+		s, err := Open(ctx, base, opt)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		res := s.Claim(ctx, testOffer())
+		s.Close()
+		cancel()
+		time.Sleep(300 * time.Millisecond)
+		if res.Outcome != Failed || res.Detail != "interrupted" {
+			t.Errorf("result = %v", res)
+		}
+		if n := store.hitCount("place"); n != 0 {
+			t.Errorf("the order button was pressed %d time(s) after the claim was called off", n)
+		}
+		if n := store.orderCount(); n != 0 {
+			t.Errorf("%d order(s) reached the store", n)
+		}
+	}
+}
+
+func TestLeavePagePromptDoesNotHoldTheSessionUp(t *testing.T) {
+	// A checkout that asks "Leave this page?" must not stall the clean-up
+	// after a claim (or the next offer's checkout).
+	started := time.Now()
+	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0),
+		ExtraHTML: `<script>window.addEventListener('beforeunload', function (e) { e.preventDefault(); e.returnValue = 'Leave?'; });</script>`}, nil)
+	wantOutcome(t, r, Claimed, 1)
+	if took := time.Since(started); took > 9*time.Second {
+		t.Errorf("the session took %v; the leave-page prompt held it up", took.Round(time.Second))
+	}
+}
+
+func TestOrderButtonIsPressedOnce(t *testing.T) {
+	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0)}, nil)
+	wantOutcome(t, r, Claimed, 1)
+	if n := r.store.hitCount("place"); n != 1 {
+		t.Errorf("the order button was pressed %d times", n)
+	}
+}

@@ -254,6 +254,11 @@ func (c *Conn) Done() <-chan struct{} { return c.done }
 
 // Call sends a command and waits for its reply. result may be nil.
 func (c *Conn) Call(ctx context.Context, method string, params any, result any) error {
+	// A command that is sent is carried out, whether or not anyone waits
+	// for the reply: nothing is sent once the caller has been called off.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%s: %w", method, err)
+	}
 	id := c.nextID.Add(1)
 	ch := make(chan reply, 1)
 

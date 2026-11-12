@@ -584,6 +584,10 @@ func (s *Session) eventLoop(t *tab) {
 		case <-t.page.Done():
 			return
 		case ev := <-t.page.Events():
+			if ev.Method == "Page.javascriptDialogOpening" {
+				s.dismissDialog(t.page, ev.Params)
+				continue
+			}
 			if ev.Method != "Fetch.requestPaused" {
 				continue
 			}
@@ -594,6 +598,20 @@ func (s *Session) eventLoop(t *tab) {
 			s.answer(t.page, p)
 		}
 	}
+}
+
+// dismissDialog answers a dialog the page has opened. Unanswered, it would
+// hold the page (and every navigation away from it) up. "Leave this page?"
+// is answered with yes, so that a checkout can always be left; anything
+// else is declined.
+func (s *Session) dismissDialog(page *cdp.Page, params json.RawMessage) {
+	var d struct {
+		Type string `json:"type"`
+	}
+	_ = json.Unmarshal(params, &d)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = page.Call(ctx, "Page.handleJavaScriptDialog", map[string]any{"accept": d.Type == "beforeunload"}, nil)
 }
 
 func (s *Session) answer(page *cdp.Page, p pausedRequest) {
@@ -969,7 +987,7 @@ func priceEvidence(st pageState, w *orderWatch) (Verdict, []string) {
 func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFallThrough bool, known map[string]bool) (res Result, last pageState, tryNext bool) {
 	// ---- wait until the checkout is ready AND proves the price is zero
 	deadline := time.Now().Add(s.opt.CheckoutWait)
-	var errorSince, strangerSince, lastAdopt time.Time
+	var errorSince, strangerSince, lastAdopt, checkSeen time.Time
 	adopted, sawBrowserCheck, ownChecked, sawButton := false, false, false, false
 	var evidence []string
 	pre := Unknown
@@ -1009,6 +1027,9 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 				return Result{Throttled, "Epic says this account cannot claim more free games right now"}, last, false
 			case st.Captcha:
 				return Result{Captcha, "Epic asked for a human check before the order"}, last, false
+			}
+			if st.BrowserCheck {
+				checkSeen = time.Now()
 			}
 			if st.BrowserCheck && !sawBrowserCheck {
 				// Epic's site is checking the browser (a Cloudflare page).
@@ -1078,7 +1099,9 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 		}
 		if time.Now().After(deadline) {
 			switch {
-			case last.BrowserCheck:
+			case last.BrowserCheck || (sawBrowserCheck && time.Since(checkSeen) < 5*time.Second):
+				// (The check's page reloads itself every second or so; the
+				// last look may have caught it in between.)
 				// Backs off like a CAPTCHA: asking again soon would not help.
 				return Result{Captcha, "Epic's site kept showing its browser check instead of the checkout"}, last, false
 			case sawButton:
@@ -1109,10 +1132,19 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 	}
 
 	// ---- place the order
+	if ctx.Err() != nil {
+		return Result{Failed, "interrupted"}, last, false
+	}
 	pressed := *last.Place
 	// Words of thanks that were on the page before the press prove nothing.
 	thanksBefore := last.Success
 	if err := s.click(ctx, last.Place); err != nil {
+		if errors.Is(err, cdp.ErrPressed) {
+			return Result{Failed, "interrupted after the order button was pressed; the library will be checked next time"}, last, false
+		}
+		if ctx.Err() != nil {
+			return Result{Failed, "interrupted"}, last, false
+		}
 		return Result{Failed, "could not press the order button: " + err.Error()}, last, false
 	}
 	clickedAt := time.Now()
@@ -1242,8 +1274,15 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 func (s *Session) click(ctx context.Context, b *btn) error {
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if err := s.page.Click(cctx, b.X, b.Y); err == nil {
+	err := s.page.Click(cctx, b.X, b.Y)
+	if err == nil {
 		return nil
+	}
+	// The scripted click is only for a browser that refuses mouse input.
+	// It must not follow a mouse click that may have landed (that would be
+	// two clicks), nor a claim that has been called off.
+	if errors.Is(err, cdp.ErrPressed) || cctx.Err() != nil {
+		return err
 	}
 	var ok bool
 	if err := s.page.Eval(cctx, fmt.Sprintf("%s(%f, %f)", clickJS, b.X, b.Y), &ok); err != nil {

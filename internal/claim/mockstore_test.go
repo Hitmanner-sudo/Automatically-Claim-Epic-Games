@@ -143,6 +143,20 @@ window.addEventListener('message', function (ev) {
 
 func (m *mockStore) URL() string { return m.srv.URL }
 
+// hitCount is how often pages reported an event (a click on the order
+// button reports "place").
+func (m *mockStore) hitCount(what string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, h := range m.hits {
+		if h == what {
+			n++
+		}
+	}
+	return n
+}
+
 func (m *mockStore) orderCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -324,6 +338,7 @@ if (S.throttled) document.getElementById('extra').textContent = 'Your account is
 setTimeout(function () { btn.disabled = false; }, S.slowMs || 0);
 btn.addEventListener('click', function (ev) {
   window.clicks.push({ what: 'place', trusted: ev.isTrusted });
+  fetch('/hit?what=place');
   fetch(S.submitPath || '/checkout/api/complete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ purchaseToken: 'tok', offers: offers }) })
     .then(function (r) { return r.json(); }).then(function (c) {
       if (c.error) document.getElementById('extra').innerHTML = '<div role="alert">' + c.message + '</div>';
@@ -451,6 +466,7 @@ function submit() {
 }
 btn.addEventListener('click', function (ev) {
   window.clicks.push({ what: 'place', trusted: ev.isTrusted });
+  fetch('/hit?what=place');
   submit();
 });
 </script></body></html>`

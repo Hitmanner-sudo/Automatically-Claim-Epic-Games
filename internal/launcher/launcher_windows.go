@@ -102,7 +102,7 @@ func Locate(override string) (Install, error) {
 	// 1. A launcher that is running right now is the most certain answer.
 	if procs, err := win.Processes(); err == nil {
 		for _, p := range procs {
-			if strings.EqualFold(p.Name, ExeName) {
+			if isLauncher(p) {
 				add(win.ImagePath(p.PID))
 			}
 		}
@@ -185,7 +185,7 @@ func Inspect() Activity {
 	tree := map[uint32]bool{}
 	var transfer []uint32
 	for _, p := range procs {
-		if strings.EqualFold(p.Name, ExeName) {
+		if isLauncher(p) {
 			a.PIDs = append(a.PIDs, p.PID)
 			tree[p.PID] = true
 			transfer = append(transfer, p.PID)
@@ -260,6 +260,14 @@ func Inspect() Activity {
 	return a
 }
 
+// isLauncher reports whether a process is a launcher of this Windows
+// session. With fast user switching another signed-in user's launcher may be
+// running too: it cannot be looked into or closed from here, and it does
+// not get in a hidden launcher's way.
+func isLauncher(p win.ProcInfo) bool {
+	return strings.EqualFold(p.Name, ExeName) && win.InThisSession(p.PID)
+}
+
 // visibleLauncherWindow reports whether any launcher process shows a window
 // on the user's desktop.
 func visibleLauncherWindow() bool {
@@ -269,7 +277,7 @@ func visibleLauncherWindow() bool {
 	}
 	tree := map[uint32]bool{}
 	for _, p := range procs {
-		if strings.EqualFold(p.Name, ExeName) {
+		if isLauncher(p) {
 			tree[p.PID] = true
 		}
 	}
@@ -298,7 +306,7 @@ func KillLeftovers() int {
 	}
 	var stale []uint32
 	for _, p := range procs {
-		if strings.EqualFold(p.Name, ExeName) && strings.Contains(win.CommandLine(p.PID), "-cefdebug=") {
+		if isLauncher(p) && strings.Contains(win.CommandLine(p.PID), "-cefdebug=") {
 			stale = append(stale, p.PID)
 		}
 	}
@@ -341,7 +349,7 @@ func launcherRunning() bool {
 		return true
 	}
 	for _, p := range procs {
-		if strings.EqualFold(p.Name, ExeName) {
+		if isLauncher(p) {
 			return true
 		}
 	}
@@ -351,11 +359,11 @@ func launcherRunning() bool {
 // StopUserInstance ends the launcher the user left idle in the tray, so that
 // a private hidden instance can take its place for a moment. The check that
 // found it idle took a few seconds, so it is repeated here: if the user has
-// opened the launcher in the meantime, nothing is touched and false is
-// returned.
-func StopUserInstance(a Activity) bool {
+// opened the launcher in the meantime, nothing is touched. When the launcher
+// is not gone afterwards, why says what stood in the way.
+func StopUserInstance(a Activity) (stopped bool, why string) {
 	if visibleLauncherWindow() {
-		return false
+		return false, "the launcher window is open"
 	}
 	// Only processes that still are the launcher (ids get reused).
 	var pids []uint32
@@ -365,7 +373,7 @@ func StopUserInstance(a Activity) bool {
 			was[pid] = true
 		}
 		for _, p := range procs {
-			if was[p.PID] && strings.EqualFold(p.Name, ExeName) {
+			if was[p.PID] && isLauncher(p) {
 				pids = append(pids, p.PID)
 			}
 		}
@@ -377,8 +385,13 @@ func StopUserInstance(a Activity) bool {
 	for time.Now().Before(deadline) && launcherRunning() {
 		time.Sleep(300 * time.Millisecond)
 	}
+	if launcherRunning() {
+		// Typically a launcher running with administrator rights, which a
+		// program without them may not end.
+		return false, "the launcher is running and could not be closed (it may have been started with administrator rights)"
+	}
 	time.Sleep(1500 * time.Millisecond)
-	return true
+	return true, ""
 }
 
 // Running reports whether any launcher process exists.
@@ -429,6 +442,10 @@ type Instance struct {
 
 	mu      sync.Mutex
 	flagged map[uint32]bool
+	// spawnMu is held while this program starts a process of its own and
+	// while the process list is read, so that no reading ever shows such a
+	// process before it has been placed among the instance's own.
+	spawnMu sync.Mutex
 }
 
 // StartHidden starts the launcher invisibly with its embedded browser's
@@ -461,6 +478,8 @@ func (in *Instance) Summon(link ...string) error {
 	if in.proc == nil {
 		return errors.New("hidden launcher is not running")
 	}
+	in.spawnMu.Lock()
+	defer in.spawnMu.Unlock()
 	_, err := in.proc.Spawn(in.inst.Exe, link, in.inst.Dir, in.desktop.Name, in.env)
 	return err
 }
@@ -500,6 +519,9 @@ func (in *Instance) isMine(pid uint32, job map[uint32]bool) (mine, known bool) {
 // an Epic program. When in doubt the answer is no: wrongly stepping aside
 // would put a launcher window on the user's screen.
 func startedFromOutside(p win.ProcInfo, byPID map[uint32]win.ProcInfo) bool {
+	if p.PPID == uint32(os.Getpid()) {
+		return false // what this program starts is never the user
+	}
 	parent, ok := byPID[p.PPID]
 	if !ok {
 		return false
@@ -511,17 +533,22 @@ func startedFromOutside(p win.ProcInfo, byPID map[uint32]win.ProcInfo) bool {
 // launchers splits the running launcher processes into this instance's own
 // and those started by someone else.
 func (in *Instance) launchers() (mine, foreign []win.ProcInfo) {
+	if in.proc == nil {
+		return nil, nil
+	}
+	in.spawnMu.Lock()
 	procs, err := win.Processes()
-	if err != nil || in.proc == nil {
+	job := in.proc.PIDs()
+	in.spawnMu.Unlock()
+	if err != nil {
 		return nil, nil
 	}
 	byPID := make(map[uint32]win.ProcInfo, len(procs))
 	for _, p := range procs {
 		byPID[p.PID] = p
 	}
-	job := in.proc.PIDs()
 	for _, p := range procs {
-		if !strings.EqualFold(p.Name, ExeName) {
+		if !isLauncher(p) {
 			continue
 		}
 		m, known := in.isMine(p.PID, job)
@@ -579,6 +606,25 @@ func (in *Instance) HiddenWindows() []win.Window {
 	return in.desktop.Windows()
 }
 
+// AskToClose asks the hidden launcher's windows to close, as a person
+// closing them would. It reports whether there was anything to ask; the
+// launcher then needs a few seconds to save its state and exit.
+func (in *Instance) AskToClose() bool {
+	if in == nil || in.proc == nil {
+		return false
+	}
+	mine, _ := in.launchers()
+	if len(mine) == 0 {
+		return false
+	}
+	pids := in.proc.PIDs()
+	for _, p := range mine {
+		pids[p.PID] = true
+	}
+	n, err := in.desktop.RequestClose(pids)
+	return err == nil && n > 0
+}
+
 // Stop shuts the hidden launcher down: first by asking its windows to close,
 // then, after the grace period, by ending its processes.
 func (in *Instance) Stop(grace time.Duration) {
@@ -586,16 +632,10 @@ func (in *Instance) Stop(grace time.Duration) {
 		return
 	}
 	mine, _ := in.launchers()
-	if grace > 0 && len(mine) > 0 {
-		pids := in.proc.PIDs()
-		for _, p := range mine {
-			pids[p.PID] = true
-		}
-		if n, err := in.desktop.RequestClose(pids); err == nil && n > 0 {
-			deadline := time.Now().Add(grace)
-			for time.Now().Before(deadline) && in.Alive() {
-				time.Sleep(250 * time.Millisecond)
-			}
+	if grace > 0 && in.AskToClose() {
+		deadline := time.Now().Add(grace)
+		for time.Now().Before(deadline) && in.Alive() {
+			time.Sleep(250 * time.Millisecond)
 		}
 	}
 	// Whatever is left, including a re-executed launcher that slipped out
@@ -678,26 +718,17 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 	if err != nil {
 		return err
 	}
-	handedOver := false
-	defer func() {
-		if !handedOver {
-			proc.Close()
-		}
-	}()
+	defer proc.Close()
 
 	// userCommand returns the command line of a launcher start that is not
 	// part of this run: the user asking for the launcher.
-	userCommand := func() (string, bool) {
-		procs, err := win.Processes()
-		if err != nil {
-			return "", false
-		}
+	userCommand := func(procs []win.ProcInfo) (string, bool) {
 		byPID := make(map[uint32]win.ProcInfo, len(procs))
 		for _, p := range procs {
 			byPID[p.PID] = p
 		}
 		for _, p := range procs {
-			if !strings.EqualFold(p.Name, ExeName) || !startedFromOutside(p, byPID) {
+			if !isLauncher(p) || !startedFromOutside(p, byPID) {
 				continue
 			}
 			cmd := win.CommandLine(p.PID)
@@ -708,7 +739,12 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 		return "", false
 	}
 
+	// The guard hides, within a few hundredths of a second, any window that
+	// this run's own processes show, and it is also what notices the user
+	// starting the launcher (a start that lives only for a moment before
+	// the launcher running here absorbs it).
 	stopGuard := make(chan struct{})
+	userStart := make(chan string, 1)
 	var guardDone sync.WaitGroup
 	var hiddenCount int
 	guardDone.Add(1)
@@ -716,29 +752,41 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 		defer guardDone.Done()
 		t := time.NewTicker(40 * time.Millisecond)
 		defer t.Stop()
-		names := map[uint32]bool{}
-		refresh := time.Time{}
+		extra := map[uint32]bool{}
+		scanned := time.Time{}
 		for {
 			select {
 			case <-stopGuard:
 				return
 			case <-t.C:
-				if time.Since(refresh) > 500*time.Millisecond {
-					refresh = time.Now()
-					// This run's own processes only: what it started, the
-					// launcher that comes back from the update carrying this
-					// run's switch, and the updater in between.
-					names = proc.PIDs()
+				// This run's own processes only: what it started (asked
+				// afresh every time, so that a new process is known at
+				// once), the launcher that comes back from the update
+				// carrying this run's switch, and the updater in between.
+				names := proc.PIDs()
+				if time.Since(scanned) > 200*time.Millisecond {
+					scanned = time.Now()
 					if procs, err := win.Processes(); err == nil {
+						extra = map[uint32]bool{}
 						for _, p := range procs {
 							switch {
-							case strings.EqualFold(p.Name, "EpicGamesUpdater.exe"):
-								names[p.PID] = true
-							case strings.EqualFold(p.Name, ExeName) && strings.Contains(win.CommandLine(p.PID), flag):
-								names[p.PID] = true
+							case strings.EqualFold(p.Name, "EpicGamesUpdater.exe") && win.InThisSession(p.PID):
+								extra[p.PID] = true
+							case isLauncher(p) && strings.Contains(win.CommandLine(p.PID), flag):
+								extra[p.PID] = true
 							}
 						}
+						if cmd, yes := userCommand(procs); yes {
+							select {
+							case userStart <- cmd:
+							default:
+							}
+							return // their launcher from here on: nothing more is hidden
+						}
 					}
+				}
+				for pid := range extra {
+					names[pid] = true
 				}
 				for _, w := range win.Windows() {
 					if names[w.PID] && w.Visible {
@@ -759,23 +807,44 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 	}
 	defer stopGuardNow()
 
+	// endRun ends every launcher that carries this run's switch, wherever
+	// the updater started it from, and waits until none is left.
+	endRun := func() {
+		var mine []uint32
+		if procs, err := win.Processes(); err == nil {
+			for _, p := range procs {
+				if isLauncher(p) && strings.Contains(win.CommandLine(p.PID), flag) {
+					mine = append(mine, p.PID)
+				}
+			}
+		}
+		killLaunchers(mine)
+		proc.Kill()
+		stop := time.Now().Add(10 * time.Second)
+		for time.Now().Before(stop) && launcherRunning() {
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
+
+	// handOver is for when the user starts the launcher during this run.
+	// Their start was absorbed by the launcher running here, which carries
+	// this program's switches. It is ended, and the launcher is started
+	// afresh the way they started it, so that what they get is entirely
+	// their own.
+	handOver := func(cmd string) error {
+		stopGuardNow()
+		endRun()
+		_ = win.StartDetached(inst.Exe, userArgs(cmd), inst.Dir)
+		logf("the launcher was started by the user while it was updating; leaving it to them")
+		return ErrUserStarted
+	}
+
 	// The update is finished when the (restarted) launcher is back with its
 	// DevTools endpoint up.
 	base := cdp.Base(port)
 	deadline := time.Now().Add(10 * time.Minute)
 	ok := false
 	for time.Now().Before(deadline) && ctx.Err() == nil {
-		if cmd, yes := userCommand(); yes {
-			// Their start was absorbed by the launcher running here. Stop
-			// hiding its windows, let it live, and repeat their start so
-			// that it shows itself.
-			stopGuardNow()
-			proc.Release()
-			handedOver = true
-			_ = win.StartDetached(inst.Exe, userArgs(cmd), inst.Dir)
-			logf("the launcher was started by the user while it was updating; leaving it to them")
-			return ErrUserStarted
-		}
 		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		_, verr := cdp.Version(cctx, base)
 		cancel()
@@ -785,6 +854,8 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 		}
 		select {
 		case <-ctx.Done():
+		case cmd := <-userStart:
+			return handOver(cmd)
 		case <-time.After(400 * time.Millisecond):
 		}
 	}
@@ -792,26 +863,18 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 		// Let it settle (it writes its state right after starting).
 		select {
 		case <-ctx.Done():
+		case cmd := <-userStart:
+			return handOver(cmd)
 		case <-time.After(6 * time.Second):
 		}
 	}
+	select {
+	case cmd := <-userStart:
+		return handOver(cmd)
+	default:
+	}
 
-	// End every launcher that carries this run's switch, wherever the
-	// updater started it from.
-	var mine []uint32
-	if procs, err := win.Processes(); err == nil {
-		for _, p := range procs {
-			if strings.EqualFold(p.Name, ExeName) && strings.Contains(win.CommandLine(p.PID), flag) {
-				mine = append(mine, p.PID)
-			}
-		}
-	}
-	killLaunchers(mine)
-	proc.Kill()
-	stop := time.Now().Add(10 * time.Second)
-	for time.Now().Before(stop) && launcherRunning() {
-		time.Sleep(300 * time.Millisecond)
-	}
+	endRun()
 	time.Sleep(1500 * time.Millisecond)
 
 	if ctx.Err() != nil {

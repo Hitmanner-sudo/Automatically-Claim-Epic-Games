@@ -99,11 +99,34 @@ func (r *Runner) startWatch(h *hidden) {
 	}()
 }
 
-// close ends the watch and the hidden launcher.
+// close ends the hidden launcher and the watch. With a grace period the
+// launcher is first asked to close and given that long to do so; the watch
+// stays on meanwhile, and the wait ends at once if the user asks for the
+// launcher (h.userCmd is then set, and the caller hands over).
 func (h *hidden) close(grace time.Duration) {
+	if grace > 0 && h.userCmd.Load() == nil && h.in.AskToClose() {
+		deadline := time.Now().Add(grace)
+		for time.Now().Before(deadline) && h.userCmd.Load() == nil && h.in.Alive() {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
 	h.cancel()
 	h.watch.Wait()
-	h.in.Stop(grace)
+	h.in.Stop(0)
+}
+
+// finish shuts the hidden launcher down at the end of a session. If the
+// user asked for the launcher at any point, the shutdown included, it is
+// started for them and true is returned.
+func (r *Runner) finish(inst launcher.Install, h *hidden, grace time.Duration) (handedOver bool) {
+	if h.userCmd.Load() == nil {
+		h.close(grace)
+	}
+	if h.userCmd.Load() != nil {
+		r.handOver(inst, h)
+		return true
+	}
+	return false
 }
 
 // handOver gets out of the user's way: their start of the launcher was
@@ -229,12 +252,12 @@ func (r *Runner) makeRoom() (inst launcher.Install, restore bool, release func()
 		release()
 		return inst, false, nil, e
 	}
-	if n := launcher.KillLeftovers(); n > 0 {
-		r.logf("ended %d hidden launcher(s) left over from an earlier run", n)
-	}
 	// Never get in the user's way.
 	if win.FullscreenActivity() {
 		return fail(&daemon.BusyError{Reason: "a full-screen game or presentation is running"})
+	}
+	if n := launcher.KillLeftovers(); n > 0 {
+		r.logf("ended %d hidden launcher(s) left over from an earlier run", n)
 	}
 	act := launcher.Inspect()
 	if act.Running {
@@ -244,8 +267,8 @@ func (r *Runner) makeRoom() (inst launcher.Install, restore bool, release func()
 		if !r.RestartIdleLauncher {
 			return fail(&daemon.BusyError{Reason: "the launcher is running in the tray, and the settings say not to restart it"})
 		}
-		if !launcher.StopUserInstance(act) {
-			return fail(&daemon.BusyError{Reason: "the launcher window is open"})
+		if stopped, why := launcher.StopUserInstance(act); !stopped {
+			return fail(&daemon.BusyError{Reason: why})
 		}
 		r.logf("the launcher was idle in the tray; closed it for a moment so a hidden one can run")
 		restore = true
@@ -284,7 +307,7 @@ func (r *Runner) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]
 		}
 		return results, err
 	}
-	defer h.close(8 * time.Second)
+	defer h.close(0) // whatever happens below, it does not outlive this call
 	r.logf("hidden %s is up after %v (DevTools on port %d)", inst.Gen, time.Since(started).Round(time.Second), h.in.Port)
 
 	sess, err := r.openSession(h.ctx, h.in, h.base)
@@ -312,9 +335,8 @@ func (r *Runner) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]
 		sess.Close()
 	}
 
-	if h.userCmd.Load() != nil {
+	if r.finish(inst, h, 8*time.Second) {
 		handedOver = true
-		r.handOver(inst, h)
 		return results, daemon.ErrYielded
 	}
 	if err != nil {
@@ -437,7 +459,7 @@ func (r *Runner) TrialLaunch(ctx context.Context) LaunchReport {
 		rep.Err = err.Error()
 		return rep
 	}
-	defer h.close(8 * time.Second)
+	defer h.close(0)
 	in, base := h.in, h.base
 	rep.Up = true
 	rep.StartupSeconds = time.Since(started).Seconds()
@@ -493,9 +515,8 @@ func (r *Runner) TrialLaunch(ctx context.Context) LaunchReport {
 	rep.Pages = surveyPages(ctx, base)
 	rep.HiddenWindows = in.HiddenWindows()
 	rep.OnUserDesktop = in.OnUserDesktop()
-	if h.userCmd.Load() != nil {
+	if r.finish(inst, h, 8*time.Second) {
 		handedOver = true
-		r.handOver(inst, h)
 		rep.Err = "the launcher was started by the user during the trial; stepped aside"
 	}
 	return rep

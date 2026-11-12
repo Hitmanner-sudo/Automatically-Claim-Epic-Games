@@ -391,23 +391,6 @@ func (p *Process) Kill() {
 	}
 }
 
-// Release lets the process tree go: it keeps running after this program
-// has let go of it and after this program exits.
-func (p *Process) Release() {
-	if p == nil {
-		return
-	}
-	if p.job != 0 {
-		_ = setJobLimits(p.job, 0) // no longer "kill when the handle closes"
-		_ = windows.CloseHandle(p.job)
-		p.job = 0
-	}
-	if p.h != 0 {
-		_ = windows.CloseHandle(p.h)
-		p.h = 0
-	}
-}
-
 // Close kills whatever is left and releases the handles.
 func (p *Process) Close() {
 	if p == nil {
@@ -446,6 +429,24 @@ func Processes() ([]ProcInfo, error) {
 		out = append(out, ProcInfo{PID: e.ProcessID, PPID: e.ParentProcessID, Name: windows.UTF16ToString(e.ExeFile[:])})
 	}
 	return out, nil
+}
+
+var ownSession = sync.OnceValue(func() uint32 {
+	var sid uint32
+	_ = windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &sid)
+	return sid
+})
+
+// InThisSession reports whether a process belongs to the Windows session
+// (the signed-in user's desktop) this program runs in. A process that may
+// not even be asked is another user's, so the answer is no; when the
+// question fails for any other reason the process is taken to be local.
+func InThisSession(pid uint32) bool {
+	var sid uint32
+	if err := windows.ProcessIdToSessionId(pid, &sid); err != nil {
+		return !errors.Is(err, windows.ERROR_ACCESS_DENIED)
+	}
+	return sid == ownSession()
 }
 
 // ImagePath returns the full path of a process's executable.

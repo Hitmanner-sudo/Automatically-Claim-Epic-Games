@@ -171,9 +171,14 @@ func (p *Page) mouse(ctx context.Context, typ string, x, y float64, extra map[st
 	return p.Call(ctx, "Input.dispatchMouseEvent", params, nil)
 }
 
+// ErrPressed marks a click that failed after the mouse button had been
+// pressed: the page may well have received it.
+var ErrPressed = errors.New("the click may have been delivered")
+
 // Click moves the pointer to (x, y) in viewport coordinates and performs a
 // left click there, the way a person using a mouse would: a short glide,
-// press, brief hold, release.
+// press, brief hold, release. An error that wraps ErrPressed means the
+// button went down before something failed.
 func (p *Page) Click(ctx context.Context, x, y float64) error {
 	const steps = 8
 	fromX, fromY := p.mouseX, p.mouseY
@@ -190,14 +195,23 @@ func (p *Page) Click(ctx context.Context, x, y float64) error {
 	}
 	p.mouseX, p.mouseY = x, y
 	click := map[string]any{"button": "left", "buttons": 1, "clickCount": 1}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := p.mouse(ctx, "mousePressed", x, y, click); err != nil {
-		return err
+		// The command went out; whether it arrived is not known.
+		return fmt.Errorf("%w: %v", ErrPressed, err)
 	}
-	if err := sleepCtx(ctx, time.Duration(50+rand.IntN(60))*time.Millisecond); err != nil {
-		return err
-	}
+	// From here the click is completed whatever happens to the caller: a
+	// button left down would be worse than a finished click.
+	time.Sleep(time.Duration(50+rand.IntN(60)) * time.Millisecond)
 	click["buttons"] = 0
-	return p.mouse(ctx, "mouseReleased", x, y, click)
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := p.mouse(rctx, "mouseReleased", x, y, click); err != nil {
+		return fmt.Errorf("%w: %v", ErrPressed, err)
+	}
+	return nil
 }
 
 // Screenshot captures the page as JPEG, for diagnostics.

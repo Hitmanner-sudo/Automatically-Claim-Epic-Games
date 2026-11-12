@@ -120,6 +120,25 @@ func TestAgainstRealBrowser(t *testing.T) {
 		t.Fatalf("pointer did not glide to the target: moves=%d err=%v", moves, err)
 	}
 
+	// a caller that has been called off sends nothing: neither a script...
+	dead, kill := context.WithCancel(ctx)
+	kill()
+	if err := page.Eval(dead, `window.afterCancel = true`, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Eval on a cancelled context: %v", err)
+	}
+	// ...nor a click
+	if err := page.Click(dead, 260, 170); !errors.Is(err, context.Canceled) || errors.Is(err, cdp.ErrPressed) {
+		t.Fatalf("Click on a cancelled context: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	var after struct {
+		Flag   bool `json:"flag"`
+		Clicks int  `json:"clicks"`
+	}
+	if err := page.Eval(ctx, `({flag: !!window.afterCancel, clicks: window.clicks.length})`, &after); err != nil || after.Flag || after.Clicks != 1 {
+		t.Fatalf("commands were carried out after cancellation: %+v (%v)", after, err)
+	}
+
 	// same-site iframes can be evaluated in
 	waitFor(t, page, `!!document.getElementById("f").contentDocument && document.getElementById("f").contentDocument.readyState === "complete"`)
 	frames, err := page.Frames(ctx)
