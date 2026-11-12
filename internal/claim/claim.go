@@ -363,6 +363,7 @@ type tab struct {
 	// fenced: this is a background worker that was already running; it is
 	// kept away from order addresses (see fence).
 	fenced bool
+	kind   string // the target's type: page, iframe, worker, ...
 }
 
 // autoAttach asks the browser to attach every frame of another site and
@@ -395,7 +396,7 @@ func (s *Session) attach(ctx context.Context, t cdp.Target) (*tab, error) {
 	if err != nil {
 		return nil, fmt.Errorf("attach to launcher page: %w", err)
 	}
-	nt := &tab{id: t.ID, page: page, done: make(chan struct{})}
+	nt := &tab{id: t.ID, kind: t.Type, page: page, done: make(chan struct{})}
 	go s.eventLoop(nt)
 	// (Workers have no page to speak of; their requests are what matters.)
 	isWorker := strings.Contains(t.Type, "worker")
@@ -503,6 +504,42 @@ func (s *Session) adopted(targetID string) bool {
 		}
 	}
 	return false
+}
+
+// watching describes, for the log, what is under supervision next to the
+// page being driven.
+func (s *Session) watching() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	frames, workers, fenced, loose := 0, 0, 0, 0
+	count := func(kind string, supervised, isFenced bool) {
+		if strings.Contains(kind, "worker") {
+			workers++
+			switch {
+			case isFenced:
+				fenced++
+			case !supervised:
+				loose++
+			}
+			return
+		}
+		frames++
+	}
+	for _, k := range s.kids {
+		count(k.kind, k.supervised, k.fenced)
+	}
+	auto := false
+	for i, t := range s.tabs {
+		auto = auto || t.auto
+		if i > 0 && t.page != s.page {
+			count(t.kind, true, t.fenced)
+		}
+	}
+	how := "found by looking at intervals"
+	if auto {
+		how = "handed over by the browser as they are created"
+	}
+	return fmt.Sprintf("%d frame(s) and %d worker(s) next to the page (%d kept away from order addresses, %d not separately inspectable), %s", frames, workers, fenced, loose, how)
 }
 
 // unsupervised lists what is running next to the checkout without its
@@ -1330,6 +1367,7 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 				if !ownChecked {
 					// Frames from other sites get the same supervision.
 					s.superviseFrames(ctx, nil)
+					s.opt.Logf("%s: checkout is up; its requests are held back and checked, with %s", o.Title, s.watching())
 					// What does the account already have? (Asked once; it
 					// takes a moment, so the page is read afresh afterwards.)
 					ownChecked = true

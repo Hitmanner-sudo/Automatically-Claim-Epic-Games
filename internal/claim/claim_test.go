@@ -780,7 +780,11 @@ func pageIDs(base string) map[string]bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	out := map[string]bool{}
-	targets, _ := cdp.Targets(ctx, base)
+	targets, err := cdp.Targets(ctx, base)
+	if err != nil {
+		// An empty answer would make callers close or keep the wrong tabs.
+		panic("the test browser did not list its pages: " + err.Error())
+	}
 	for _, tg := range targets {
 		if tg.Type == "page" {
 			out[tg.ID] = true
@@ -1380,6 +1384,7 @@ func TestStorePageWithItsCheckoutInsideThePage(t *testing.T) {
 	if n := store.hitCount("place"); n != 1 {
 		t.Fatalf("the order button was pressed %d times", n)
 	}
+	s.Close() // (each part with a session of its own, one at a time)
 
 	// The same with a price: nothing is ordered.
 	before2 := pageIDs(base)
@@ -1396,6 +1401,7 @@ func TestStorePageWithItsCheckoutInsideThePage(t *testing.T) {
 	if n := paid.orderCount(); n != 0 {
 		t.Fatalf("paid: orders = %d", n)
 	}
+	s2.Close()
 
 	// A frame that is not this offer's checkout is left alone.
 	before3 := pageIDs(base)
