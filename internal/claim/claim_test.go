@@ -2,6 +2,7 @@ package claim
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -110,7 +111,7 @@ func runScenario(t *testing.T, sc scenario, mod func(*Options)) run {
 	if mod != nil {
 		mod(&opt)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), patience(90*time.Second)+opt.BrowserCheckWait)
 	defer cancel()
 	s, err := Open(ctx, base, opt)
 	if err != nil {
@@ -120,6 +121,32 @@ func runScenario(t *testing.T, sc scenario, mod func(*Options)) run {
 	r.res = s.Claim(ctx, testOffer())
 	t.Logf("result: %v", r.res)
 	return r
+}
+
+// whatWasSeen logs, for a scenario that went wrong, how often the checkout
+// was asked for and what the program last saw of the page.
+func whatWasSeen(t *testing.T, r run) {
+	t.Helper()
+	t.Logf("the checkout was requested %d time(s)", r.store.loads())
+	found, _ := filepath.Glob(filepath.Join(r.diag, "*", "summary.json"))
+	for _, f := range found {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		var doc struct {
+			Page struct {
+				URL, Title, Ready, Text string
+				BrowserCheck, App       bool
+			} `json:"page"`
+		}
+		if json.Unmarshal(raw, &doc) == nil {
+			if len(doc.Page.Text) > 300 {
+				doc.Page.Text = doc.Page.Text[:300]
+			}
+			t.Logf("last seen: %+v", doc.Page)
+		}
+	}
 }
 
 func wantOutcome(t *testing.T, r run, want Outcome, orders int) {
@@ -995,6 +1022,9 @@ func TestBrowserCheckIsWaitedOut(t *testing.T) {
 		o.BrowserCheckWait = patience(30 * time.Second)
 	})
 	wantOutcome(t, r, Claimed, 1)
+	if r.res.Outcome != Claimed {
+		whatWasSeen(t, r)
+	}
 }
 
 func TestBrowserCheckThatNeverPassesBacksOff(t *testing.T) {

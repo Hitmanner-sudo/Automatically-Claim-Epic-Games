@@ -90,6 +90,7 @@ type mockStore struct {
 	// lastOffers is the offers parameter of the last checkout opened.
 	lastOffers string
 	firstHit   time.Time
+	pageLoads  int      // how often the checkout page was asked for
 	hits       []string // what pages reported through /hit
 }
 
@@ -209,6 +210,12 @@ func (m *mockStore) hitCount(what string) int {
 	return n
 }
 
+func (m *mockStore) loads() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.pageLoads
+}
+
 func (m *mockStore) orderCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -318,6 +325,7 @@ const errorPage = `<!doctype html><html><head><title>Payment by Epic Games</titl
 func (m *mockStore) handleCheckout(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	m.mu.Lock()
+	m.pageLoads++
 	if m.firstHit.IsZero() {
 		m.firstHit = time.Now()
 	}
