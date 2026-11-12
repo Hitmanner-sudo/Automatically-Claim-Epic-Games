@@ -1004,12 +1004,15 @@ func TestRunSaysWhenItIsWaiting(t *testing.T) {
 	var mu sync.Mutex
 	var events []string
 	waiting := false
+	ran := make(chan struct{})
+	var ranOnce sync.Once
 	r.claim.during = func() {
 		mu.Lock()
 		if waiting {
 			events = append(events, "ROUND WHILE WAITING")
 		}
 		mu.Unlock()
+		ranOnce.Do(func() { close(ran) })
 	}
 	a := feed.Offer{Title: "Game a", Namespace: "ns", OfferID: "a", Start: time.Now().Add(-time.Hour), End: time.Now().Add(48 * time.Hour)}
 	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a}}
@@ -1030,16 +1033,22 @@ func TestRunSaysWhenItIsWaiting(t *testing.T) {
 		}})
 		close(done)
 	}()
-	deadline := time.After(20 * time.Second)
-	for len(r.claim.calls) == 0 {
-		select {
-		case <-deadline:
-			t.Fatal("the round never ran")
-		default:
-			time.Sleep(20 * time.Millisecond)
-		}
+	select {
+	case <-ran:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the round never ran")
 	}
-	time.Sleep(200 * time.Millisecond) // into the wait for the next day
+	// Give it time to get into the wait for the next day (however slow the
+	// machine): look until that wait has been announced.
+	for i := 0; i < 500; i++ {
+		mu.Lock()
+		n := len(events)
+		mu.Unlock()
+		if n >= 3 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	cancel()
 	<-done
 	mu.Lock()
