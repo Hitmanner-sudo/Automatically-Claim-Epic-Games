@@ -1,0 +1,1286 @@
+{
+ "data": {
+  "Catalog": {
+   "searchStore": {
+    "elements": [
+     {
+      "title": "Idle Champions of the Forgotten Realms",
+      "id": "a9748abde1c94b66aae5250bb9fc5503",
+      "namespace": "7e508f543b05465abe3a935960eb70ac",
+      "description": "Idle Champions of the Forgotten Realms is a Dungeons & Drago",
+      "effectiveDate": "2021-02-16T17:00:00.000Z",
+      "offerType": "BASE_GAME",
+      "expiryDate": null,
+      "viewableDate": "2021-02-16T17:00:00.000Z",
+      "status": "ACTIVE",
+      "isCodeRedemptionOnly": false,
+      "seller": {
+       "id": "o-3kpjwtwqwfl2p9wdwvpad7yqz4kt6c",
+       "name": "Codename Entertainment"
+      },
+      "productSlug": "idle-champions-of-the-forgotten-realms",
+      "urlSlug": "banegeneralaudience",
+      "url": null,
+      "items": [
+       {
+        "id": "9a4e1a1eb6b140f6a9e5e4dcb5a2bf55",
+        "namespace": "7e508f543b05465abe3a935960eb70ac"
+       }
+      ],
+      "customAttributes": [
+       {
+        "key": "com.epicgames.app.productSlug",
+        "value": "idle-champions-of-the-forgotten-realms"
+       }
+      ],
+      "categories": [
+       {
+        "path": "freegames"
+       },
+       {
+        "path": "games"
+       },
+       {
+        "path": "games/edition"
+       },
+       {
+        "path": "games/edition/base"
+       },
+       {
+        "path": "applications"
+       }
+      ],
+      "tags": [
+       {
+        "id": "21136"
+       },
+       {
+        "id": "21122"
+       }
+      ],
+      "catalogNs": {
+       "mappings": [
+        {
+         "pageSlug": "idle-champions-of-the-forgotten-realms",
+         "pageType": "productHome"
+        }
+       ]
+      },
+      "offerMappings": [
+       {
+        "pageSlug": "idle-champions-of-the-forgotten-realms",
+        "pageType": "productHome"
+       }
+      ],
+      "price": {
+       "totalPrice": {
+        "discountPrice": 0,
+        "originalPrice": 0,
+        "voucherDiscount": 0,
+        "discount": 0,
+        "currencyCode": "USD",
+        "currencyInfo": {
+         "decimals": 2
+        },
+        "fmtPrice": {
+         "originalPrice": "0",
+         "discountPrice": "0",
+         "intermediatePrice": "0"
+        },
+        "dualPrice": null
+       },
+       "lineOffers": [
+        {
+         "appliedRules": []
+        }
+       ]
+      },
+      "promotions": {
+       "promotionalOffers": [
+        {
+         "promotionalOffers": [
+          {
+           "startDate": "2026-11-05T16:00:00.000Z",
+           "endDate": "2026-11-12T16:00:00.000Z",
+           "discountSetting": {
+            "discountType": "PERCENTAGE",
+            "discountPercentage": 0
+           }
+          }
+         ]
+        }
+       ],
+       "upcomingPromotionalOffers": []
+      }
+     },
+     {
+      "title": "Them's Fightin' Herds",
+      "id": "1f723b00df58467998c4984ca39915ad",
+      "namespace": "a567c32599bf4d4fb609e424f3691b39",
+      "description": "Them's Fightin' Herds",
+      "effectiveDate": "2022-12-19T16:00:00.000Z",
+      "offerType": "BASE_GAME",
+      "expiryDate": null,
+      "viewableDate": "2022-12-19T15:55:00.000Z",
+      "status": "ACTIVE",
+      "isCodeRedemptionOnly": false,
+      "seller": {
+       "id": "o-znrmullaj65y32mwjfa5dzabpprtmt",
+       "name": "Gameplay Group International Inc."
+      },
+      "productSlug": "thems-fightin-herds/home",
+      "urlSlug": "thems-fightin-herds",
+      "url": null,
+      "items": [
+       {
+        "id": "10deb2d9a2654231a12e24f8e58a446d",
+        "namespace": "a567c32599bf4d4fb609e424f3691b39"
+       }
+      ],
+      "customAttributes": [
+       {
+        "key": "com.epicgames.app.productSlug",
+        "value": "thems-fightin-herds/home"
+       }
+      ],
+      "categories": [
+       {
+        "path": "freegames"
+       },
+       {
+        "path": "games"
+       },
+       {
+        "path": "games/edition"
+       },
+       {
+        "path": "games/edition/base"
+       },
+       {
+        "path": "applications"
+       }
+      ],
+      "tags": [
+       {
+        "id": "1344"
+       },
+       {
+        "id": "29088"
+       }
+      ],
+      "catalogNs": {
+       "mappings": [
+        {
+         "pageSlug": "thems-fightin-herds",
+         "pageType": "productHome"
+        }
+       ]
+      },
+      "offerMappings": [
+       {
+        "pageSlug": "thems-fightin-herds",
+        "pageType": "productHome"
+       }
+      ],
+      "price": {
+       "totalPrice": {
+        "discountPrice": 1999,
+        "originalPrice": 1999,
+        "voucherDiscount": 0,
+        "discount": 0,
+        "currencyCode": "USD",
+        "currencyInfo": {
+         "decimals": 2
+        },
+        "fmtPrice": {
+         "originalPrice": "$19.99",
+         "discountPrice": "$19.99",
+         "intermediatePrice": "$19.99"
+        },
+        "dualPrice": null
+       },
+       "lineOffers": [
+        {
+         "appliedRules": []
+        }
+       ]
+      },
+      "promotions": null
+     },
+     {
+      "title": "Model Builder: Complete Edition",
+      "id": "d3e5b556640144bfa5de2d5d3b283d68",
+      "namespace": "23499f64e5304139b514c3e674c5c0d6",
+      "description": "Join the latest trend in simulation games, bring out your cr",
+      "effectiveDate": "2023-01-16T17:00:00.000Z",
+      "offerType": "BASE_GAME",
+      "expiryDate": null,
+      "viewableDate": "2023-01-16T17:00:00.000Z",
+      "status": "ACTIVE",
+      "isCodeRedemptionOnly": false,
+      "seller": {
+       "id": "o-l2jhzf6ltgxbz83h2dd8yj7zudhkvh",
+       "name": "Green Man Gaming Publishing"
+      },
+      "productSlug": null,
+      "urlSlug": "3f18c54a6e00424ba6e8f4422167cac7",
+      "url": null,
+      "items": [
+       {
+        "id": "d940bec298844474857b0b53570fc3a4",
+        "namespace": "23499f64e5304139b514c3e674c5c0d6"
+       }
+      ],
+      "customAttributes": [],
+      "categories": [
+       {
+        "path": "freegames"
+       },
+       {
+        "path": "games"
+       },
+       {
+        "path": "games/edition"
+       },
+       {
+        "path": "games/edition/base"
+       }
+      ],
+      "tags": [
+       {
+        "id": "1188"
+       },
+       {
+        "id": "19847"
+       }
+      ],
+      "catalogNs": {
+       "mappings": [
+        {
+         "pageSlug": "model-builder-complete-edition-f9b456",
+         "pageType": "productHome"
+        }
+       ]
+      },
+      "offerMappings": [
+       {
+        "pageSlug": "model-builder-complete-edition-f9b456",
+        "pageType": "productHome"
+       }
+      ],
+      "price": {
+       "totalPrice": {
+        "discountPrice": 1999,
+        "originalPrice": 1999,
+        "voucherDiscount": 0,
+        "discount": 0,
+        "currencyCode": "USD",
+        "currencyInfo": {
+         "decimals": 2
+        },
+        "fmtPrice": {
+         "originalPrice": "$19.99",
+         "discountPrice": "$19.99",
+         "intermediatePrice": "$19.99"
+        },
+        "dualPrice": null
+       },
+       "lineOffers": [
+        {
+         "appliedRules": []
+        }
+       ]
+      },
+      "promotions": null
+     },
+     {
+      "title": "Eternal Threads",
+      "id": "921e40c4c69f4d728914ca2a4f0aa407",
+      "namespace": "35eda4ff87f94a7491dc28175b8f3b4f",
+      "description": "Eternal Threads is a single-player, first-person story-drive",
+      "effectiveDate": "2023-10-19T15:00:00.000Z",
+      "offerType": "BASE_GAME",
+      "expiryDate": null,
+      "viewableDate": "2023-10-12T15:00:00.000Z",
+      "status": "ACTIVE",
+      "isCodeRedemptionOnly": false,
+      "seller": {
+       "id": "o-rdrzv6e26usvcn4dsevv2mpfr4bytu",
+       "name": "Secret Mode Limited"
+      },
+      "productSlug": null,
+      "urlSlug": "a9152a8924cc4e438f0e61106ec02f7d",
+      "url": null,
+      "items": [
+       {
+        "id": "8963690b6659413e95e885f49fd92ea4",
+        "namespace": "35eda4ff87f94a7491dc28175b8f3b4f"
+       }
+      ],
+      "customAttributes": [],
+      "categories": [
+       {
+        "path": "freegames"
+       },
+       {
+        "path": "games"
+       },
+       {
+        "path": "games/edition"
+       },
+       {
+        "path": "games/edition/base"
+       }
+      ],
+      "tags": [
+       {
+        "id": "1298"
+       },
+       {
+        "id": "19847"
+       }
+      ],
+      "catalogNs": {
+       "mappings": [
+        {
+         "pageSlug": "eternal-threads-197169",
+         "pageType": "productHome"
+        }
+       ]
+      },
+      "offerMappings": [
+       {
+        "pageSlug": "eternal-threads-197169",
+        "pageType": "productHome"
+       }
+      ],
+      "price": {
+       "totalPrice": {
+        "discountPrice": 1999,
+        "originalPrice": 1999,
+        "voucherDiscount": 0,
+        "discount": 0,
+        "currencyCode": "USD",
+        "currencyInfo": {
+         "decimals": 2
+        },
+        "fmtPrice": {
+         "originalPrice": "$19.99",
+         "discountPrice": "$19.99",
+         "intermediatePrice": "$19.99"
+        },
+        "dualPrice": null
+       },
+       "lineOffers": [
+        {
+         "appliedRules": []
+        }
+       ]
+      },
+      "promotions": null
+     },
+     {
+      "title": "Ghostrunner 2",
+      "id": "be5600439b434624802764f704755cde",
+      "namespace": "708f57aaa04b42ef885be16c8288f0ac",
+      "description": "Ghostrunner 2 is a hardcore FPP slasher set in a post-apocal",
+      "effectiveDate": "2023-10-26T15:00:00.000Z",
+      "offerType": "BASE_GAME",
+      "expiryDate": null,
+      "viewableDate": "2023-10-26T15:00:00.000Z",
+      "status": "ACTIVE",
+      "isCodeRedemptionOnly": false,
+      "seller": {
+       "id": "o-cul2z53mrw3bxltv63v68rgd4b3w52",
+       "name": "505 Games"
+      },
+      "productSlug": "ghostrunner-2",
+      "urlSlug": "ghostrunner-2",
+      "url": null,
+      "items": [
+       {
+        "id": "b5644df892c8403ba6e18998565e75e5",
+        "namespace": "708f57aaa04b42ef885be16c8288f0ac"
+       }
+      ],
+      "customAttributes": [
+       {
+        "key": "com.epicgames.app.productSlug",
+        "value": "ghostrunner-2"
+       }
+      ],
+      "categories": [
+       {
+        "path": "freegames"
+       },
+       {
+        "path": "games"
+       },
+       {
+        "path": "games/edition"
+       },
+       {
+        "path": "games/edition/base"
+       },
+       {
+        "path": "applications"
+       }
+      ],
+      "tags": [
+       {
+        "id": "1216"
+       },
+       {
+        "id": "21122"
+       }
+      ],
+      "catalogNs": {
+       "mappings": [
+        {
+         "pageSlug": "ghostrunner-2",
+         "pageType": "productHome"
+        }
+       ]
+      },
+      "offerMappings": [
+       {
+        "pageSlug": "ghostrunner-2",
+        "pageType": "productHome"
+       }
+      ],
+      "price": {
+       "totalPrice": {
+        "discountPrice": 3999,
+        "originalPrice": 3999,
+        "voucherDiscount": 0,
+        "discount": 0,
+        "currencyCode": "USD",
+        "currencyInfo": {
+         "decimals": 2
+        },
+        "fmtPrice": {
+         "originalPrice": "$39.99",
+         "discountPrice": "$39.99",
+         "intermediatePrice": "$39.99"
+        },
+        "dualPrice": null
+       },
+       "lineOffers": [
+        {
+         "appliedRules": []
+        }
+       ]
+      },
+      "promotions": {
+       "promotionalOffers": [],
+       "upcomingPromotionalOffers": [
+        {
+         "promotionalOffers": [
+          {
+           "startDate": "2026-12-10T17:00:00.000Z",
+           "endDate": "2027-01-07T23:59:00.000Z",
+           "discountSetting": {
+            "discountType": "PERCENTAGE",
+            "discountPercentage": 20
+           }
+          }
+         ]
+        }
+       ]
+      }
+     },
+     {
+      "title": "Lost Castle: The Old Ones Awaken",
+      "id": "4a88d0dc64114b20b67339c74543f859",
+      "namespace": "ab29925a0a9a49598adba45d108ceb3e",
+      "description": "The Old Ones Awaken adds new levels to explore, new enemies ",
+      "effectiveDate": "2024-02-08T16:00:00.000Z",
+      "offerType": "ADD_ON",
+      "expiryDate": null,
+      "viewableDate": "2024-02-01T16:00:00.000Z",
+      "status": "ACTIVE",
+      "isCodeRedemptionOnly": false,
+      "seller": {
+       "id": "o-ze7grkplqlrzc92lepkjv4xpaj7gn8",
+       "name": "Another Indie Studio Limited"
+      },
+      "productSlug": null,
+      "urlSlug": "lost-castle-the-old-ones-awaken",
+      "url": null,
+      "items": [
+       {
+        "id": "30f2fedfe5af4e9d96e151696f372a70",
+        "namespace": "ab29925a0a9a49598adba45d108ceb3e"
+       }
+      ],
+      "customAttributes": [],
+      "categories": [
+       {
+        "path": "addons"
+       },
+       {
+        "path": "freegames"
+       },
+       {
+        "path": "addons/durable"
+       }
+      ],
+      "tags": [
+       {
+        "id": "1264"
+       },
+       {
+        "id": "1265"
+       }
+      ],
+      "catalogNs": {
+       "mappings": [
+        {
+         "pageSlug": "lost-castle-abb2e2",
+         "pageType": "productHome"
+        }
+       ]
+      },
+      "offerMappings": [
+       {
+        "pageSlug": "lost-castle-lost-castle-the-old-ones-awaken-db1545",
+        "pageType": "offer"
+       }
+      ],
+      "price": {
+       "totalPrice": {
+        "discountPrice": 399,
+        "originalPrice": 399,
+        "voucherDiscount": 0,
+        "discount": 0,
+        "currencyCode": "USD",
+        "currencyInfo": {
+         "decimals": 2
+        },
+        "fmtPrice": {
+         "originalPrice": "$3.99",
+         "discountPrice": "$3.99",
+         "intermediatePrice": "$3.99"
+        },
+        "dualPrice": null
+       },
+       "lineOffers": [
+        {
+         "appliedRules": []
+        }
+       ]
+      },
+      "promotions": null
+     },
+     {
+      "title": "LISA: The Definitive Edition",
+      "id": "944b5b5d646d46bc92bc33edfe983d26",
+      "namespace": "ca3a9d16d131478c97fd56c138a6511a",
+      "description": "Explore Olathe and unmask its twisted secrets with LISA: The",
+      "effectiveDate": "2024-05-21T16:00:00.000Z",
+      "offerType": "BUNDLE",
+      "expiryDate": null,
+      "viewableDate": "2024-05-21T16:00:00.000Z",
+      "status": "ACTIVE",
+      "isCodeRedemptionOnly": false,
+      "seller": {
+       "id": "o-256f2bc2a35049a39ceae0f57d01bb",
+       "name": "Serenity Forge"
+      },
+      "productSlug": "lisa-the-definitive-edition",
+      "urlSlug": "lisa-the-definitive-edition",
+      "url": null,
+      "items": [
+       {
+        "id": "2cde880361534ed4bafd0a9bb502c543",
+        "namespace": "2052c58b9f64498386cbbbc85df90bbf"
+       },
+       {
+        "id": "a7729179144d41ec9e0a7e1c09ad2f35",
+        "namespace": "87de7c0aad7944899fb6d2b05e13b108"
+       }
+      ],
+      "customAttributes": [
+       {
+        "key": "com.epicgames.app.productSlug",
+        "value": "lisa-the-definitive-edition"
+       }
+      ],
+      "categories": [
+       {
+        "path": "bundles"
+       },
+       {
+        "path": "freegames"
+       },
+       {
+        "path": "games"
+       },
+       {
+        "path": "bundles/games"
+       },
+       {
+        "path": "applications"
+       }
+      ],
+      "tags": [
+       {
+        "id": "1367"
+       },
+       {
+        "id": "1370"
+       }
+      ],
+      "catalogNs": {
+       "mappings": [
+        {
+         "pageSlug": "lisa-the-definitive-edition",
+         "pageType": "productHome"
+        }
+       ]
+      },
+      "offerMappings": [
+       {
+        "pageSlug": "lisa-the-definitive-edition",
+        "pageType": "productHome"
+       }
+      ],
+      "price": {
+       "totalPrice": {
+        "discountPrice": 2499,
+        "originalPrice": 2499,
+        "voucherDiscount": 0,
+        "discount": 0,
+        "currencyCode": "USD",
+        "currencyInfo": {
+         "decimals": 2
+        },
+        "fmtPrice": {
+         "originalPrice": "$24.99",
+         "discountPrice": "$24.99",
+         "intermediatePrice": "$24.99"
+        },
+        "dualPrice": null
+       },
+       "lineOffers": [
+        {
+         "appliedRules": []
+        }
+       ]
+      },
+      "promotions": {
+       "promotionalOffers": [],
+       "upcomingPromotionalOffers": [
+        {
+         "promotionalOffers": [
+          {
+           "startDate": "2026-12-10T16:00:00.000Z",
+           "endDate": "2027-01-07T16:00:00.000Z",
+           "discountSetting": {
+            "discountType": "PERCENTAGE",
+            "discountPercentage": 55
+           }
+          }
+         ]
+        }
+       ]
+      }
+     },
+     {
+      "title": "Castlevania Anniversary Collection",
+      "id": "8f80897c0b6e4e678fed08da169d44be",
+      "namespace": "247d4d4b4e424afd9b474334fe450a43",
+      "description": "Konami's Castlevania Anniversary Collection traces the origi",
+      "effectiveDate": "2024-11-14T16:00:00.000Z",
+      "offerType": "BASE_GAME",
+      "expiryDate": null,
+      "viewableDate": "2024-11-07T05:00:00.000Z",
+      "status": "ACTIVE",
+      "isCodeRedemptionOnly": false,
+      "seller": {
+       "id": "o-snd8ledlra6sytkbbve7h5uwuxuytv",
+       "name": "KONAMI"
+      },
+      "productSlug": null,
+      "urlSlug": "32b3e0adbe0c4399be1874958194f97f",
+      "url": null,
+      "items": [
+       {
+        "id": "05eab1bf838e446a89b59afd27e53273",
+        "namespace": "247d4d4b4e424afd9b474334fe450a43"
+       }
+      ],
+      "customAttributes": [],
+      "categories": [
+       {
+        "path": "freegames"
+       },
+       {
+        "path": "games"
+       },
+       {
+        "path": "games/edition"
+       },
+       {
+        "path": "games/edition/base"
+       }
+      ],
+      "tags": [
+       {
+        "id": "1216"
+       },
+       {
+        "id": "21121"
+       }
+      ],
+      "catalogNs": {
+       "mappings": [
+        {
+         "pageSlug": "castlevania-anniversary-collection-a61f94",
+         "pageType": "productHome"
+        }
+       ]
+      },
+      "offerMappings": [
+       {
+        "pageSlug": "castlevania-anniversary-collection-a61f94",
+        "pageType": "productHome"
+       }
+      ],
+      "price": {
+       "totalPrice": {
+        "discountPrice": 1999,
+        "originalPrice": 1999,
+        "voucherDiscount": 0,
+        "discount": 0,
+        "currencyCode": "USD",
+        "currencyInfo": {
+         "decimals": 2
+        },
+        "fmtPrice": {
+         "originalPrice": "$19.99",
+         "discountPrice": "$19.99",
+         "intermediatePrice": "$19.99"
+        },
+        "dualPrice": null
+       },
+       "lineOffers": [
+        {
+         "appliedRules": []
+        }
+       ]
+      },
+      "promotions": null
+     },
+     {
+      "title": "Monument Valley",
+      "id": "f967cff9761c4198b4e972cfd71e40d7",
+      "namespace": "e236e73a294b462d85715f5ba23a6346",
+      "description": "Embark on a journey of forgiveness through impossible enviro",
+      "effectiveDate": "2025-09-04T15:00:00.000Z",
+      "offerType": "BASE_GAME",
+      "expiryDate": null,
+      "viewableDate": "2025-08-28T15:00:00.000Z",
+      "status": "ACTIVE",
+      "isCodeRedemptionOnly": false,
+      "seller": {
+       "id": "o-dlp2t8d5tvq8kz8m6q6mltypw6c9am",
+       "name": "ustwo games"
+      },
+      "productSlug": null,
+      "urlSlug": "monument-valley-02",
+      "url": null,
+      "items": [
+       {
+        "id": "5c5c3efb40a44ddf9d4b845aee75e2a0",
+        "namespace": "e236e73a294b462d85715f5ba23a6346"
+       }
+      ],
+      "customAttributes": [],
+      "categories": [
+       {
+        "path": "freegames"
+       },
+       {
+        "path": "games"
+       },
+       {
+        "path": "games/edition"
+       },
+       {
+        "path": "games/edition/base"
+       }
+      ],
+      "tags": [
+       {
+        "id": "1296"
+       },
+       {
+        "id": "1298"
+       }
+      ],
+      "catalogNs": {
+       "mappings": [
+        {
+         "pageSlug": "monument-valley-1d99d3",
+         "pageType": "productHome"
+        }
+       ]
+      },
+      "offerMappings": [
+       {
+        "pageSlug": "monument-valley-1d99d3",
+        "pageType": "productHome"
+       }
+      ],
+      "price": {
+       "totalPrice": {
+        "discountPrice": 799,
+        "originalPrice": 799,
+        "voucherDiscount": 0,
+        "discount": 0,
+        "currencyCode": "USD",
+        "currencyInfo": {
+         "decimals": 2
+        },
+        "fmtPrice": {
+         "originalPrice": "$7.99",
+         "discountPrice": "$7.99",
+         "intermediatePrice": "$7.99"
+        },
+        "dualPrice": null
+       },
+       "lineOffers": [
+        {
+         "appliedRules": []
+        }
+       ]
+      },
+      "promotions": {
+       "promotionalOffers": [],
+       "upcomingPromotionalOffers": [
+        {
+         "promotionalOffers": [
+          {
+           "startDate": "2026-12-10T16:00:00.000Z",
+           "endDate": "2027-01-07T16:00:00.000Z",
+           "discountSetting": {
+            "discountType": "PERCENTAGE",
+            "discountPercentage": 35
+           }
+          }
+         ]
+        }
+       ]
+      }
+     },
+     {
+      "title": "Luftrausers",
+      "id": "c76046dddcdb43619c33ce0395941033",
+      "namespace": "639daf403b554ee9b02eee5eedafc302",
+      "description": "The skies are aflame and the seas will overflow with wreckag",
+      "effectiveDate": "2026-09-10T15:00:00.000Z",
+      "offerType": "BASE_GAME",
+      "expiryDate": null,
+      "viewableDate": "2026-09-03T15:00:00.000Z",
+      "status": "ACTIVE",
+      "isCodeRedemptionOnly": false,
+      "seller": {
+       "id": "o-plnhdz2wfx5etjjeh88szjqy2gx8gw",
+       "name": "Devolver Digital, Inc."
+      },
+      "productSlug": null,
+      "urlSlug": "luftrausers",
+      "url": null,
+      "items": [
+       {
+        "id": "98fb3320a8964a1d85beb87e64eba312",
+        "namespace": "639daf403b554ee9b02eee5eedafc302"
+       }
+      ],
+      "customAttributes": [],
+      "categories": [
+       {
+        "path": "freegames"
+       },
+       {
+        "path": "games"
+       },
+       {
+        "path": "games/edition"
+       },
+       {
+        "path": "games/edition/base"
+       }
+      ],
+      "tags": [
+       {
+        "id": "1216"
+       },
+       {
+        "id": "1370"
+       }
+      ],
+      "catalogNs": {
+       "mappings": [
+        {
+         "pageSlug": "luftrausers-51e5e9",
+         "pageType": "productHome"
+        }
+       ]
+      },
+      "offerMappings": [
+       {
+        "pageSlug": "luftrausers-51e5e9",
+        "pageType": "productHome"
+       }
+      ],
+      "price": {
+       "totalPrice": {
+        "discountPrice": 999,
+        "originalPrice": 999,
+        "voucherDiscount": 0,
+        "discount": 0,
+        "currencyCode": "USD",
+        "currencyInfo": {
+         "decimals": 2
+        },
+        "fmtPrice": {
+         "originalPrice": "$9.99",
+         "discountPrice": "$9.99",
+         "intermediatePrice": "$9.99"
+        },
+        "dualPrice": null
+       },
+       "lineOffers": [
+        {
+         "appliedRules": []
+        }
+       ]
+      },
+      "promotions": null
+     },
+     {
+      "title": "TerraScape",
+      "id": "af6b823b8698465f9aedc3bddf2e8686",
+      "namespace": "bfb80547289b477193ce3b14d83cd292",
+      "description": "Build gorgeous kingdoms on floating islands by strategically",
+      "effectiveDate": "2026-10-08T15:00:00.000Z",
+      "offerType": "BASE_GAME",
+      "expiryDate": null,
+      "viewableDate": "2026-09-29T14:03:02.000Z",
+      "status": "ACTIVE",
+      "isCodeRedemptionOnly": false,
+      "seller": {
+       "id": "o-m7c9hge3j8w7xxnf3bf49tzua88t8a",
+       "name": "Bitfall Studios GmbH"
+      },
+      "productSlug": null,
+      "urlSlug": "f229ed53ddba40788e0ab62978e9eaf9",
+      "url": null,
+      "items": [
+       {
+        "id": "c42dfeb6caf643718b606d752b54c30b",
+        "namespace": "bfb80547289b477193ce3b14d83cd292"
+       }
+      ],
+      "customAttributes": [],
+      "categories": [
+       {
+        "path": "freegames"
+       },
+       {
+        "path": "games"
+       },
+       {
+        "path": "games/edition"
+       },
+       {
+        "path": "games/edition/base"
+       }
+      ],
+      "tags": [
+       {
+        "id": "29088"
+       },
+       {
+        "id": "21894"
+       }
+      ],
+      "catalogNs": {
+       "mappings": [
+        {
+         "pageSlug": "terrascape-2b12b1",
+         "pageType": "productHome"
+        }
+       ]
+      },
+      "offerMappings": [
+       {
+        "pageSlug": "terrascape-2b12b1",
+        "pageType": "productHome"
+       }
+      ],
+      "price": {
+       "totalPrice": {
+        "discountPrice": 1699,
+        "originalPrice": 1699,
+        "voucherDiscount": 0,
+        "discount": 0,
+        "currencyCode": "USD",
+        "currencyInfo": {
+         "decimals": 2
+        },
+        "fmtPrice": {
+         "originalPrice": "$16.99",
+         "discountPrice": "$16.99",
+         "intermediatePrice": "$16.99"
+        },
+        "dualPrice": null
+       },
+       "lineOffers": [
+        {
+         "appliedRules": []
+        }
+       ]
+      },
+      "promotions": {
+       "promotionalOffers": [],
+       "upcomingPromotionalOffers": [
+        {
+         "promotionalOffers": [
+          {
+           "startDate": "2026-11-21T16:00:00.000Z",
+           "endDate": "2026-12-21T16:00:00.000Z",
+           "discountSetting": {
+            "discountType": "PERCENTAGE",
+            "discountPercentage": 70
+           }
+          }
+         ]
+        }
+       ]
+      }
+     },
+     {
+      "title": "Flotsam",
+      "id": "3be0a0d8479946d78f60d90c9442a0b4",
+      "namespace": "27e33143fc9e4de8bbf76782292933d4",
+      "description": "The floating garbage town survival game! Scavenge what preci",
+      "effectiveDate": "2026-11-05T16:00:00.000Z",
+      "offerType": "BASE_GAME",
+      "expiryDate": null,
+      "viewableDate": "2026-10-29T15:00:00.000Z",
+      "status": "ACTIVE",
+      "isCodeRedemptionOnly": false,
+      "seller": {
+       "id": "o-dwuld3yb6hujsr2eddx6flmag4yn8r",
+       "name": "Pajama Llama Games"
+      },
+      "productSlug": null,
+      "urlSlug": "7ca01ab906ad4eff92d4ed1efa5fbfcb",
+      "url": null,
+      "items": [
+       {
+        "id": "697883143d244f6c82e08782093f3a9e",
+        "namespace": "27e33143fc9e4de8bbf76782292933d4"
+       }
+      ],
+      "customAttributes": [],
+      "categories": [
+       {
+        "path": "freegames"
+       },
+       {
+        "path": "games"
+       },
+       {
+        "path": "games/edition"
+       },
+       {
+        "path": "games/edition/base"
+       }
+      ],
+      "tags": [
+       {
+        "id": "21122"
+       },
+       {
+        "id": "1188"
+       }
+      ],
+      "catalogNs": {
+       "mappings": [
+        {
+         "pageSlug": "flotsam-266287",
+         "pageType": "productHome"
+        }
+       ]
+      },
+      "offerMappings": [
+       {
+        "pageSlug": "flotsam-266287",
+        "pageType": "productHome"
+       }
+      ],
+      "price": {
+       "totalPrice": {
+        "discountPrice": 0,
+        "originalPrice": 2499,
+        "voucherDiscount": 0,
+        "discount": 2499,
+        "currencyCode": "USD",
+        "currencyInfo": {
+         "decimals": 2
+        },
+        "fmtPrice": {
+         "originalPrice": "$24.99",
+         "discountPrice": "0",
+         "intermediatePrice": "0"
+        },
+        "dualPrice": null
+       },
+       "lineOffers": [
+        {
+         "appliedRules": [
+          {
+           "id": "a48fcd4f4fa84f9eb709c5df30d98ce8",
+           "endDate": "2026-11-12T16:00:00.000Z",
+           "discountSetting": {
+            "discountType": "PERCENTAGE"
+           }
+          }
+         ]
+        }
+       ]
+      },
+      "promotions": {
+       "promotionalOffers": [
+        {
+         "promotionalOffers": [
+          {
+           "startDate": "2026-11-05T16:00:00.000Z",
+           "endDate": "2026-11-12T16:00:00.000Z",
+           "discountSetting": {
+            "discountType": "PERCENTAGE",
+            "discountPercentage": 0
+           }
+          }
+         ]
+        }
+       ],
+       "upcomingPromotionalOffers": []
+      }
+     },
+     {
+      "title": "Knightica",
+      "id": "9975548b6d404a94b8a9bdb34cad49e9",
+      "namespace": "02d659f31e1c43a78c43fd9fd9edc089",
+      "description": "Recruit units, place them strategically, and find the synerg",
+      "effectiveDate": "2026-11-12T16:00:00.000Z",
+      "offerType": "BASE_GAME",
+      "expiryDate": null,
+      "viewableDate": "2026-11-05T16:00:00.000Z",
+      "status": "ACTIVE",
+      "isCodeRedemptionOnly": false,
+      "seller": {
+       "id": "o-7jby5x5ez3xmyf5qhgur72hlye379e",
+       "name": "Goblinz Studio SAS"
+      },
+      "productSlug": null,
+      "urlSlug": "72b46f5d95624fd5b7e7d81b7dcaead1",
+      "url": null,
+      "items": [
+       {
+        "id": "abf4eb9c26e24912ae58d2036745d5cf",
+        "namespace": "02d659f31e1c43a78c43fd9fd9edc089"
+       }
+      ],
+      "customAttributes": [],
+      "categories": [
+       {
+        "path": "freegames"
+       },
+       {
+        "path": "games/edition/base"
+       },
+       {
+        "path": "games/edition"
+       },
+       {
+        "path": "games"
+       }
+      ],
+      "tags": [
+       {
+        "id": "21894"
+       },
+       {
+        "id": "19847"
+       }
+      ],
+      "catalogNs": {
+       "mappings": [
+        {
+         "pageSlug": "knightica-3be45c",
+         "pageType": "productHome"
+        }
+       ]
+      },
+      "offerMappings": [
+       {
+        "pageSlug": "knightica-3be45c",
+        "pageType": "productHome"
+       }
+      ],
+      "price": {
+       "totalPrice": {
+        "discountPrice": 1499,
+        "originalPrice": 1499,
+        "voucherDiscount": 0,
+        "discount": 0,
+        "currencyCode": "USD",
+        "currencyInfo": {
+         "decimals": 2
+        },
+        "fmtPrice": {
+         "originalPrice": "$14.99",
+         "discountPrice": "$14.99",
+         "intermediatePrice": "$14.99"
+        },
+        "dualPrice": null
+       },
+       "lineOffers": [
+        {
+         "appliedRules": []
+        }
+       ]
+      },
+      "promotions": {
+       "promotionalOffers": [],
+       "upcomingPromotionalOffers": [
+        {
+         "promotionalOffers": [
+          {
+           "startDate": "2026-11-12T16:00:00.000Z",
+           "endDate": "2026-11-19T16:00:00.000Z",
+           "discountSetting": {
+            "discountType": "PERCENTAGE",
+            "discountPercentage": 0
+           }
+          }
+         ]
+        }
+       ]
+      }
+     }
+    ],
+    "paging": {
+     "count": 40,
+     "total": 13
+    }
+   }
+  }
+ },
+ "extensions": {}
+}

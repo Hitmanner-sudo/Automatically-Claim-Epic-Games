@@ -10,8 +10,10 @@
 #
 # Nothing here signs in to an account.
 param(
+    [ValidateSet('silent', 'desktop', 'plain')]
+    [string]$Test = 'silent',
     [int]$Port = 9222,
-    [int]$BootMinutes = 12
+    [int]$BootMinutes = 8
 )
 
 $ErrorActionPreference = 'Continue'
@@ -19,7 +21,8 @@ $ProgressPreference = 'SilentlyContinue'
 $OutDir = Join-Path $env:RUNNER_TEMP 'egl-probe'
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
-function Section([string]$t) { Write-Host ""; Write-Host "=================== $t ===================" }
+$script:Started = Get-Date
+function Section([string]$t) { Write-Host ""; Write-Host ("=================== {0}  [+{1}s] ===================" -f $t, [int]((Get-Date) - $script:Started).TotalSeconds) }
 
 Add-Type -TypeDefinition @'
 using System;
@@ -252,7 +255,9 @@ $msi = Join-Path $OutDir 'EpicInstaller.msi'
 $sw = [Diagnostics.Stopwatch]::StartNew()
 Invoke-WebRequest -UseBasicParsing -Uri 'https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/installer/download/EpicGamesLauncherInstaller.msi' -OutFile $msi
 Write-Host "downloaded $([int]((Get-Item $msi).Length / 1MB)) MB in $([int]$sw.Elapsed.TotalSeconds)s"
-$p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart /l*v `"$OutDir\msi.log`"" -Wait -PassThru
+# Not -Wait: that also waits for every descendant, and the installer may start the launcher.
+$p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart /l*v `"$OutDir\msi.log`"" -PassThru
+if (-not $p.WaitForExit(600000)) { Write-Host "msiexec still running after 10 minutes"; try { $p.Kill() } catch {} }
 Write-Host "msiexec exit=$($p.ExitCode) after $([int]$sw.Elapsed.TotalSeconds)s"
 Start-Sleep -Seconds 8
 Show-EpicProcs 'after-install'
@@ -312,81 +317,100 @@ $cwd = Split-Path $exe
 Write-Host "exe=$exe version=$((Get-Item $exe).VersionInfo.FileVersion) product=$((Get-Item $exe).VersionInfo.ProductVersion)"
 Get-ChildItem $cwd -Filter '*.exe' | ForEach-Object { Write-Host "    $($_.Name) $($_.VersionInfo.FileVersion)" }
 
-# ---------------------------------------------------------------- test A
-Section "test A: normal desktop, -silent -cefdebug=$Port"
-Stop-Epic
-$script:t0 = Get-Date
-$launchA = { Start-Process -FilePath $exe -ArgumentList '-silent', "-cefdebug=$Port" -WorkingDirectory $cwd }
-& $launchA
-$upA = Wait-Cdp $Port $exe "-silent -cefdebug=$Port" $BootMinutes $launchA
-Show-EpicProcs 'test-A'
-Show-Windows 'test-A default desktop' ([IntPtr]::Zero)
-Write-Host "[listening ports of launcher processes]"
-$pidsA = @(Get-EpicProcs | ForEach-Object { $_.ProcessId })
-Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $pidsA -contains $_.OwningProcess } |
-    ForEach-Object { Write-Host "    $($_.LocalAddress):$($_.LocalPort) pid=$($_.OwningProcess)" }
-if ($upA) {
-    Start-Sleep -Seconds 20
-    Test-Cdp $Port 'A: -silent on normal desktop' $true
-    Show-Windows 'test-A after navigation' ([IntPtr]::Zero)
-}
-
-Section 'launcher log (cef / debug / window related lines)'
+# ---------------------------------------------------------------- tests
 $log = "$env:LOCALAPPDATA\EpicGamesLauncher\Saved\Logs\EpicGamesLauncher.log"
-if (Test-Path $log) {
-    Copy-Item $log (Join-Path $OutDir 'EpicGamesLauncher-A.log') -ErrorAction SilentlyContinue
-    Select-String -Path $log -Pattern 'cefdebug|remote.debug|DevTools|Command ?line|silent|SelfUpdate|Self update|Restarting|LogInit: (Version|Build|Engine)|CEF|WebBrowser' |
-        Select-Object -First 60 | ForEach-Object { $l = $_.Line; if ($l.Length -gt 300) { $l = $l.Substring(0, 300) }; Write-Host "    $l" }
+function Show-LauncherLog([string]$tag) {
+    Section "launcher log ($tag)"
+    if (Test-Path $log) {
+        Copy-Item $log (Join-Path $OutDir "EpicGamesLauncher-$tag.log") -ErrorAction SilentlyContinue
+        Select-String -Path $log -Pattern 'cefdebug|remote.debug|DevTools|Command ?line|SelfUpdate|Self update|Restarting|LogInit: (Version|Build|Engine)|WebBrowser|RememberMe|silent' |
+            Select-Object -First 45 | ForEach-Object { $l = $_.Line; if ($l.Length -gt 260) { $l = $l.Substring(0, 260) }; Write-Host "    $l" }
+    }
+    else { Write-Host "no launcher log at $log" }
+    Get-ChildItem "$env:LOCALAPPDATA\EpicGamesLauncher\Saved" -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+        Where-Object { -not $_.PSIsContainer } | Select-Object -First 40 | ForEach-Object { Write-Host "    saved: $($_.FullName.Substring($env:LOCALAPPDATA.Length)) ($($_.Length))" }
 }
-else { Write-Host "no launcher log at $log" }
-Get-ChildItem "$env:LOCALAPPDATA\EpicGamesLauncher\Saved" -Recurse -Depth 3 -ErrorAction SilentlyContinue |
-    Where-Object { -not $_.PSIsContainer } | Select-Object -First 60 | ForEach-Object { Write-Host "    saved: $($_.FullName.Substring($env:LOCALAPPDATA.Length)) ($($_.Length))" }
 
-Section 'graceful close test (taskkill without /F)'
-$swc = [Diagnostics.Stopwatch]::StartNew()
-& taskkill.exe /IM EpicGamesLauncher.exe 2>&1 | ForEach-Object { Write-Host "    $_" }
-$closed = $false
-for ($i = 0; $i -lt 30; $i++) {
-    Start-Sleep -Seconds 1
-    if (@(Get-EpicProcs | Where-Object { $_.Name -eq 'EpicGamesLauncher.exe' }).Count -eq 0) { $closed = $true; break }
-}
-Write-Host "graceful close worked=$closed after $([int]$swc.Elapsed.TotalSeconds)s"
-Show-EpicProcs 'after-graceful-close'
 Stop-Epic
-
-# ---------------------------------------------------------------- test B
-$PortB = $Port + 1
-Section "test B: hidden desktop, -cefdebug=$PortB (no -silent)"
-$deskName = 'EglProbeDesk'
-$hDesk = [WinProbe]::CreateDesktopW($deskName, [IntPtr]::Zero, [IntPtr]::Zero, 0, 0x10000000, [IntPtr]::Zero)
-Write-Host "CreateDesktopW -> $hDesk (lastError=$([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
 $script:t0 = Get-Date
-$launchB = { $newPid = [WinProbe]::StartOnDesktop($deskName, "`"$exe`" -cefdebug=$PortB", $cwd); Write-Host "started pid=$newPid on desktop $deskName" }
-try { & $launchB } catch { Write-Host "launch on hidden desktop FAILED: $_" }
-$upB = Wait-Cdp $PortB $exe "-cefdebug=$PortB" 6 $launchB
-Show-EpicProcs 'test-B'
-Show-Windows 'test-B DEFAULT desktop (expect launcher-owned=0)' ([IntPtr]::Zero)
-Show-Windows 'test-B HIDDEN desktop' $hDesk
-if ($upB) {
+$up = $false
+$closed = 'n/a'
+
+if ($Test -eq 'silent') {
+    Section "test: normal desktop, -silent -cefdebug=$Port"
+    $launch = { Start-Process -FilePath $exe -ArgumentList '-silent', "-cefdebug=$Port" -WorkingDirectory $cwd }
+    & $launch
+    $up = Wait-Cdp $Port $exe "-silent -cefdebug=$Port" $BootMinutes $launch
+    Show-EpicProcs 'silent'
+    Show-Windows 'silent: default desktop (want launcher-VISIBLE=0)' ([IntPtr]::Zero)
+    Write-Host "[listening ports of launcher processes]"
+    $pidsA = @(Get-EpicProcs | ForEach-Object { $_.ProcessId })
+    Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $pidsA -contains $_.OwningProcess } |
+        ForEach-Object { Write-Host "    $($_.LocalAddress):$($_.LocalPort) pid=$($_.OwningProcess)" }
+    if ($up) {
+        Start-Sleep -Seconds 20
+        Test-Cdp $Port 'silent on normal desktop' $true
+        Show-Windows 'silent: after navigation' ([IntPtr]::Zero)
+    }
+
+    Section 'second instance while one is running (what a user double-click does)'
+    Start-Process -FilePath $exe -WorkingDirectory $cwd
+    for ($i = 0; $i -lt 6; $i++) { Start-Sleep -Seconds 2; Show-EpicProcs "second-instance t+$(($i + 1) * 2)s" }
+    Show-Windows 'after second instance (does the window pop up?)' ([IntPtr]::Zero)
+    Write-Host "cdp still up: $([bool](Get-Http "http://127.0.0.1:$Port/json/version"))"
+}
+
+if ($Test -eq 'desktop') {
+    Section "test: hidden desktop, -cefdebug=$Port (no -silent)"
+    $deskName = 'EglProbeDesk'
+    $hDesk = [WinProbe]::CreateDesktopW($deskName, [IntPtr]::Zero, [IntPtr]::Zero, 0, 0x10000000, [IntPtr]::Zero)
+    Write-Host "CreateDesktopW -> $hDesk (lastError=$([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+    $launch = { $newPid = [WinProbe]::StartOnDesktop($deskName, "`"$exe`" -cefdebug=$Port", $cwd); Write-Host "started pid=$newPid on desktop $deskName" }
+    try { & $launch } catch { Write-Host "launch on hidden desktop FAILED: $_" }
+    $up = Wait-Cdp $Port $exe "-cefdebug=$Port" $BootMinutes $launch
+    Show-EpicProcs 'desktop'
+    Show-Windows 'hidden-desktop test: DEFAULT desktop (want launcher-owned=0)' ([IntPtr]::Zero)
+    Show-Windows 'hidden-desktop test: HIDDEN desktop' $hDesk
+    if ($up) {
+        Start-Sleep -Seconds 20
+        Test-Cdp $Port 'hidden desktop' $true
+        Show-Windows 'hidden-desktop test: DEFAULT desktop after navigation' ([IntPtr]::Zero)
+        Show-Windows 'hidden-desktop test: HIDDEN desktop after navigation' $hDesk
+    }
+
+    Section 'second instance from the NORMAL desktop while the hidden one runs'
+    Start-Process -FilePath $exe -WorkingDirectory $cwd
+    for ($i = 0; $i -lt 6; $i++) { Start-Sleep -Seconds 2; Show-EpicProcs "second-instance t+$(($i + 1) * 2)s" }
+    Show-Windows 'DEFAULT desktop after second instance' ([IntPtr]::Zero)
+    Show-Windows 'HIDDEN desktop after second instance' $hDesk
+    [void][WinProbe]::CloseDesktop($hDesk)
+}
+
+if ($Test -eq 'plain') {
+    Section "test: normal desktop, NO -silent, -cefdebug=$Port (what would the user see?)"
+    $launch = { Start-Process -FilePath $exe -ArgumentList "-cefdebug=$Port" -WorkingDirectory $cwd }
+    & $launch
+    $up = Wait-Cdp $Port $exe "-cefdebug=$Port" $BootMinutes $launch
     Start-Sleep -Seconds 15
-    Test-Cdp $PortB 'B: hidden desktop' $true
-    Show-Windows 'test-B DEFAULT desktop after navigation' ([IntPtr]::Zero)
+    Show-EpicProcs 'plain'
+    Show-Windows 'plain: default desktop (expect VISIBLE windows)' ([IntPtr]::Zero)
+    if ($up) { Test-Cdp $Port 'plain' $false }
+
+    Section 'graceful close test (taskkill without /F = WM_CLOSE)'
+    $swc = [Diagnostics.Stopwatch]::StartNew()
+    & taskkill.exe /IM EpicGamesLauncher.exe 2>&1 | ForEach-Object { Write-Host "    $_" }
+    $closed = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Seconds 1
+        if (@(Get-EpicProcs | Where-Object { $_.Name -eq 'EpicGamesLauncher.exe' }).Count -eq 0) { $closed = $true; break }
+    }
+    Write-Host "graceful close worked=$closed after $([int]$swc.Elapsed.TotalSeconds)s"
+    Show-EpicProcs 'after-graceful-close'
+    Show-Windows 'after graceful close' ([IntPtr]::Zero)
 }
-Stop-Epic
-[void][WinProbe]::CloseDesktop($hDesk)
 
-# ---------------------------------------------------------------- test C
-$PortC = $Port + 2
-Section "test C: normal desktop, NO -silent, -cefdebug=$PortC (what would the user see?)"
-$script:t0 = Get-Date
-$launchC = { Start-Process -FilePath $exe -ArgumentList "-cefdebug=$PortC" -WorkingDirectory $cwd }
-& $launchC
-$upC = Wait-Cdp $PortC $exe "-cefdebug=$PortC" 4 $launchC
-Start-Sleep -Seconds 10
-Show-Windows 'test-C default desktop (expect VISIBLE windows)' ([IntPtr]::Zero)
+Show-LauncherLog $Test
 Stop-Epic
-
 Section 'summary'
-Write-Host "RESULT cdp_with_silent=$upA cdp_on_hidden_desktop=$upB cdp_plain=$upC graceful_close=$closed"
-if (Test-Path $log) { Copy-Item $log (Join-Path $OutDir 'EpicGamesLauncher-final.log') -ErrorAction SilentlyContinue }
+Write-Host "RESULT test=$Test cdp_up=$up graceful_close=$closed"
 exit 0
