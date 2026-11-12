@@ -63,6 +63,17 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// patience stretches a wait when the tests run in a slow browser: the
+// launcher's own, on a CI runner without a graphics card, where it keeps
+// the processors busy and answers in fits and starts (see CDP_BASE in
+// cdptest).
+func patience(d time.Duration) time.Duration {
+	if os.Getenv("CDP_BASE") != "" {
+		return 3 * d
+	}
+	return d
+}
+
 func testOffer() feed.Offer {
 	return feed.Offer{
 		Title: "Flotsam", Namespace: "ns", OfferID: "id", Slug: "flotsam",
@@ -86,12 +97,12 @@ func runScenario(t *testing.T, sc scenario, mod func(*Options)) run {
 	opt := Options{
 		CheckoutBases: []string{store.URL()}, LoginBase: store.URL(),
 		DiagDir:    r.diag,
-		UIWait:     20 * time.Second,
+		UIWait:     patience(20 * time.Second),
 		SettleWait: 50 * time.Millisecond,
 		LoginGrace: 2 * time.Second,
 		// Short waits keep the negative cases quick.
-		CheckoutWait: 12 * time.Second,
-		OrderWait:    14 * time.Second,
+		CheckoutWait: patience(12 * time.Second),
+		OrderWait:    patience(14 * time.Second),
 		Logf: func(f string, a ...any) {
 			t.Logf(f, a...)
 		},
@@ -981,7 +992,7 @@ func TestBrowserCheckIsWaitedOut(t *testing.T) {
 	// meanwhile, and the claim then goes ahead.
 	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), ChallengeFor: 4 * time.Second}, func(o *Options) {
 		o.CheckoutWait = 3 * time.Second // shorter than the check lasts
-		o.BrowserCheckWait = 30 * time.Second
+		o.BrowserCheckWait = patience(30 * time.Second)
 	})
 	wantOutcome(t, r, Claimed, 1)
 }
@@ -1366,7 +1377,7 @@ func TestLeavePagePromptDoesNotHoldTheSessionUp(t *testing.T) {
 	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0),
 		ExtraHTML: `<script>window.addEventListener('beforeunload', function (e) { e.preventDefault(); e.returnValue = 'Leave?'; });</script>`}, nil)
 	wantOutcome(t, r, Claimed, 1)
-	if took := time.Since(started); took > 9*time.Second {
+	if took := time.Since(started); took > patience(9*time.Second) {
 		t.Errorf("the session took %v; the leave-page prompt held it up", took.Round(time.Second))
 	}
 }

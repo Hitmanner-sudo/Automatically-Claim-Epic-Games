@@ -328,7 +328,7 @@ func (m *mockStore) handleCheckout(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = io.WriteString(w, `<!doctype html><html><head><title>One more step</title><meta http-equiv="refresh" content="1"></head><body>
 <div class="cf_challenge_container"><h1 data-t="challengeTitle">One more step</h1><p data-t="challengeSubtitle" class="cf_challenge_text">Please complete a security check to continue</p></div>
-<script>window._cf_chl_opt = { cType: 'managed' };</script></body></html>`)
+<script>window._cf_chl_opt = { cType: 'managed' }; setTimeout(function () { location.reload(); }, 1200);</script></body></html>`)
 		return
 	}
 	if !m.hasSession(r) {

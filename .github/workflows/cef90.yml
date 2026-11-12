@@ -85,7 +85,15 @@ jobs:
             Pop-Location
             $all = Get-Content "$env:RUNNER_TEMP\cef90.txt"
             "passed: $(($all | Select-String -Pattern '^--- PASS').Count); failed: $(($all | Select-String -Pattern '^--- FAIL').Count); skipped: $(($all | Select-String -Pattern '^--- SKIP').Count)"
-            if ($code -ne 0) { '--- everything the tests said'; $all | Select-Object -First 1500 }
+            if ($code -ne 0) {
+              '--- what the failing tests said'
+              $name = ''; $buf = @()
+              foreach ($line in $all) {
+                if ($line -match '^=== RUN\s+(\S+)') { $name = $Matches[1]; $buf = @() }
+                $buf += $line
+                if ($line -match '^--- FAIL: ') { $buf | ForEach-Object { $_ } }
+              }
+            }
           } finally {
             Get-CimInstance Win32_Process | Where-Object { $_.Name -in 'EpicGamesLauncher.exe', 'EpicWebHelper.exe' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
           }
