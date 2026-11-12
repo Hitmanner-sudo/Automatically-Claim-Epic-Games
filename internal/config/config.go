@@ -74,10 +74,27 @@ func Load(path string) (Config, error) {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		var typeErr *json.UnmarshalTypeError
 		if errors.As(err, &typeErr) {
-			// One value is of the wrong kind; everything else in the file
-			// was read and applies.
+			// A value is of the wrong kind; everything else in the file
+			// was read and applies. The two settings that hold the program
+			// back are read cautiously when they are not plain true/false
+			// ("dryRun": "true", say): somebody wanted them set.
 			c.Normalize()
-			return c, fmt.Errorf("settings file %s: the value of %q is not of the expected kind and was ignored", path, typeErr.Field)
+			note := ""
+			var fields map[string]json.RawMessage
+			if json.Unmarshal(raw, &fields) == nil {
+				for name, v := range fields {
+					plain := string(v) == "true" || string(v) == "false"
+					switch {
+					case strings.EqualFold(name, "dryRun") && !plain:
+						c.DryRun = true
+						note += "; \"dryRun\" must be true or false without quotes, so until it is fixed NOTHING WILL BE ORDERED (dry run)"
+					case strings.EqualFold(name, "restartIdleLauncher") && !plain:
+						c.RestartIdleLauncher = false
+						note += "; \"restartIdleLauncher\" must be true or false without quotes, so until it is fixed a running launcher is left alone"
+					}
+				}
+			}
+			return c, fmt.Errorf("settings file %s: the value of %q is not of the expected kind and was ignored%s", path, typeErr.Field, note)
 		}
 		// The file exists because something other than the defaults was
 		// wanted, and it cannot be read. The cautious reading is to order

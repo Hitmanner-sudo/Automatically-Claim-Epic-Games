@@ -9,7 +9,7 @@ It runs in the background, watches Epic's free-games list, and when a new giveaw
 ## Setup
 
 1. Install the Epic Games Launcher and sign in once with **Remember me** ticked. (If you already use the launcher, this is done.)
-2. Get `EpicAutoClaim.exe`: on this repository's **Actions** tab, open the newest green **Build and test** run and download the **EpicAutoClaim** artifact.
+2. Get `EpicAutoClaim.exe`. If this repository has a release, take the file from the **Releases** page. Otherwise, signed in to GitHub, open the **Actions** tab, the newest green **Build and test** run, and download the **EpicAutoClaim** artifact (a zip; extract the exe from it). Artifacts expire after about three months; running the **Release** workflow from the Actions tab publishes a release that does not.
 3. Double-click `EpicAutoClaim.exe`.
 
 A single dialog confirms the installation. That is the only window the program ever shows. From then on it starts with Windows and works on its own.
@@ -87,7 +87,7 @@ Tested on real Windows machines (GitHub's Windows runners) with a real Epic Game
 
 - finding the launcher;
 - starting it hidden, including the case where it first wants to update itself;
-- bringing up its interface on the hidden desktop, with **no launcher window on the visible desktop**;
+- bringing up its interface on the hidden desktop, with **no launcher window on the visible desktop** at any moment of the trial (the test fails if one shows up even briefly);
 - recognising that a launcher is signed out;
 - shutting everything down again with nothing left running.
 

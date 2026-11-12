@@ -27,6 +27,9 @@ func sharedBrowser(t *testing.T) string {
 	t.Helper()
 	browserOnce.Do(func() { browserBase = cdptest.Start(&keepAlive{TB: t}) })
 	if browserBase == "" {
+		if os.Getenv("CHROMIUM_REQUIRED") != "" {
+			t.Fatal("no Chromium available, and CHROMIUM_REQUIRED is set")
+		}
 		t.Skip("no Chromium available")
 	}
 	return browserBase

@@ -30,6 +30,8 @@ jobs:
       - name: Test
         # The checkout driver is exercised in a real Chrome against a
         # stand-in for Epic's store.
+        env:
+          CHROMIUM_REQUIRED: '1'
         run: go test ./... -count=1 -race -timeout 20m
 
   windows:
@@ -42,6 +44,8 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Test
+        env:
+          CHROMIUM_REQUIRED: '1'
         run: go test ./... -count=1 -timeout 20m
       - name: Build
         shell: pwsh
@@ -83,7 +87,7 @@ jobs:
         shell: pwsh
         run: |
           & "$env:RUNNER_TEMP/eac-console.exe" once
-          "exit code $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { throw "once failed with $LASTEXITCODE" }
           & "$env:RUNNER_TEMP/eac-console.exe" status
       - name: Nothing left running
         if: always()

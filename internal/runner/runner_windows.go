@@ -65,6 +65,18 @@ type hidden struct {
 
 	watch   sync.WaitGroup
 	userCmd atomic.Pointer[string]
+
+	// strays are windows of the hidden launcher that turned up on the
+	// visible desktop (and were hidden again at once). There should never
+	// be any; they are kept so that a trial can report them.
+	strayMu sync.Mutex
+	strays  []win.Window
+}
+
+func (h *hidden) leaked() []win.Window {
+	h.strayMu.Lock()
+	defer h.strayMu.Unlock()
+	return append([]win.Window(nil), h.strays...)
 }
 
 func (r *Runner) startWatch(h *hidden) {
@@ -86,9 +98,18 @@ func (r *Runner) startWatch(h *hidden) {
 					return
 				}
 				if stray := h.in.OnUserDesktop(); len(stray) > 0 {
+					h.strayMu.Lock()
 					for _, w := range stray {
 						win.HideWindow(w.HWND)
+						known := false
+						for _, k := range h.strays {
+							known = known || k.HWND == w.HWND
+						}
+						if !known {
+							h.strays = append(h.strays, w)
+						}
 					}
+					h.strayMu.Unlock()
 					if !warned {
 						warned = true
 						r.logf("a window of the hidden launcher appeared on the visible desktop and was hidden again (class %q, title %q)", stray[0].Class, stray[0].Title)
@@ -335,7 +356,13 @@ func (r *Runner) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]
 		sess.Close()
 	}
 
-	if r.finish(inst, h, 8*time.Second) {
+	grace := 8 * time.Second
+	if ctx.Err() != nil {
+		// Asked to stop (the program is being closed, or a console window
+		// was): be quick, so that the launcher is back in the tray in time.
+		grace = 0
+	}
+	if r.finish(inst, h, grace) {
 		handedOver = true
 		return results, daemon.ErrYielded
 	}
@@ -355,8 +382,9 @@ type LaunchReport struct {
 	Targets        []cdp.Target
 	TargetsAfter   []cdp.Target
 	HiddenWindows  []win.Window
-	OnUserDesktop  []win.Window
-	SignedIn       string // "yes", "no", "unknown"
+	OnUserDesktop  []win.Window // still showing on the visible desktop at the end
+	Leaked         []win.Window // showed on the visible desktop at some point (hidden again at once)
+	SignedIn       string       // "yes", "no", "unknown"
 	Pages          []PageSurvey
 	Err            string
 }
@@ -515,9 +543,17 @@ func (r *Runner) TrialLaunch(ctx context.Context) LaunchReport {
 	rep.Pages = surveyPages(ctx, base)
 	rep.HiddenWindows = in.HiddenWindows()
 	rep.OnUserDesktop = in.OnUserDesktop()
-	if r.finish(inst, h, 8*time.Second) {
+	grace := 8 * time.Second
+	if ctx.Err() != nil {
+		grace = 0 // asked to stop: be quick about it
+	}
+	if r.finish(inst, h, grace) {
 		handedOver = true
 		rep.Err = "the launcher was started by the user during the trial; stepped aside"
+	}
+	rep.Leaked = h.leaked()
+	if ctx.Err() != nil && rep.Err == "" {
+		rep.Err = "interrupted"
 	}
 	return rep
 }

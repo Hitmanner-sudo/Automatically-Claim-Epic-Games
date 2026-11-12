@@ -35,12 +35,13 @@ import (
 var version = "dev"
 
 const (
-	appName    = "EpicAutoClaim"
-	exeName    = "EpicAutoClaim.exe"
-	runKey     = `Software\Microsoft\Windows\CurrentVersion\Run`
-	mutexName  = `Local\EpicAutoClaim-daemon`
-	stopName   = `Local\EpicAutoClaim-stop`
-	dialogName = "Epic Auto Claim"
+	appName     = "EpicAutoClaim"
+	exeName     = "EpicAutoClaim.exe"
+	runKey      = `Software\Microsoft\Windows\CurrentVersion\Run`
+	mutexName   = `Local\EpicAutoClaim-daemon`
+	installLock = `Local\EpicAutoClaim-install`
+	stopName    = `Local\EpicAutoClaim-stop`
+	dialogName  = "Epic Auto Claim"
 )
 
 type paths struct {
@@ -63,7 +64,14 @@ func appPaths() (paths, error) {
 	}, nil
 }
 
+// samePath reports whether two paths name the same file, however they are
+// spelled (a junction, a mapped drive, a short name).
 func samePath(a, b string) bool {
+	if sa, err := os.Stat(a); err == nil {
+		if sb, err := os.Stat(b); err == nil {
+			return os.SameFile(sa, sb)
+		}
+	}
 	ca, err1 := filepath.Abs(a)
 	cb, err2 := filepath.Abs(b)
 	return err1 == nil && err2 == nil && strings.EqualFold(filepath.Clean(ca), filepath.Clean(cb))
@@ -101,29 +109,22 @@ func removeAutostart() {
 }
 
 // daemonRunning reports whether the background process is alive.
-func daemonRunning() bool {
-	release, ok, err := win.SingleInstance(mutexName)
-	if err != nil {
-		return false
-	}
-	if ok {
-		release()
-		return false
-	}
-	return true
-}
+func daemonRunning() bool { return win.LockHeld(mutexName) }
 
 // stopDaemon asks the background process to exit and waits for it. It
 // reports whether one was running, and whether it is gone now. (In the
 // middle of a claim it first shuts the hidden launcher down, which can take
 // most of a minute.)
-func stopDaemon() (was, gone bool) {
+func stopDaemon() (was, gone bool) { return stopDaemonCtx(context.Background()) }
+
+// stopDaemonCtx is stopDaemon with a way to give up waiting early.
+func stopDaemonCtx(ctx context.Context) (was, gone bool) {
 	if !daemonRunning() {
 		return false, true
 	}
 	win.RaiseStopSignal(stopName)
 	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) && daemonRunning() {
+	for time.Now().Before(deadline) && ctx.Err() == nil && daemonRunning() {
 		time.Sleep(200 * time.Millisecond)
 	}
 	return true, !daemonRunning()
@@ -226,10 +227,13 @@ func cmdRun(a *app, atLogin bool, afterPID uint32) int {
 			release = r
 			break
 		}
-		if afterPID == 0 || try >= 25 {
+		// A moment's patience in any case (another command may just be
+		// looking at the lock); a successor waits as long as its
+		// predecessor may need to wind down.
+		if (afterPID == 0 && try >= 3) || try >= 450 {
 			return 0 // already running
 		}
-		time.Sleep(200 * time.Millisecond) // the manual run is still letting go
+		time.Sleep(200 * time.Millisecond)
 	}
 	defer release()
 
@@ -284,31 +288,8 @@ func cmdOnce(a *app, args []string) int {
 		a.cfg.DryRun = true
 	}
 
-	wasRunning := daemonRunning()
-	if wasRunning {
-		fmt.Fprintln(a.out, "The background process is running; stopping it for this manual run.")
-		if _, gone := stopDaemon(); !gone {
-			fmt.Fprintln(a.out, "It is in the middle of something and has not stopped yet. Nothing was done; try again in a minute.")
-			return 1
-		}
-	}
-	// For its duration this run is the background process: no second copy
-	// starts next to it, and "stop" reaches it.
-	release, ok, err := win.SingleInstance(mutexName)
-	if err != nil || !ok {
-		fmt.Fprintln(a.out, "Another copy has just started; nothing was done.")
-		return 1
-	}
-	defer release()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if stop, err := win.NewStopSignal(stopName); err == nil {
-		defer stop.Close()
-		go func() {
-			stop.Wait()
-			cancel()
-		}()
-	}
 	// Ctrl+C winds the run down properly (the hidden launcher is closed and
 	// a launcher that was in the tray is put back) instead of cutting it off.
 	sig := make(chan os.Signal, 1)
@@ -318,13 +299,50 @@ func cmdOnce(a *app, args []string) int {
 		fmt.Fprintln(a.out, "\nInterrupted; winding down ...")
 		cancel()
 	}()
-	if wasRunning {
-		// The background process comes back when this run is over, even if
-		// this window is closed half-way through: its successor is started
-		// now and waits for this process to end.
+
+	wasRunning := daemonRunning()
+	// The background process comes back when this run is over, however it
+	// ends (even if this window is closed half-way through): its successor
+	// is started as soon as the old one has been told to stop, and waits
+	// for this process to end.
+	successorStarted := false
+	startSuccessor := func() {
+		if !wasRunning || successorStarted {
+			return
+		}
+		successorStarted = true
 		if err := win.StartDetached(a.p.exe, []string{"run", "--after-pid=" + strconv.Itoa(os.Getpid())}, a.p.dir); err != nil {
 			fmt.Fprintf(a.out, "Could not arrange for the background process to come back (%v); double-click %s afterwards.\n", err, exeName)
 		}
+	}
+	if wasRunning {
+		fmt.Fprintln(a.out, "The background process is running; stopping it for this manual run.")
+		if _, gone := stopDaemonCtx(ctx); !gone {
+			startSuccessor()
+			if ctx.Err() == nil {
+				fmt.Fprintln(a.out, "It is in the middle of something and has not stopped yet. Nothing was done; try again in a minute.")
+			}
+			return 1
+		}
+	}
+	// For its duration this run is the background process: no second copy
+	// starts next to it, and "stop" reaches it.
+	release, ok, err := win.SingleInstance(mutexName)
+	if err != nil || !ok {
+		startSuccessor()
+		fmt.Fprintln(a.out, "Another copy has just started; nothing was done.")
+		return 1
+	}
+	defer release()
+	if stop, err := win.NewStopSignal(stopName); err == nil {
+		defer stop.Close()
+		go func() {
+			stop.Wait()
+			cancel()
+		}()
+	}
+	startSuccessor()
+	if wasRunning {
 		// Start from what the background process last wrote.
 		if st, err := state.Open(a.p.state); err == nil {
 			a.st = st
@@ -488,7 +506,11 @@ func cmdDoctor(a *app, args []string) int {
 	}
 
 	fmt.Fprintln(a.out, "\nStarting the launcher hidden (this can take a minute or two) ...")
-	rep := a.runner().TrialLaunch(context.Background())
+	// Ctrl+C ends the trial properly: the hidden launcher is closed and a
+	// launcher that was in the tray is put back.
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	rep := a.runner().TrialLaunch(ctx)
 	if rep.Err != "" {
 		fmt.Fprintf(a.out, "RESULT: FAILED: %s\n", rep.Err)
 		return 1
@@ -525,11 +547,17 @@ func cmdDoctor(a *app, args []string) int {
 		}
 	}
 	fmt.Fprintf(a.out, "Windows on the private desktop: %d (%d shown there)\n", len(rep.HiddenWindows), visibleHidden)
-	fmt.Fprintf(a.out, "Launcher windows on YOUR desktop: %d\n", len(rep.OnUserDesktop))
+	// Counted over the whole trial, not just at its end: a window that
+	// showed up on the visible desktop is hidden again within a fraction of
+	// a second, but it must not happen at all.
+	fmt.Fprintf(a.out, "Launcher windows on YOUR desktop: %d\n", len(rep.OnUserDesktop)+len(rep.Leaked))
 	for _, w := range rep.OnUserDesktop {
-		fmt.Fprintf(a.out, "  LEAKED: %s\n", describeWindow(w))
+		fmt.Fprintf(a.out, "  LEAKED (still showing): %s\n", describeWindow(w))
 	}
-	ok := rep.Up && len(rep.OnUserDesktop) == 0 && len(rep.TargetsAfter) > 0
+	for _, w := range rep.Leaked {
+		fmt.Fprintf(a.out, "  LEAKED (appeared for a moment and was hidden): %s\n", describeWindow(w))
+	}
+	ok := rep.Up && len(rep.OnUserDesktop) == 0 && len(rep.Leaked) == 0 && len(rep.TargetsAfter) > 0
 	if ok {
 		fmt.Fprintln(a.out, "RESULT: OK - the launcher can be started and driven without showing anything.")
 		if rep.SignedIn == "no" {
@@ -550,7 +578,7 @@ func copyFile(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return err
 	}
-	tmp := dst + ".new"
+	tmp := dst + ".new." + strconv.Itoa(os.Getpid())
 	out, err := os.Create(tmp)
 	if err != nil {
 		return err
@@ -579,23 +607,55 @@ func copyFile(src, dst string) error {
 // Windows and starts it. interactive adds a confirmation dialog: this is
 // the one time the program shows anything.
 func cmdInstall(interactive bool, out io.Writer) int {
+	p, pathErr := appPaths()
+	stoppedOld := false
+	// One installation at a time (a double-click is easily made twice).
+	// The lock is let go before any dialog is shown.
+	var installing func()
+	releaseInstall := func() {
+		if installing != nil {
+			installing()
+			installing = nil
+		}
+	}
+	defer releaseInstall()
 	fail := func(err error) int {
+		// A failed upgrade must not leave the PC without the copy that was
+		// installed and running before.
+		if stoppedOld && !daemonRunning() {
+			if _, statErr := os.Stat(p.exe); statErr == nil {
+				_ = win.StartDetached(p.exe, []string{"run"}, p.dir)
+			}
+		}
+		releaseInstall()
 		fmt.Fprintf(out, "Install failed: %v\n", err)
 		if interactive {
 			win.MessageBox(dialogName, "Could not install:\n\n"+err.Error(), true)
 		}
 		return 1
 	}
-	p, err := appPaths()
-	if err != nil {
-		return fail(err)
+	if pathErr != nil {
+		return fail(pathErr)
+	}
+	for try := 0; ; try++ {
+		r, ok, err := win.SingleInstance(installLock)
+		if err == nil && ok {
+			installing = r
+			break
+		}
+		if try >= 150 {
+			return fail(fmt.Errorf("another installation is still running"))
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 	self, err := os.Executable()
 	if err != nil {
 		return fail(err)
 	}
 	if !samePath(self, p.exe) {
-		if _, gone := stopDaemon(); !gone {
+		was, gone := stopDaemon()
+		stoppedOld = was
+		if !gone {
 			return fail(fmt.Errorf("the copy that is already installed is busy and has not stopped yet; try again in a minute"))
 		}
 		if err := copyFile(self, p.exe); err != nil {
@@ -623,6 +683,7 @@ func cmdInstall(interactive bool, out io.Writer) int {
 	}
 	msg += "One thing to check: the launcher must be signed in with \"Remember me\" ticked.\n\n" +
 		"Settings, log and details: " + p.dir
+	releaseInstall()
 	fmt.Fprintln(out, msg)
 	if interactive {
 		win.MessageBox(dialogName, msg, false)

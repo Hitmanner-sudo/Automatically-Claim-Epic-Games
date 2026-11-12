@@ -591,6 +591,22 @@ func SingleInstance(name string) (release func(), ok bool, err error) {
 	return func() { _ = windows.CloseHandle(h) }, true, nil
 }
 
+// LockHeld reports whether some process holds the named single-instance
+// lock, without creating it. A lock that exists but may not be opened (its
+// holder runs with higher rights) counts as held.
+func LockHeld(name string) bool {
+	n, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return false
+	}
+	h, err := windows.OpenMutex(windows.SYNCHRONIZE, false, n)
+	if err == nil {
+		_ = windows.CloseHandle(h)
+		return true
+	}
+	return errors.Is(err, windows.ERROR_ACCESS_DENIED)
+}
+
 // AttachParentConsole connects a GUI-subsystem process to the console of the
 // program that started it, so command-line use can print. It reports whether
 // a console was attached.

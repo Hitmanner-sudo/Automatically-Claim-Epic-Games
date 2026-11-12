@@ -88,6 +88,28 @@ func TestNormalizeAndBadInput(t *testing.T) {
 	}
 }
 
+func TestWrongKindSafetySettingsAreReadCautiously(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	for body, want := range map[string][2]bool{ // dryRun, restartIdleLauncher
+		`{"dryRun": "true", "restartIdleLauncher": "false"}`: {true, false},
+		`{"country": 5, "dryRun": "yes"}`:                    {true, true},
+		`{"restartIdleLauncher": 0, "country": "us"}`:        {false, false},
+		`{"DryRun": 1}`: {true, true},
+		`{"checkEveryMinutes": "30", "dryRun": false}`: {false, true},
+	} {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if err == nil {
+			t.Errorf("%s: no error", body)
+		}
+		if c.DryRun != want[0] || c.RestartIdleLauncher != want[1] {
+			t.Errorf("%s: dryRun=%v restartIdleLauncher=%v", body, c.DryRun, c.RestartIdleLauncher)
+		}
+	}
+}
+
 func TestNotepadEncodings(t *testing.T) {
 	const text = `{"dryRun": true, "country": "fr"}`
 	utf16le := []byte{0xFF, 0xFE}

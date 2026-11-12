@@ -47,7 +47,12 @@ func findChromium() string {
 func Start(t testing.TB) string {
 	t.Helper()
 	bin := findChromium()
+	// Where the browser tests are the point (CI), their absence is a failure.
+	required := os.Getenv("CHROMIUM_REQUIRED") != ""
 	if bin == "" {
+		if required {
+			t.Fatal("no Chromium/Chrome found, and CHROMIUM_REQUIRED is set")
+		}
 		t.Skip("no Chromium/Chrome found; set CHROMIUM_PATH to run browser tests")
 	}
 	// Not t.TempDir(): Chromium's helper processes keep writing for a moment
@@ -69,6 +74,9 @@ func Start(t testing.TB) string {
 		"about:blank",
 	)
 	if err := cmd.Start(); err != nil {
+		if required {
+			t.Fatalf("cannot start %s: %v", bin, err)
+		}
 		t.Skipf("cannot start %s: %v", bin, err)
 	}
 	t.Cleanup(func() {
