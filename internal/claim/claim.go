@@ -1025,6 +1025,22 @@ func (s *Session) Close() {
 	}
 }
 
+// Gone reports whether the connection to the launcher's page has ended: the
+// launcher was closed, closed itself (it does that when it has an update of
+// its own to install) or crashed. Nothing more can be done in this session
+// then; whoever runs it starts the launcher again.
+func (s *Session) Gone() bool {
+	if s == nil || s.home == nil {
+		return false
+	}
+	select {
+	case <-s.home.page.Done():
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Session) currentWatch() *orderWatch {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1236,9 +1252,17 @@ const (
 )
 
 func (s *Session) ownership(ctx context.Context, st pageState, o feed.Offer) ownership {
+	own, _ := s.ownershipWhy(ctx, st, o)
+	return own
+}
+
+// ownershipWhy is ownership with, for "unknown", a few words on why the
+// store gave no answer (for the log; nothing of the account is in them).
+func (s *Session) ownershipWhy(ctx context.Context, st pageState, o feed.Offer) (ownership, string) {
 	origin := storeOrigin(st.URL, s.opt.CheckoutBases)
 	if origin == "" {
-		return ownUnknown // only the store's own pages may ask its API
+		// Only the store's own pages may ask its API.
+		return ownUnknown, "the checkout is not on one of the store's own pages"
 	}
 	var res struct {
 		Status int    `json:"status"`
@@ -1246,10 +1270,61 @@ func (s *Session) ownership(ctx context.Context, st pageState, o feed.Offer) own
 	}
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	if err := s.page.Eval(cctx, ownershipJS(origin, o.Namespace, o.OfferID), &res); err != nil || res.Status != 200 {
-		return ownUnknown
+	if err := s.page.Eval(cctx, ownershipJS(origin, o.Namespace, o.OfferID), &res); err != nil {
+		return ownUnknown, "the page could not ask: " + clip(err.Error(), 100)
 	}
-	return parseOwnership([]byte(res.Body))
+	if res.Status == 0 {
+		return ownUnknown, "the request did not get through: " + clip(res.Body, 100)
+	}
+	said := graphQLError([]byte(res.Body))
+	if res.Status != 200 {
+		if said != "" {
+			return ownUnknown, fmt.Sprintf("HTTP %d: %s", res.Status, said)
+		}
+		return ownUnknown, fmt.Sprintf("HTTP %d", res.Status)
+	}
+	own := parseOwnership([]byte(res.Body))
+	if own == ownUnknown {
+		if said != "" {
+			return own, "its answer was an error: " + said
+		}
+		return own, "its answer has a form this program does not know"
+	}
+	return own, ""
+}
+
+// graphQLError is the first error message of a GraphQL answer, shortened;
+// empty when there is none.
+func graphQLError(body []byte) string {
+	var doc struct {
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if json.Unmarshal(body, &doc) != nil {
+		return ""
+	}
+	for _, e := range doc.Errors {
+		if m := strings.TrimSpace(e.Message); m != "" {
+			// (Nothing that could name an account goes into the log.)
+			return clip(reIdentifier.ReplaceAllString(m, "…"), 100)
+		}
+	}
+	return ""
+}
+
+// reIdentifier matches what could identify an account or a session in a
+// message from the store: long runs of hex digits or of letters and digits,
+// and e-mail addresses.
+var reIdentifier = regexp.MustCompile(`[0-9a-fA-F-]{16,}|\S+@\S+|[A-Za-z0-9_-]{24,}`)
+
+// clip shortens a text for the log and keeps it on one line.
+func clip(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > n {
+		return string(r[:n]) + "…"
+	}
+	return s
 }
 
 func parseOwnership(body []byte) ownership {
@@ -1539,6 +1614,8 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 	// run goes on regardless (Options.Again). notOwnedBefore: the store
 	// says the account does not have it. (Neither, when it gave no answer.)
 	ownedBefore, notOwnedBefore := false, false
+	// lost: the launcher was found gone at the last look (see below).
+	lost := false
 	var evidence []string
 	pre := Unknown
 	for {
@@ -1576,6 +1653,16 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 			s.superviseFrames(ctx, nil)
 		}
 		st, ierr := s.inspect(ctx)
+		if ierr != nil && s.Gone() {
+			// Waiting would not bring it back, and no other address would
+			// fare better. (One more turn first, so that what the network
+			// watch took in while this look was under way is not lost.)
+			if !lost {
+				lost = true
+				continue
+			}
+			return Result{Failed, "the launcher went away while the checkout was being opened; nothing was pressed"}, last, false
+		}
 		if ierr == nil {
 			last = st
 			switch {
@@ -1627,12 +1714,17 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 					// What does the account already have? (Asked once; it
 					// takes a moment, so the page is read afresh afterwards.)
 					ownChecked = true
-					switch s.ownership(ctx, st, o) {
+					own, why := s.ownershipWhy(ctx, st, o)
+					switch own {
+					case ownUnknown:
+						// (Said in the log so that a store that has stopped
+						// answering this question does not go unnoticed.)
+						s.opt.Logf("%s: the store did not say whether the account has this already (%s); the checkout and Epic's answer to the order decide", o.Title, why)
 					case ownNo:
 						notOwnedBefore = true
 					case ownYes:
 						if !s.opt.Again {
-							return Result{Owned, "already in the library"}, last, false
+							return Result{Owned, "the store says the account has it already; nothing was pressed"}, last, false
 						}
 						ownedBefore = true
 						s.opt.Logf("%s: already in the library; going on all the same, as asked", o.Title)
@@ -1720,6 +1812,9 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 		// the button and the last look is taken.
 		rehearsal := "the pointer was moved onto the button and the last look before a press passed"
 		if err := s.approach(ctx, last.Place, w); err != nil {
+			if s.Gone() && ctx.Err() == nil {
+				return Result{Failed, "the launcher went away during the rehearsal, before the last look; nothing was pressed"}, last, false
+			}
 			rehearsal = "but a real run would not have pressed: " + err.Error()
 		}
 		if ownedBefore {
@@ -1753,14 +1848,18 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 		if ctx.Err() != nil {
 			return Result{Failed, "interrupted"}, last, false
 		}
+		if errors.Is(err, errCalledOff) && w.sawPaid() {
+			return Result{NotFree, err.Error()}, last, false
+		}
+		if s.Gone() {
+			return Result{Failed, "the launcher went away just before the order button was to be pressed; nothing was pressed"}, last, false
+		}
 		if errors.Is(err, errCalledOff) {
-			if w.sawPaid() {
-				return Result{NotFree, err.Error()}, last, false
-			}
 			return Result{Failed, err.Error()}, last, false
 		}
 		return Result{Failed, "could not press the order button: " + err.Error()}, last, false
 	}
+	s.opt.Logf("%s: pressed %q; waiting for Epic's answer", o.Title, pressed.Text)
 	clickedAt := time.Now()
 	clicks := 1
 	deadline = time.Now().Add(s.opt.OrderWait)
@@ -1812,6 +1911,16 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 		}
 
 		st, ierr := s.inspect(ctx)
+		if ierr != nil && s.Gone() {
+			// No answer will reach this program any more. (One more turn
+			// first: Epic's answer may have come in while this look was
+			// under way, and the checks above then find it.)
+			if !lost {
+				lost = true
+				continue
+			}
+			return Result{Failed, "the launcher went away after the order button was pressed, before Epic's answer was seen; the library will be checked next time"}, last, false
+		}
 		if ierr == nil {
 			last = st
 			switch {
@@ -1849,6 +1958,7 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 				// nothing speaks of a price above zero.
 				if v, _ := priceEvidence(st, w); v != Paid {
 					lastConsent = time.Now()
+					s.opt.Logf("%s: the checkout asks for a confirmation; pressing %q", o.Title, st.Consent.Text)
 					_ = s.click(ctx, st.Consent, w)
 				} else {
 					return Result{NotFree, "the checkout showed a total above zero before the final confirmation; nothing was confirmed"}, last, false
@@ -1881,6 +1991,7 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 				time.Since(clickedAt) > 12*time.Second && st.Place.Text == pressed.Text {
 				if v, _ := priceEvidence(st, w); v == Free {
 					clicks++
+					s.opt.Logf("%s: no order has gone out %v after the press; pressing %q again (press %d)", o.Title, time.Since(clickedAt).Round(time.Second), st.Place.Text, clicks)
 					clickedAt = time.Now()
 					_ = s.click(ctx, st.Place, w)
 				}
@@ -1996,7 +2107,14 @@ func (s *Session) click(ctx context.Context, b *btn, w *orderWatch) error {
 	}
 	var ok bool
 	if err := s.page.Eval(cctx, fmt.Sprintf("%s(%f, %f)", clickJS, b.X, b.Y), &ok); err != nil {
-		return err
+		var thrown *cdp.EvalError
+		if errors.As(err, &thrown) || err == cdp.ErrClosed {
+			// The script itself failed, or it was never sent (the
+			// connection had gone already): nothing was clicked.
+			return err
+		}
+		// It was sent and its answer did not arrive: it may have clicked.
+		return fmt.Errorf("%w: %v", cdp.ErrPressed, err)
 	}
 	if !ok {
 		return errors.New("no button at the expected position")

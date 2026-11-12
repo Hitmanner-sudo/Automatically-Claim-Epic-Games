@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/feed"
 )
 
 // oldBrowser stands in for the DevTools endpoint of the launcher's browser
@@ -99,6 +101,15 @@ func (b *oldBrowser) send(v any) {
 	}
 }
 
+// hangUp ends the connection, as a launcher that crashes or closes does.
+func (b *oldBrowser) hangUp() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.ws != nil {
+		_ = b.ws.Close()
+	}
+}
+
 func (b *oldBrowser) saw(entry string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -172,5 +183,38 @@ func TestAHeldFrameIsLetRunAndAVanishedOneHoldsNobodyUp(t *testing.T) {
 	}, 2*time.Second)
 	if d := time.Since(sent); d > time.Second {
 		t.Fatalf("the page's request waited %v behind a frame that had gone away", d)
+	}
+}
+
+func TestALauncherThatGoesAwayEndsTheClaimAtOnce(t *testing.T) {
+	// Seen on a real PC: the launcher crashed a second before the order
+	// button was to be pressed. The claim must say so at once (not wait out
+	// every address the checkout could be at), and the session must report
+	// that it is over, so that the launcher is started again.
+	b := newOldBrowser(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	s, err := Open(ctx, b.srv.URL, Options{SettleWait: 50 * time.Millisecond, UIWait: 10 * time.Second, CheckoutWait: 40 * time.Second, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if s.Gone() {
+		t.Fatal("the session counts as over before anything has happened")
+	}
+	go func() {
+		time.Sleep(1500 * time.Millisecond)
+		b.hangUp()
+	}()
+	started := time.Now()
+	res := s.Claim(ctx, feed.Offer{Title: "Game", Namespace: "ns", OfferID: "id"})
+	if res.Outcome != Failed || !strings.Contains(res.Detail, "the launcher went away") || !strings.Contains(res.Detail, "nothing was pressed") {
+		t.Fatalf("result = %v, want a failure that says the launcher went away and nothing was pressed", res)
+	}
+	if !s.Gone() {
+		t.Fatal("the session does not report that the launcher is gone")
+	}
+	if d := time.Since(started); d > 12*time.Second {
+		t.Fatalf("the claim took %v to notice", d)
 	}
 }

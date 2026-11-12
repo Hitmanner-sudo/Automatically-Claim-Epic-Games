@@ -1650,6 +1650,42 @@ func TestTheLibraryOnlyConfirmsAClaimIfItDidNotListTheGameBefore(t *testing.T) {
 	wantOutcome(t, r, Claimed, 1)
 }
 
+func TestTheLogSaysWhyTheStoreDidNotAnswerAboutTheLibrary(t *testing.T) {
+	// A store that has stopped answering "does the account have this?"
+	// must not go unnoticed: the claim goes on (the checkout and Epic's
+	// answer decide), and the log says what the store said instead.
+	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), GraphQLDown: true}, nil)
+	wantOutcome(t, r, Claimed, 1)
+	said, pressed := false, false
+	for _, l := range r.logs {
+		if strings.Contains(l, "did not say whether the account has this already") && strings.Contains(l, "HTTP 400: PersistedQueryNotFound") {
+			said = true
+		}
+		if strings.Contains(l, "pressed \"") && strings.Contains(l, "waiting for Epic's answer") {
+			pressed = true
+		}
+	}
+	if !said {
+		t.Errorf("the log does not say why the store gave no answer: %q", r.logs)
+	}
+	if !pressed {
+		t.Errorf("the log does not say that the button was pressed: %q", r.logs)
+	}
+
+	if got := graphQLError([]byte(`{"errors":[{"message":"  Persisted\nQuery   NotFound "}]}`)); got != "Persisted Query NotFound" {
+		t.Errorf("graphQLError = %q", got)
+	}
+	if got := graphQLError([]byte(`{"errors":[{"message":"no access for 0123456789abcdef0123456789abcdef (someone@example.com)"}]}`)); strings.Contains(got, "0123") || strings.Contains(got, "@") {
+		t.Errorf("an identifier got into the log text: %q", got)
+	}
+	if got := graphQLError([]byte(`<html>blocked</html>`)); got != "" {
+		t.Errorf("graphQLError of a page = %q", got)
+	}
+	if got := clip(strings.Repeat("é", 150), 100); len([]rune(got)) != 101 {
+		t.Errorf("clip left %d characters", len([]rune(got)))
+	}
+}
+
 // ---- what runs next to the checkout is supervised from its first moment
 
 // wantRefusedAtTheNetwork: the button was pressed once, the order that

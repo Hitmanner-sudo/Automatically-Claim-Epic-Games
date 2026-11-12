@@ -367,15 +367,57 @@ func (r *Runner) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]
 		}
 	}()
 
-	started := time.Now()
+	// The launcher can go away in the middle of a claim. It is then started
+	// again (bringUp lets it install an update of its own first, if that is
+	// why it left) and the claim is taken up afresh, a few times at most.
 	sn := &seen{}
+	err = rounds(offers, maxRestarts, func(pending []feed.Offer, mayRestart bool) (int, error) {
+		lostAt, yielded, err := r.session(ctx, inst, sn, pending, mayRestart, results)
+		if yielded {
+			handedOver = true // the launcher is running for the user now
+			return -1, daemon.ErrYielded
+		}
+		if lostAt >= 0 {
+			// Nothing of the launcher that went away may be left to swallow
+			// the next start.
+			if n := launcher.KillLeftovers(); n > 0 {
+				r.logf("ended %d launcher process(es) left over from the launcher that went away", n)
+			}
+			// As before the first start: never in the user's way. A
+			// launcher that runs now is somebody else's (a hidden start
+			// would be passed on to it and bring its window up).
+			if launcher.Running() || win.FullscreenActivity() {
+				r.logf("the launcher is not started again right now (it is running for someone else, or something is full-screen); what is left waits for the next look")
+				return -1, err
+			}
+		}
+		return lostAt, err
+	})
+	var busy *daemon.BusyError
+	if len(results) > 0 && errors.As(err, &busy) {
+		// "Busy" means nothing was attempted. Here something was, in a
+		// round before the launcher had to be started again: what came of
+		// it is kept, and the rest waits as it would after "busy".
+		r.logf("the launcher could not be started again: %s; what is left waits for the next look", busy.Reason)
+		err = nil
+	}
+	return results, err
+}
+
+// session runs one hidden launcher over the given offers and writes what
+// came of each into results. lostAt is -1, or (only with mayRestart) the
+// index of the offer during which the launcher went away: that offer has no
+// result yet, and neither have those behind it. yielded reports that the
+// user asked for the launcher, which is then running for them.
+func (r *Runner) session(ctx context.Context, inst launcher.Install, sn *seen, offers []feed.Offer, mayRestart bool, results map[string]claim.Result) (lostAt int, yielded bool, err error) {
+	lostAt = -1
+	started := time.Now()
 	h, err := r.bringUp(ctx, inst, sn)
 	if err != nil {
 		if errors.Is(err, errUserAsked) {
-			handedOver = true // the launcher is running for the user now
-			return results, daemon.ErrYielded
+			return -1, true, nil
 		}
-		return results, err
+		return -1, false, err
 	}
 	defer h.close(0) // whatever happens below, it does not outlive this call
 	r.logf("hidden %s is up after %v (DevTools on port %d)", inst.Gen, time.Since(started).Round(time.Second), h.in.Port)
@@ -397,7 +439,18 @@ func (r *Runner) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]
 			if h.ctx.Err() != nil && res.Outcome == claim.Failed && strings.HasPrefix(res.Detail, "interrupted") && !strings.Contains(res.Detail, "after the order button") {
 				break // never got anywhere; do not record it as an attempt
 			}
+			gone := res.Outcome == claim.Failed && sess.Gone() && h.ctx.Err() == nil
+			if gone && mayRestart {
+				// (It closes itself when it has an update of its own to
+				// install, and it can crash.)
+				r.logf("%s: %s. Starting the launcher again and taking this up afresh", o.Title, res.Detail)
+				lostAt = i
+				break
+			}
 			results[o.Key()] = res
+			if gone {
+				break // the offers behind it were not reached; they keep their turn
+			}
 			if res.Outcome == claim.NotSignedIn || res.Outcome == claim.Captcha || res.Outcome == claim.Throttled {
 				break // these concern the account: every other offer would end the same way
 			}
@@ -412,13 +465,12 @@ func (r *Runner) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]
 		grace = 0
 	}
 	if r.finish(inst, h, grace) {
-		handedOver = true
-		return results, daemon.ErrYielded
+		return -1, true, nil
 	}
 	if err != nil {
-		return results, err
+		return -1, false, err
 	}
-	return results, ctx.Err()
+	return lostAt, false, ctx.Err()
 }
 
 // LaunchReport is what a trial run of the hidden launcher found.

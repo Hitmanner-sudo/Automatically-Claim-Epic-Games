@@ -525,7 +525,9 @@ func (d *Daemon) claim(ctx context.Context, due []feed.Offer) time.Time {
 				d.logf("CLAIMED: %s (%s)", o.Title, res.Detail)
 			case claim.Owned:
 				e.Status, e.DoneAt = state.Owned, now
-				d.logf("%s is already in the library", o.Title)
+				// (With what said so: the store beforehand, or Epic in
+				// answer to the order.)
+				d.logf("%s is already in the library (%s)", o.Title, res.Detail)
 			case claim.Unavailable:
 				e.Status, e.DoneAt = state.Skipped, now
 				d.logf("%s cannot be claimed on this account: %s", o.Title, res.Detail)
