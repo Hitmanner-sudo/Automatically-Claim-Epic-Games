@@ -48,6 +48,13 @@ func findChromium() string {
 // base URL of its endpoint. The test is skipped when no browser is available.
 func Start(t testing.TB) string {
 	t.Helper()
+	// CDP_BASE points the tests at a browser that is already running: in CI,
+	// the Epic Games Launcher's own (Chromium 90), so that what the program
+	// does is tried on the very engine it meets in real use.
+	if base := os.Getenv("CDP_BASE"); base != "" {
+		useExisting(t, base)
+		return base
+	}
 	bin := findChromium()
 	// Where the browser tests are the point (CI), their absence is a failure.
 	required := os.Getenv("CHROMIUM_REQUIRED") != ""
@@ -81,6 +88,45 @@ func Start(t testing.TB) string {
 	}
 	t.Fatalf("Chromium did not expose a DevTools port in %d attempts (%s)", attempts, bin)
 	return ""
+}
+
+// useExisting gets a browser that is already running ready for the tests:
+// every page it shows is taken to an empty page.
+func useExisting(t testing.TB, base string) {
+	t.Helper()
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		targets, err := cdp.Targets(ctx, base)
+		done := 0
+		if err == nil {
+			for _, tg := range targets {
+				if tg.Type != "page" {
+					continue
+				}
+				p, perr := cdp.OpenPage(ctx, tg)
+				if perr != nil {
+					err = perr
+					continue
+				}
+				if nerr := p.Navigate(ctx, "about:blank"); nerr != nil {
+					err = nerr
+				} else {
+					done++
+				}
+				_ = p.Close()
+			}
+		}
+		cancel()
+		if done > 0 {
+			t.Logf("using the browser at %s (%d page(s) taken to an empty page)", base, done)
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the browser at %s (CDP_BASE) has no page that can be used: %v", base, err)
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 var errExited = errors.New("the browser exited at once")

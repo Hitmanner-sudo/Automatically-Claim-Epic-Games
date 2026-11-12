@@ -780,6 +780,16 @@ func browserCall(t *testing.T, base, method string, params any) {
 	}
 }
 
+// needTabs skips a test that has the browser open tabs on request. The
+// launcher's own browser (see CDP_BASE in cdptest) does not do that for an
+// outsider.
+func needTabs(t *testing.T) {
+	t.Helper()
+	if os.Getenv("CDP_BASE") != "" {
+		t.Skip("needs a browser that opens tabs on request")
+	}
+}
+
 func pageIDs(base string) map[string]bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -812,6 +822,7 @@ func TestFollowsACheckoutWindowTheLauncherOpens(t *testing.T) {
 	// window instead of loading it in place: here, the direct address shows
 	// an error, and a new window with the working checkout appears.
 	base := sharedBrowser(t)
+	needTabs(t)
 	before := pageIDs(base)
 	defer closeNewTabs(t, base, before)
 	store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), DirectBlocked: true})
@@ -862,6 +873,7 @@ func TestClaimsThroughTheStorePage(t *testing.T) {
 	// launcher's own route does: store page (behind a "Continue" notice),
 	// "Get", and a checkout window the launcher opens.
 	base := sharedBrowser(t)
+	needTabs(t)
 	before := pageIDs(base)
 	defer closeNewTabs(t, base, before)
 	store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), DirectBlocked: true, ProductGate: true})
@@ -885,6 +897,7 @@ func TestStorePagePaidOrderIsStillRefused(t *testing.T) {
 	// The store-page route ends in the same checkout checks: a total above
 	// zero is never ordered.
 	base := sharedBrowser(t)
+	needTabs(t)
 	before := pageIDs(base)
 	defer closeNewTabs(t, base, before)
 	store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$19.99", PreviewTotal: 1999, ConfirmTotal: intp(1999), DirectBlocked: true})
@@ -917,6 +930,7 @@ func TestStorePageStates(t *testing.T) {
 		{"Coming Soon", Later, "right now"},
 	}
 	for _, c := range cases {
+		needTabs(t)
 		before := pageIDs(base)
 		// "In Library" is only believed when the store confirms it for
 		// this very offer.
@@ -1257,6 +1271,7 @@ func TestStorePageLibraryTileIsNotTheOffersState(t *testing.T) {
 	// The page offers "Get" for this game and, further down, shows another
 	// edition that is "In Library". The offer is not owned.
 	base := sharedBrowser(t)
+	needTabs(t)
 	before := pageIDs(base)
 	defer closeNewTabs(t, base, before)
 	store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), DirectBlocked: true,
@@ -1281,6 +1296,7 @@ func TestCheckoutWindowForAnotherOfferIsNotUsed(t *testing.T) {
 	// "Get" opens a checkout for something other than this giveaway (a
 	// bundle or an edition the page promotes). It is left alone.
 	base := sharedBrowser(t)
+	needTabs(t)
 	before := pageIDs(base)
 	defer closeNewTabs(t, base, before)
 	store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), DirectBlocked: true, ProductOpens: "1-ns-other"})
@@ -1368,6 +1384,7 @@ func TestStorePageWithItsCheckoutInsideThePage(t *testing.T) {
 	// store page. Its address is opened as a page of its own and handled
 	// like any other checkout.
 	base := sharedBrowser(t)
+	needTabs(t)
 	before := pageIDs(base)
 	defer closeNewTabs(t, base, before)
 	store := newMockStore(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), DirectBlocked: true, ProductInPage: true})
