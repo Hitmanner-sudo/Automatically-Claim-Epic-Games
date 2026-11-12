@@ -1,0 +1,88 @@
+name: Browser tests in the launcher's own browser
+
+# What the program does to a checkout, tried on the very engine it meets in
+# real use: the stand-in store's pages are loaded in the Epic Games
+# Launcher's built-in browser (Chromium 90) on a Windows runner. The launcher
+# is not signed in there; nothing of Epic's is ordered or even opened.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/cef90.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  cef90:
+    name: Stand-in store in the launcher's Chromium 90
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        shell: pwsh
+        run: go build -trimpath -ldflags "-X main.version=cef90" -o "$env:RUNNER_TEMP/eac-console.exe" ./cmd/epicautoclaim
+      - name: Install the Epic Games Launcher
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $msi = "$env:RUNNER_TEMP\EpicInstaller.msi"
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/installer/download/EpicGamesLauncherInstaller.msi' -OutFile $msi
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -PassThru
+          if (-not $p.WaitForExit(600000)) { throw 'installer timed out' }
+          "msiexec exit code $($p.ExitCode)"
+      - name: Let the launcher update itself
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP/eac-console.exe" doctor --launch
+          & "$env:RUNNER_TEMP/eac-console.exe" doctor --launch
+          if ($LASTEXITCODE -ne 0) { throw "doctor failed with $LASTEXITCODE" }
+      - name: Browser tests in the launcher's browser
+        shell: pwsh
+        env:
+          CHROMIUM_REQUIRED: '1'
+        run: |
+          $exe = Get-ChildItem "${env:ProgramFiles(x86)}\Epic Games\Launcher\Portal\Binaries", "$env:ProgramFiles\Epic Games\Launcher\Portal\Binaries" -Recurse -Filter EpicGamesLauncher.exe -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) { throw 'the launcher was not found' }
+          "launcher: $exe"
+          $port = 9333
+          $base = "http://127.0.0.1:$port"
+          $code = 1
+          try {
+            Start-Process -FilePath $exe -ArgumentList "-cefdebug=$port", '-silent'
+            $deadline = (Get-Date).AddMinutes(7)
+            $pages = @(); $last = ''
+            while ((Get-Date) -lt $deadline) {
+              try {
+                $all = @(Invoke-RestMethod "$base/json/list" -TimeoutSec 20)
+                $pages = @($all | Where-Object { $_.type -eq 'page' })
+                $last = "answered with $($all.Count) target(s): " + (($all | ForEach-Object { "$($_.type) $($_.url)" }) -join ' | ')
+              } catch { $pages = @(); $last = "no answer: $($_.Exception.Message)" }
+              if ($pages.Count -gt 0) { break }
+              Start-Sleep -Seconds 3
+            }
+            "the launcher's debugging port: $last"
+            if ($pages.Count -eq 0) { throw 'the launcher showed no page' }
+            Start-Sleep -Seconds 8
+            Invoke-RestMethod "$base/json/list" -TimeoutSec 30 | Select-Object type, title, url | Format-Table -AutoSize -Wrap
+            try { Invoke-RestMethod "$base/json/version" -TimeoutSec 30 | Format-List } catch { "no /json/version: $($_.Exception.Message)" }
+            $env:CDP_BASE = $base
+            $only = 'TestClaimsFreeOffer|TestRealFreeCheckoutFlowOf2026|TestDryRunPlacesNoOrder|TestFrameFromAnotherSite|TestFrameCreatedAtTheClick|TestWorkersCannot|TestServiceWorker|TestPaidTotalOnPage|TestOrderRequestWithPaidTotal|TestConsentDialog|TestNewCheckoutLayout|TestCoveredButton|TestPurchaseLimit|TestOrderButtonIsPressedOnce'
+            go test ./internal/claim/ -run $only -count=1 -timeout 25m -v 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\cef90.txt" | Select-String -Pattern '^(--- |FAIL|ok|PASS|panic)' | ForEach-Object { $_.Line }
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { '--- everything the tests said'; Get-Content "$env:RUNNER_TEMP\cef90.txt" | Select-Object -First 900 }
+          } finally {
+            Get-CimInstance Win32_Process | Where-Object { $_.Name -in 'EpicGamesLauncher.exe', 'EpicWebHelper.exe' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          }
+          exit $code
+      - name: The launcher's own browser log
+        if: always()
+        shell: pwsh
+        run: |
+          $log = "$env:LOCALAPPDATA\EpicGamesLauncher\Saved\Logs\cef3.log"
+          if (Test-Path $log) { Get-Content $log -Tail 60 } else { 'no cef3.log' }

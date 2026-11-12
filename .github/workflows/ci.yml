@@ -6,6 +6,7 @@ on:
       - '**.md'
       - 'ci/egl-probe.ps1'
       - '.github/workflows/egl-probe.yml'
+      - '.github/workflows/cef90.yml'
   pull_request:
   workflow_dispatch:
 
@@ -129,42 +130,6 @@ jobs:
           $left = Get-CimInstance Win32_Process | Where-Object { $_.Name -in 'EpicAutoClaim.exe' }
           if ($left) { $left | Select-Object ProcessId, CommandLine | Format-List; throw 'the background process is still running after uninstall' }
           exit 0
-      - name: Browser tests against the launcher's own browser (Chromium 90)
-        # What the program does to a checkout, tried on the very engine it
-        # meets in real use: the stand-in store's pages are loaded in the
-        # launcher's built-in browser. (For information for now: a failure
-        # here does not fail the build.)
-        continue-on-error: true
-        timeout-minutes: 30
-        shell: pwsh
-        env:
-          CHROMIUM_REQUIRED: '1'
-        run: |
-          $exe = Get-ChildItem "${env:ProgramFiles(x86)}\Epic Games\Launcher\Portal\Binaries", "$env:ProgramFiles\Epic Games\Launcher\Portal\Binaries" -Recurse -Filter EpicGamesLauncher.exe -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $exe) { throw 'the launcher was not found' }
-          "launcher: $exe"
-          $port = 9333
-          $base = "http://127.0.0.1:$port"
-          Start-Process -FilePath $exe -ArgumentList "-cefdebug=$port", '-silent'
-          $deadline = (Get-Date).AddMinutes(4)
-          $pages = @()
-          while ((Get-Date) -lt $deadline) {
-            try { $pages = @(Invoke-RestMethod "$base/json/list" -TimeoutSec 3 | Where-Object { $_.type -eq 'page' }) } catch { $pages = @() }
-            if ($pages.Count -gt 0) { break }
-            Start-Sleep -Seconds 2
-          }
-          if ($pages.Count -eq 0) { throw 'the launcher showed no page' }
-          Start-Sleep -Seconds 5
-          Invoke-RestMethod "$base/json/list" | Select-Object type, title, url | Format-Table -AutoSize -Wrap
-          Invoke-RestMethod "$base/json/version" | Format-List
-          $env:CDP_BASE = $base
-          $only = 'TestClaimsFreeOffer|TestRealFreeCheckoutFlowOf2026|TestDryRunPlacesNoOrder|TestFrameFromAnotherSite|TestFrameCreatedAtTheClick|TestWorkersCannot|TestServiceWorker|TestPaidTotalOnPage|TestOrderRequestWithPaidTotal|TestConsentDialog|TestNewCheckoutLayout|TestCoveredButton|TestPurchaseLimit|TestOrderButtonIsPressedOnce'
-          go test ./internal/claim/ -run $only -count=1 -timeout 20m -v 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\cef90.txt" | Select-String -Pattern '^(--- |FAIL|ok|PASS|panic)' | ForEach-Object { $_.Line }
-          $code = $LASTEXITCODE
-          if ($code -ne 0) { '--- everything the tests said'; Get-Content "$env:RUNNER_TEMP\cef90.txt" | Select-Object -First 700 }
-          Get-CimInstance Win32_Process | Where-Object { $_.Name -in 'EpicGamesLauncher.exe', 'EpicWebHelper.exe' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-          Start-Sleep -Seconds 3
-          exit $code
       - name: Nothing left running
         if: always()
         shell: pwsh
