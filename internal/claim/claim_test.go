@@ -447,6 +447,12 @@ func TestRejectedOrder(t *testing.T) {
 func TestRejectedBecauseAlreadyOwned(t *testing.T) {
 	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), GraphQLDown: true, ConfirmError: "You already own this item."}, nil)
 	wantOutcome(t, r, Owned, 1)
+	// However the refusal is read (Epic's reply to the order, or the notice
+	// the page shows for it), the result says that it answers a press:
+	// "once --again" goes by these words.
+	if !strings.Contains(r.res.Detail, "Epic says the account has this already") && !strings.Contains(r.res.Detail, "after the press") {
+		t.Errorf("the result does not say that this answers a press: %v", r.res)
+	}
 }
 
 func TestWorksWithoutOwnershipQuery(t *testing.T) {
@@ -1681,6 +1687,14 @@ func TestTheLogSaysWhyTheStoreDidNotAnswerAboutTheLibrary(t *testing.T) {
 	// A token in base64 goes too; Epic's error codes and field names stay.
 	if got := scrub("bad token abcdEFGH+ijklMNOP/qrstUVWX+yz012345/6789abcd== for you"); strings.Contains(got, "abcd") || strings.Contains(got, "6789") {
 		t.Errorf("a token got through: %q", got)
+	}
+	for _, gone := range []string{
+		"abcdEFGHijklMNOPqrstUVWXyzABCDEFGHIJKLMNOP==",       // base64 without a digit
+		"XsrfTokenValueWithoutAnyDigitInItButVeryLongIndeed", // 40 characters and more
+	} {
+		if got := scrub("bad token " + gone + " for you"); strings.Contains(got, gone[:12]) {
+			t.Errorf("a token got through: %q", got)
+		}
 	}
 	for _, keep := range []string{
 		"errors.com.epicgames.common.authentication.token_verification_failed",

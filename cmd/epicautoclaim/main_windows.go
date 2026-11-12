@@ -622,7 +622,7 @@ func cmdOnce(a *app, args []string) int {
 		default:
 			// (Not "nothing was pressed": a press whose answer never
 			// came, or was not understood, ends here too.)
-			a.log.Printf("Done, but this run with --again did not see Epic answer a press of the order button, so it does not prove the whole path: the lines above say why.")
+			a.log.Printf("Done, but in this run with --again no press of the order button was answered by Epic with \"you have this already\" or a confirmation, so it does not prove the whole path: the lines above say why.")
 		}
 	default:
 		fmt.Fprintf(a.out, "\nDone. The background process would check again at %s.\n", next.Local().Format("Mon 2 Jan 15:04"))

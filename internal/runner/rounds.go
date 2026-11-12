@@ -39,14 +39,22 @@ func afterAPress(res claim.Result) bool {
 	return strings.Contains(res.Detail, "after the order button")
 }
 
+// pressedEarlier is added to what a later start of the launcher finds for
+// an offer whose order button was pressed, without Epic's answer being
+// seen, at an earlier start in the same session. It states the fact and
+// leaves the conclusion to the reader: the order may have gone through, or
+// (for a game the account had already) may have been refused like the next.
+const pressedEarlier = "; at an earlier start of the launcher in this session the order button had been pressed and Epic's answer to it was not seen"
+
 // settle is what is written down for an offer when a round comes to the
 // result res, given what an earlier start of the launcher in the same
 // session left for it (prev, if had). A press whose answer was lost with
-// the launcher most likely did place the order; when the next round then
-// finds the game owned, "owned" must not be the whole story.
+// the launcher must not disappear behind what a later start says ("owned",
+// or a failure in which "nothing was pressed"): only a claim, or a result
+// that itself speaks of a press, stands as it is.
 func settle(prev claim.Result, had bool, res claim.Result) claim.Result {
-	if had && afterAPress(prev) && res.Outcome == claim.Owned {
-		res.Detail += "; at an earlier start of the launcher in this session the order button had been pressed before the launcher went away, so that order most likely went through"
+	if had && afterAPress(prev) && res.Outcome != claim.Claimed && !afterAPress(res) {
+		res.Detail += pressedEarlier
 	}
 	return res
 }

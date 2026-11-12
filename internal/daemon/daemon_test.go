@@ -932,9 +932,20 @@ func TestRunWaitsOutTheMinutesAfterSignIn(t *testing.T) {
 		return h
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	done := make(chan struct{})
+	// The loop is stopped and waited for before the test ends: it writes
+	// its notes into the test's folder, which is removed afterwards (on
+	// Windows a file that is still being written cannot be).
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("the loop did not stop when told to")
+		}
+	}()
 	started := time.Now()
-	go r.d.Run(ctx, RunOptions{Settle: settle})
+	go func() { defer close(done); r.d.Run(ctx, RunOptions{Settle: settle}) }()
 	for r.feed.calls.Load() == 0 {
 		if time.Since(started) > 5*time.Second {
 			t.Fatal("the round never ran")
@@ -967,6 +978,35 @@ func TestAnAnswerAboutTheAccountCountsEvenWhenTheSessionWasCutShort(t *testing.T
 		if e := r.entry("b"); e.NextAttempt.Sub(r.now) != 25*time.Hour || e.Attempts != 0 {
 			t.Errorf("%s: the offer behind it waits %v (attempts %d), want 25h", name, e.NextAttempt.Sub(r.now), e.Attempts)
 		}
+	}
+}
+
+func TestAFailedOfferDoesNotComeBackSoonerThanTheSessionAllows(t *testing.T) {
+	// The order button was pressed, the launcher was lost before Epic's
+	// answer, and then the user took the launcher. The offer is written
+	// down as a failed attempt, but its own wait must not undercut the
+	// one that holds for the whole session.
+	lost := claim.Result{Outcome: claim.Failed, Detail: "the launcher went away after the order button was pressed, before Epic's answer was seen; the library will be checked next time"}
+	r := newRig(t)
+	a := r.offer("a", 5*24*time.Hour)
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a}}
+	r.claim.results[a.Key()] = lost
+	r.claim.err = ErrYielded
+	r.d.Tick(context.Background())
+	if e := r.entry("a"); e.Attempts != 1 || e.NextAttempt.Sub(r.now) != yieldRetry {
+		t.Errorf("after a hand-over the offer waits %v (attempts %d), want %v and one attempt", e.NextAttempt.Sub(r.now), e.Attempts, yieldRetry)
+	}
+	if yieldRetry <= failBackoff[0] {
+		t.Fatalf("this test needs the hand-over wait (%v) to be longer than the first wait after a failure (%v)", yieldRetry, failBackoff[0])
+	}
+	// Without anything that concerns the session, it waits as any failure.
+	r = newRig(t)
+	a = r.offer("a", 5*24*time.Hour)
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a}}
+	r.claim.results[a.Key()] = lost
+	r.d.Tick(context.Background())
+	if e := r.entry("a"); e.Attempts != 1 || e.NextAttempt.Sub(r.now) != failBackoff[0] {
+		t.Errorf("a failed attempt waits %v (attempts %d), want %v and one attempt", e.NextAttempt.Sub(r.now), e.Attempts, failBackoff[0])
 	}
 }
 

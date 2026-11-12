@@ -556,7 +556,14 @@ func (d *Daemon) claim(ctx context.Context, due []feed.Offer) time.Time {
 				d.logf("%s: %s", o.Title, res.Detail)
 			default:
 				e.Attempts++
-				e.NextAttempt = now.Add(pick(failBackoff, e.Attempts))
+				wait := pick(failBackoff, e.Attempts)
+				// A wait that concerns the whole session (the user took
+				// the launcher, the launcher is signed out) is not
+				// undercut by one offer's own.
+				if sessionWait > wait {
+					wait = sessionWait
+				}
+				e.NextAttempt = now.Add(wait)
 				d.logf("%s: attempt %d failed: %s; next try %s", o.Title, e.Attempts, res.Detail, e.NextAttempt.Local().Format("Mon 15:04"))
 			}
 			if !e.Status.Done() {

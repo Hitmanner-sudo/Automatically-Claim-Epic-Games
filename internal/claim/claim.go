@@ -1315,12 +1315,14 @@ func graphQLError(body []byte) string {
 
 // scrub takes out of a message from the store what could identify an
 // account or a session: e-mail addresses, and long runs of letters and
-// digits (ids, tokens). Long words without a digit stay: Epic's error
-// codes and field names are such words, and they are what the message is
-// read for.
+// digits (ids, tokens). A long word stays if it has no digit, no "+" or
+// "=" and fewer than 40 characters: Epic's error codes and field names are
+// such words, and they are what the message is read for. (A token that
+// happens to look like such a word would stay too; what is written is at
+// most 100 characters, into a log on the user's own PC.)
 func scrub(m string) string {
 	return reIdentifier.ReplaceAllStringFunc(m, func(t string) string {
-		if strings.Contains(t, "@") || strings.ContainsAny(t, "0123456789") {
+		if strings.Contains(t, "@") || strings.ContainsAny(t, "0123456789+=") || len(t) >= 40 {
 			return "…"
 		}
 		return t
@@ -1989,6 +1991,11 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 					errSeen, errText = time.Now(), fresh
 				}
 				if oc, known := classifyError(errText); known {
+					if oc == Owned {
+						// (Said with the words that mark an answer to a
+						// press: the notice is new since the press.)
+						return Result{Owned, "after the press, the checkout reports: " + errText}, last, false
+					}
 					return Result{oc, errText}, last, false
 				}
 				if time.Since(errSeen) > 6*time.Second {
