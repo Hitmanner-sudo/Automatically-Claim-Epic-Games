@@ -56,22 +56,10 @@ jobs:
           # Same program with a console, for the checks below.
           go build -trimpath -ldflags "-X main.version=$v" -o "$env:RUNNER_TEMP/eac-console.exe" ./cmd/epicautoclaim
           Get-Item dist/EpicAutoClaim.exe | Format-List Name, Length
-          # The same program again with its symbol table left in. Nothing is
-          # hidden in either; this one simply tells Windows (and anyone who
-          # looks) more about itself, which matters where Smart App Control
-          # judges unsigned programs.
-          New-Item -ItemType Directory -Force dist-symbols | Out-Null
-          go build -trimpath -ldflags "-H=windowsgui -X main.version=$v" -o dist-symbols/EpicAutoClaim.exe ./cmd/epicautoclaim
-          Get-FileHash dist/EpicAutoClaim.exe, dist-symbols/EpicAutoClaim.exe -Algorithm SHA256 | Format-List Path, Hash
       - uses: actions/upload-artifact@v4
         with:
           name: EpicAutoClaim
           path: dist/EpicAutoClaim.exe
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v4
-        with:
-          name: EpicAutoClaim-with-symbols
-          path: dist-symbols/EpicAutoClaim.exe
           if-no-files-found: error
       - name: Install the Epic Games Launcher
         shell: pwsh
