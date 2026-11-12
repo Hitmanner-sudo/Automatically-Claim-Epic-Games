@@ -221,11 +221,11 @@ func (s *Session) viaStorePage(ctx context.Context, o feed.Offer, w *orderWatch)
 			case ps.Confirm.clickable() && time.Since(lastGate) > 2*time.Second:
 				// "This edition contains something you already have."
 				lastGate = time.Now()
-				_ = s.click(ctx, ps.Confirm)
+				_ = s.click(ctx, ps.Confirm, nil)
 			case ps.Gate.clickable() && time.Since(lastGate) > 2*time.Second:
 				// Mature-content notice, or "device not supported".
 				lastGate = time.Now()
-				_ = s.click(ctx, ps.Gate)
+				_ = s.click(ctx, ps.Gate, nil)
 			case ps.CTA.clickable():
 				label := strings.TrimSpace(ps.CTA.Text)
 				switch {
@@ -233,7 +233,7 @@ func (s *Session) viaStorePage(ctx context.Context, o feed.Offer, w *orderWatch)
 					if presses == 0 || (presses < 3 && time.Since(pressedAt) > 20*time.Second) {
 						presses++
 						pressedAt = time.Now()
-						if err := s.click(ctx, ps.CTA); err != nil {
+						if err := s.click(ctx, ps.CTA, nil); err != nil {
 							return Result{Failed, "could not press the store page's button: " + err.Error()}, last
 						}
 					}

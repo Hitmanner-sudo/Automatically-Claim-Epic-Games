@@ -50,7 +50,7 @@ It is built to be unnoticeable on the weakest PC that can run the Epic Games Lau
 
 ### What it will not do
 
-- **Pay for anything.** The order button is pressed only when the checkout page itself shows that the total is zero. On top of that, every request the checkout sends is checked before it leaves your PC: one that states a price is dropped, and so is any order once a price above zero has shown up anywhere. When the claim is over, the checkout page is closed, so nothing can be sent afterwards.
+- **Pay for anything.** The order button is pressed only when the checkout states that the order's total is zero: Epic's own order preview says so, or the page's total line does, or every price on the page is zero and the page says "This is free". Immediately before the press it looks once more: still no price anywhere, still the same button under the pointer. On top of that, every request the checkout sends is held back and checked before it leaves your PC, including those of frames and workers, which are put under the same watch the moment they come into being. A request that states a price is dropped, and from then on so is everything else that could change anything. A background worker that was already running, whose requests cannot be held back, is simply kept from reaching any order address. When the claim is over, the checkout page is closed, so nothing can be sent afterwards.
 - **Solve CAPTCHAs.** If Epic asks for a human check, the program leaves the game alone and tries again hours later.
 - **Touch your password.** It never signs in. It relies on the launcher already being signed in, and it does not read the launcher's saved credentials.
 - **Send anything anywhere** except to Epic. There is no telemetry and no account with this project.
@@ -104,7 +104,7 @@ Tested on real Windows machines (GitHub's Windows runners) with a real Epic Game
 - recognising that a launcher is signed out;
 - shutting everything down again with nothing left running.
 
-Tested in a real browser against a stand-in for Epic's store (about 65 scenarios): placing a free order directly and through the store page, a checkout window opened by the launcher itself, a checkout shown inside the store page, the EU consent dialog, both the older and the 2026 checkout layout, holiday mystery games, already-owned games, region locks, CAPTCHAs, signed-out sessions, and every case found so far in which a price above zero appears anywhere (on the page, in Epic's order preview, in the order itself, sent through a service worker or a frame from another site, or re-sent by the page after the claim has ended), none of which may result in an order.
+Tested in a real browser against a stand-in for Epic's store (about 70 scenarios): placing a free order directly and through the store page, a checkout window opened by the launcher itself, a checkout shown inside the store page, the EU consent dialog, both the older and the 2026 checkout layout, holiday mystery games, already-owned games, region locks, CAPTCHAs, signed-out sessions, and every case found so far in which a price above zero appears anywhere (on the page, in Epic's order preview, in the order itself however it is written or encoded, sent through a service worker, a frame from another site or a worker, including ones that only come into being at the moment of the click, or re-sent by the page after the claim has ended), none of which may result in an order.
 
 Tested on a real PC with a real, signed-in account (Windows 11, launcher 20.3.8, 12 November 2026):
 
@@ -149,9 +149,9 @@ We are, frankly, rather pleased with ourselves:
 
 - It does something the Epic Games Launcher has no switch for, namely using the launcher without the launcher ever being seen, and it found out how by experiment: installing the real launcher on throwaway Windows machines and probing it until it gave up its secrets.
 - Its first run against a real account claimed a game in 24 seconds, with no window, no click and no notification.
-- It cannot spend money by design, and that design was attacked on purpose: independent AI reviewers went over the code again and again trying to make it buy something, lose a giveaway or show a window. They found more than fifty real problems. Every one was fixed, each with a test that fails if it ever comes back.
-- About 150 automated tests, most of them driving a real browser against a stand-in for Epic's store, run on every change, together with a rehearsal against the real launcher on a real Windows machine.
-- Roughly 9,000 lines of Go and 4,500 more of tests, one small file to run, and next to nothing asked of the PC.
+- It cannot spend money by design, and that design was attacked on purpose: independent AI reviewers went over the code again and again trying to make it buy something, lose a giveaway or show a window. They found more than sixty real problems. Every one was fixed, each with a test that fails if it ever comes back.
+- More than 150 automated tests, most of them driving a real browser against a stand-in for Epic's store, run on every change, together with a rehearsal against the real launcher on a real Windows machine.
+- Roughly 10,000 lines of Go and 4,700 more of tests, one small file to run, and next to nothing asked of the PC.
 
 Not bad for something nobody typed.
 

@@ -99,6 +99,10 @@ func (e *Error) Error() string {
 type Event struct {
 	Method string
 	Params json.RawMessage
+	// SessionID names the attached child target the event comes from (a
+	// frame of another site, a worker); empty for the target the
+	// connection was opened to. See CallSession.
+	SessionID string
 }
 
 type reply struct {
@@ -206,11 +210,12 @@ func (c *Conn) readLoop() {
 			break
 		}
 		var msg struct {
-			ID     int64           `json:"id"`
-			Method string          `json:"method"`
-			Params json.RawMessage `json:"params"`
-			Result json.RawMessage `json:"result"`
-			Error  *Error          `json:"error"`
+			ID        int64           `json:"id"`
+			Method    string          `json:"method"`
+			Params    json.RawMessage `json:"params"`
+			Result    json.RawMessage `json:"result"`
+			Error     *Error          `json:"error"`
+			SessionID string          `json:"sessionId"`
 		}
 		if err := json.Unmarshal(data, &msg); err != nil {
 			continue
@@ -230,7 +235,7 @@ func (c *Conn) readLoop() {
 			continue
 		}
 		if msg.Method != "" {
-			c.queueEvent(Event{Method: msg.Method, Params: msg.Params})
+			c.queueEvent(Event{Method: msg.Method, Params: msg.Params, SessionID: msg.SessionID})
 		}
 	}
 	c.mu.Lock()
@@ -254,6 +259,14 @@ func (c *Conn) Done() <-chan struct{} { return c.done }
 
 // Call sends a command and waits for its reply. result may be nil.
 func (c *Conn) Call(ctx context.Context, method string, params any, result any) error {
+	return c.CallSession(ctx, "", method, params, result)
+}
+
+// CallSession is Call addressed to a child target that was attached through
+// this connection with Target.setAutoAttach in "flatten" mode: its messages
+// travel over the same connection, marked with the child's session id. An
+// empty session id means the connection's own target.
+func (c *Conn) CallSession(ctx context.Context, sessionID, method string, params any, result any) error {
 	// A command that is sent is carried out, whether or not anyone waits
 	// for the reply: nothing is sent once the caller has been called off.
 	if err := ctx.Err(); err != nil {
@@ -273,6 +286,9 @@ func (c *Conn) Call(ctx context.Context, method string, params any, result any) 
 	msg := map[string]any{"id": id, "method": method}
 	if params != nil {
 		msg["params"] = params
+	}
+	if sessionID != "" {
+		msg["sessionId"] = sessionID
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {

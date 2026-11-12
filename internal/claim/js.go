@@ -92,10 +92,21 @@ const inspectJS = `(function () {
     var at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
     return !!at && (at === el || el.contains(at) || at.contains(el));
   }
+  // (Bringing a button into view moves the page, so the positions are
+  // taken afterwards, and what lies on top is looked at once more.)
+  function onTop(el) {
+    var r = el.getBoundingClientRect();
+    if (r.top < 0 || r.bottom > (innerHeight || 0) || r.left < 0 || r.right > (innerWidth || 0)) return false;
+    var at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return !!at && (at === el || el.contains(at) || at.contains(el));
+  }
+  if (consent === place) consent = null;
+  if (place) reachable(place);
+  if (consent) reachable(consent);
   out.place = place ? button(place) : null;
-  if (out.place) out.place.hit = reachable(place);
-  out.consent = consent && consent !== place ? button(consent) : null;
-  if (out.consent) out.consent.hit = reachable(consent);
+  if (out.place) out.place.hit = onTop(place);
+  out.consent = consent ? button(consent) : null;
+  if (out.consent) out.consent.hit = onTop(consent);
   out.buttons = [];
   for (var bi = 0; bi < buttons.length && out.buttons.length < 10; bi++) out.buttons.push(text(buttons[bi]).slice(0, 40));
 
@@ -130,7 +141,15 @@ const inspectJS = `(function () {
   var checkoutText = app && typeof app.innerText === 'string' && app.innerText ? text(app) : body;
   var priceRe = new RegExp(PRICE, 'g');
   var pm;
-  while ((pm = priceRe.exec(checkoutText)) && out.prices.length < 40) out.prices.push(pm[1]);
+  while ((pm = priceRe.exec(checkoutText)) && out.prices.length < 40) {
+    // An amount whose digits go on beyond what was recognised ("$0.0001",
+    // "1 0,00 \u20ac") has not been read: it counts as an amount that is
+    // not known to be zero.
+    var from = pm.index + pm[0].length - pm[1].length, to = pm.index + pm[0].length;
+    var runsOn = /^[.,]\d/.test(checkoutText.substr(to, 2)) ||
+      (/^\d/.test(pm[1]) && /\d[ .,\u00a0\u202f]$/.test(checkoutText.slice(Math.max(0, from - 2), from)));
+    out.prices.push(runsOn ? 'an amount that could not be read' : pm[1]);
+  }
   // Epic's own statement on the free checkout.
   out.saysFree = /\bthis (game |product |item |add-on |bundle )?is free\b/i.test(checkoutText);
 
@@ -252,6 +271,15 @@ func pageMappingJS(origin, slug string) string {
   } catch (e) { return { status: 0, body: String(e) }; }
 })()`, base, v, x)
 }
+
+// underPointJS returns the label of the button under a point of the page
+// (null when there is none), read the same way inspectJS reads it.
+const underPointJS = `(function (x, y) {
+  var el = document.elementFromPoint(x, y);
+  while (el && !(el.tagName === 'BUTTON' || (el.getAttribute && el.getAttribute('role') === 'button') || (el.tagName === 'INPUT' && el.type === 'submit'))) el = el.parentElement;
+  if (!el) return null;
+  return (((typeof el.innerText === 'string' ? el.innerText : el.textContent) || '').replace(/\s+/g, ' ').trim()).slice(0, 80);
+})`
 
 // clickJS is the fallback for when synthetic mouse input is unavailable.
 const clickJS = `(function (x, y) {

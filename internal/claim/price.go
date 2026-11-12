@@ -3,6 +3,7 @@ package claim
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -72,6 +73,62 @@ func asNumber(v any) (float64, bool) {
 	return 0, false
 }
 
+// keyName brings a field name to the form totalKeys uses: lower case,
+// without the separators of snake_case and kebab-case.
+func keyName(k string) string {
+	return strings.NewReplacer("_", "", "-", "").Replace(strings.ToLower(k))
+}
+
+// amountKeys are the names under which an amount sits inside an object that
+// is itself a total ("total": {"amount": 1999, "currency": "USD"}).
+var amountKeys = map[string]bool{"amount": true, "value": true, "price": true, "total": true, "gross": true, "net": true, "due": true, "amountdue": true, "cents": true, "minor": true}
+
+// reMoneyText: a number with at most a currency sign or code before or
+// after it.
+var reMoneyText = regexp.MustCompile(`^(?:[A-Za-z]{0,3}\s?\p{Sc}?|\p{Sc})\s?-?\d[\d.,'\s\x{a0}\x{202f}]*\s?(?:\p{Sc}|[A-Za-z]{2,3}\.?)?$`)
+
+// totalOf reads what stands under a total-named key: a number, a number
+// written as text ("19.99", "$19.99", "0,00 €"), or an object holding the
+// amount. ok is false when it holds nothing that can be read as an amount.
+func totalOf(v any) (value float64, ok bool) {
+	if f, isNum := asNumber(v); isNum {
+		return f, true
+	}
+	switch n := v.(type) {
+	case string:
+		// Text counts when it reads as an amount of money ("$19.99",
+		// "0,00 €") or as a word for free; "3 items" says nothing.
+		t := strings.TrimSpace(n)
+		if !reMoneyText.MatchString(t) && strings.ContainsAny(t, "0123456789") {
+			return 0, false
+		}
+		switch JudgeTotalText(t) {
+		case Paid:
+			return 1, true
+		case Free:
+			return 0, true
+		}
+	case map[string]any:
+		found, nonZero := false, false
+		for k, child := range n {
+			if !amountKeys[keyName(k)] {
+				continue
+			}
+			if f, isAmount := totalOf(child); isAmount {
+				found = true
+				nonZero = nonZero || f != 0
+			}
+		}
+		if found {
+			if nonZero {
+				return 1, true
+			}
+			return 0, true
+		}
+	}
+	return 0, false
+}
+
 func walk(v any, path string, depth int, out *[]PriceFact) {
 	if depth > 24 {
 		return
@@ -86,13 +143,21 @@ func walk(v any, path string, depth int, out *[]PriceFact) {
 		for _, k := range keys {
 			child := n[k]
 			p := path + "." + k
-			if totalKeys[strings.ToLower(k)] {
-				if f, ok := asNumber(child); ok {
+			if totalKeys[keyName(k)] {
+				if f, ok := totalOf(child); ok {
 					*out = append(*out, PriceFact{Path: strings.TrimPrefix(p, "."), Value: f})
 					continue
 				}
 			}
 			walk(child, p, depth+1, out)
+		}
+	case string:
+		// JSON carried inside a JSON string.
+		if t := strings.TrimSpace(n); len(t) > 1 && (t[0] == '{' || t[0] == '[') {
+			var inner any
+			if json.Unmarshal([]byte(t), &inner) == nil {
+				walk(inner, path+"(json)", depth+1, out)
+			}
 		}
 	case []any:
 		for i, child := range n {
@@ -134,6 +199,45 @@ func JudgeJSON(raw []byte) (Verdict, []PriceFact) {
 		return Unknown, nil
 	}
 	return JudgeTotals(facts), facts
+}
+
+// JudgePreview judges Epic's reply to an order preview. A total above zero
+// anywhere in it means Paid. Free, though, is only what the reply states as
+// the order's own total (orderResponse.totalPrice, and the totals of its
+// line offers): a zero under some other key named "total" (a rewards
+// balance, a coupon count) proves nothing about the price.
+func JudgePreview(raw []byte) (Verdict, []PriceFact) {
+	v, facts := JudgeJSON(raw)
+	if v != Free {
+		return v, facts
+	}
+	var doc struct {
+		OrderResponse *struct {
+			TotalPrice any `json:"totalPrice"`
+			LineOffers []struct {
+				TotalPrice any `json:"totalPrice"`
+			} `json:"lineOffers"`
+		} `json:"orderResponse"`
+		TotalPrice any `json:"totalPrice"`
+	}
+	if json.Unmarshal(raw, &doc) != nil {
+		return Unknown, facts
+	}
+	total := doc.TotalPrice
+	if doc.OrderResponse != nil {
+		total = doc.OrderResponse.TotalPrice
+	}
+	if f, ok := totalOf(total); !ok || f != 0 {
+		return Unknown, facts
+	}
+	if doc.OrderResponse != nil {
+		for _, lo := range doc.OrderResponse.LineOffers {
+			if f, ok := totalOf(lo.TotalPrice); ok && f != 0 {
+				return Paid, facts
+			}
+		}
+	}
+	return Free, facts
 }
 
 // JudgeTotalText judges the text of the checkout's "total" line as shown to

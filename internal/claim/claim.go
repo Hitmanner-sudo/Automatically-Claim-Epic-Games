@@ -16,8 +16,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/cdp"
@@ -261,6 +263,87 @@ type Session struct {
 
 	home *tab
 	tabs []*tab // every attached page, home first
+
+	// kids are the frames and workers that the browser attached to a page's
+	// connection the moment they were created (see adopt), by session id.
+	kids map[string]kid
+}
+
+// kid is one frame or worker of an attached page.
+type kid struct {
+	targetID   string
+	kind, url  string
+	supervised bool // its requests pass through this program
+	fenced     bool // it cannot reach an order address at all (see fence)
+}
+
+// orderWords are what the address of a request that places an order (or
+// goes where orders are taken) contains. See fence.
+var orderWords = []string{
+	"confirm-order", "confirmOrder", "confirm_order", "place-order", "placeOrder", "place_order",
+	"submit-order", "submitOrder", "submit_order", "create-order", "createOrder", "complete-order", "completeOrder",
+	"quickPurchase", "quickpurchase", "/purchase/", "/checkout/", "/orders", "/order/", "/payment/", "/payments", "/pay/",
+	"/acquire", "/redeem", "://payment-", "://payments.", "://checkout.",
+}
+
+func reachesOrders(rawURL string) bool {
+	for _, w := range orderWords {
+		if strings.Contains(rawURL, w) {
+			return true
+		}
+	}
+	return false
+}
+
+// backgroundWorker reports whether a target is a worker that lives on its
+// own (shared between pages, or a service worker) rather than inside one
+// page.
+func backgroundWorker(kind string) bool { return kind == "shared_worker" || kind == "service_worker" }
+
+// fence is for a background worker that was already running when this
+// program got to it. The browser holds back the requests of a frame or of a
+// worker it is told about at its start, so that they can be looked at; it
+// does not do that for a worker that is already under way. Such a worker is
+// instead kept from reaching any order address at all, and what it tries is
+// reported (see fencedRequest). Epic's checkout sends its order from the
+// page itself, so this takes nothing away from it.
+func fence(ctx context.Context, page *cdp.Page, session string) bool {
+	if page.CallSession(ctx, session, "Network.enable", nil, nil) != nil {
+		return false
+	}
+	urls := make([]string, 0, len(orderWords))
+	for _, w := range orderWords {
+		urls = append(urls, "*"+w+"*")
+	}
+	return page.CallSession(ctx, session, "Network.setBlockedURLs", map[string]any{"urls": urls}, nil) == nil
+}
+
+// fencedRequest notes a request of a fenced worker that the browser
+// stopped because it was going to an order address.
+func (s *Session) fencedRequest(ev cdp.Event) {
+	var p struct {
+		Request struct {
+			URL      string `json:"url"`
+			Method   string `json:"method"`
+			PostData string `json:"postData"`
+		} `json:"request"`
+	}
+	if json.Unmarshal(ev.Params, &p) != nil || !reachesOrders(p.Request.URL) {
+		return
+	}
+	if w := s.currentWatch(); w != nil {
+		w.onFenced(p.Request.Method, p.Request.URL, p.Request.PostData)
+	}
+}
+
+// isFenced reports whether events of this origin come from a fenced worker.
+func (s *Session) isFenced(t *tab, session string) bool {
+	if session == "" {
+		return t.fenced
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.kids[session].fenced
 }
 
 // tab is one attached launcher page with its own request supervision.
@@ -271,7 +354,21 @@ type tab struct {
 	// swBypassed: the browser was told to keep service workers out of this
 	// page's network traffic, so that every request is seen here.
 	swBypassed bool
+	// auto: the browser hands this page's frames and workers over as they
+	// are created, each held still until it is supervised.
+	auto bool
+	// closing: the page is being let go of; nothing that could change
+	// anything is let out of it any more.
+	closing atomic.Bool
+	// fenced: this is a background worker that was already running; it is
+	// kept away from order addresses (see fence).
+	fenced bool
 }
+
+// autoAttach asks the browser to attach every frame of another site and
+// every worker a page creates to the page's own connection, and to hold
+// each one still until this program has put it under supervision.
+var autoAttach = map[string]any{"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true}
 
 // fetchPatterns select the requests that pass through this program before
 // they leave the browser (see orderWatch).
@@ -300,12 +397,25 @@ func (s *Session) attach(ctx context.Context, t cdp.Target) (*tab, error) {
 	}
 	nt := &tab{id: t.ID, page: page, done: make(chan struct{})}
 	go s.eventLoop(nt)
-	if err := page.Call(pctx, "Page.enable", nil, nil); err != nil {
-		_ = page.Close()
-		<-nt.done
-		return nil, fmt.Errorf("attach to launcher page: %w", err)
+	// (Workers have no page to speak of; their requests are what matters.)
+	isWorker := strings.Contains(t.Type, "worker")
+	if !isWorker {
+		if err := page.Call(pctx, "Page.enable", nil, nil); err != nil {
+			_ = page.Close()
+			<-nt.done
+			return nil, fmt.Errorf("attach to launcher page: %w", err)
+		}
 	}
-	if err := page.Call(pctx, "Fetch.enable", map[string]any{"patterns": fetchPatterns()}, nil); err != nil {
+	err = page.Call(pctx, "Fetch.enable", map[string]any{"patterns": fetchPatterns()}, nil)
+	if backgroundWorker(t.Type) {
+		// Found already running: holding its requests back is not to be
+		// relied on, so it is fenced off as well.
+		nt.fenced = fence(pctx, page, "")
+		if nt.fenced {
+			err = nil
+		}
+	}
+	if err != nil {
 		_ = page.Close()
 		<-nt.done
 		return nil, fmt.Errorf("cannot supervise the checkout's network requests, so nothing will be ordered: %w", err)
@@ -313,13 +423,108 @@ func (s *Session) attach(ctx context.Context, t cdp.Target) (*tab, error) {
 	// A service worker would relay the page's requests from outside this
 	// supervision. Ask the browser to leave it out; if it will not, the
 	// order button is not pressed on a page a service worker controls.
-	if err := page.Call(pctx, "Network.enable", nil, nil); err == nil {
-		nt.swBypassed = page.Call(pctx, "Network.setBypassServiceWorker", map[string]any{"bypass": true}, nil) == nil
+	if !isWorker {
+		if err := page.Call(pctx, "Network.enable", nil, nil); err == nil {
+			nt.swBypassed = page.Call(pctx, "Network.setBypassServiceWorker", map[string]any{"bypass": true}, nil) == nil
+		}
 	}
 	s.mu.Lock()
 	s.tabs = append(s.tabs, nt)
 	s.mu.Unlock()
+	// Frames of other sites and workers run outside the page; have them
+	// handed over as they appear. (Where the browser cannot do that, they
+	// are looked for at intervals instead: see superviseFrames.)
+	nt.auto = page.Call(pctx, "Target.setAutoAttach", autoAttach, nil) == nil
 	return nt, nil
+}
+
+// adopt puts a frame or worker that the browser has just attached to a
+// page's connection under the same request supervision as the page, and
+// only then lets it run.
+func (s *Session) adopt(t *tab, ev cdp.Event) {
+	var p struct {
+		SessionID  string `json:"sessionId"`
+		TargetInfo struct {
+			TargetID string `json:"targetId"`
+			Type     string `json:"type"`
+			URL      string `json:"url"`
+		} `json:"targetInfo"`
+		// Held: it has not run anything yet and waits to be let go.
+		Held bool `json:"waitingForDebugger"`
+	}
+	if json.Unmarshal(ev.Params, &p) != nil || p.SessionID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	k := kid{targetID: p.TargetInfo.TargetID, kind: p.TargetInfo.Type, url: trimURL(p.TargetInfo.URL)}
+	k.supervised = t.page.CallSession(ctx, p.SessionID, "Fetch.enable", map[string]any{"patterns": fetchPatterns()}, nil) == nil
+	if strings.Contains(k.kind, "worker") && !p.Held {
+		// A worker that was already under way: the browser does not hold
+		// its requests back from now on, whatever it answered.
+		k.supervised = false
+		if backgroundWorker(k.kind) {
+			k.fenced = fence(ctx, t.page, p.SessionID)
+		}
+	}
+	// Its own frames and workers in turn.
+	_ = t.page.CallSession(ctx, p.SessionID, "Target.setAutoAttach", autoAttach, nil)
+	s.mu.Lock()
+	if s.kids == nil {
+		s.kids = map[string]kid{}
+	}
+	s.kids[p.SessionID] = k
+	s.mu.Unlock()
+	_ = t.page.CallSession(ctx, p.SessionID, "Runtime.runIfWaitingForDebugger", nil, nil)
+}
+
+// disown forgets a frame or worker that has gone away.
+func (s *Session) disown(ev cdp.Event) {
+	var p struct {
+		SessionID string `json:"sessionId"`
+	}
+	if json.Unmarshal(ev.Params, &p) != nil {
+		return
+	}
+	s.mu.Lock()
+	delete(s.kids, p.SessionID)
+	s.mu.Unlock()
+}
+
+// adopted reports whether a target is already supervised as some page's
+// frame or worker.
+func (s *Session) adopted(targetID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, k := range s.kids {
+		if k.targetID == targetID {
+			return true
+		}
+	}
+	return false
+}
+
+// unsupervised lists what is running next to the checkout without its
+// requests passing through this program: frames (which stop the order
+// button from being pressed) and workers (which, in the launcher's browser,
+// send their requests through the page that started them).
+func (s *Session) unsupervised() (frames, workers []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, k := range s.kids {
+		if k.supervised || k.fenced {
+			continue
+		}
+		what := k.kind + " " + k.url
+		if strings.Contains(k.kind, "worker") {
+			workers = append(workers, what)
+		} else {
+			frames = append(frames, what)
+		}
+	}
+	sort.Strings(frames)
+	sort.Strings(workers)
+	return frames, workers
 }
 
 func (s *Session) attached(id string) *tab {
@@ -352,13 +557,24 @@ func (s *Session) goHome() {
 	}
 	s.mu.Unlock()
 	for _, t := range extra {
-		blank(t.page)
-		_ = t.page.Close()
-		<-t.done
+		letGo(t)
 	}
 	if s.home != nil {
 		s.page = s.home.page
 	}
+}
+
+// letGo ends the supervision of a page without giving anything it still has
+// in hand a way out: from here on nothing that could change anything is let
+// through, its content is taken off, what was held back at that moment is
+// answered, and only then is the connection closed (which would release
+// whatever was still held).
+func letGo(t *tab) {
+	t.closing.Store(true)
+	blank(t.page)
+	time.Sleep(150 * time.Millisecond)
+	_ = t.page.Close()
+	<-t.done
 }
 
 // currentTab is the attached page being driven.
@@ -375,7 +591,10 @@ func (s *Session) currentTab() *tab {
 
 // superviseFrames puts the frames that run in processes of their own
 // (frames from other sites) under the same request supervision as the page.
-func (s *Session) superviseFrames(ctx context.Context) {
+//
+// With known set (the windows that existed before the checkout was opened),
+// windows that have appeared since are supervised too.
+func (s *Session) superviseFrames(ctx context.Context, known map[string]bool) {
 	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	targets, err := cdp.Targets(tctx, s.base)
 	cancel()
@@ -383,10 +602,26 @@ func (s *Session) superviseFrames(ctx context.Context) {
 		return
 	}
 	for _, t := range targets {
-		if t.Type != "iframe" || t.WebSocketDebuggerURL == "" || s.attached(t.ID) != nil {
+		if t.WebSocketDebuggerURL == "" || s.attached(t.ID) != nil || s.adopted(t.ID) {
 			continue
 		}
-		_, _ = s.attach(ctx, t)
+		switch {
+		case t.Type == "iframe" || strings.Contains(t.Type, "worker"):
+		case t.Type == "page" && known != nil && !known[t.ID] && !isLoginURL(t.URL):
+			// A window that was not there before the order button was
+			// pressed: whatever opened it, it orders nothing unseen.
+		default:
+			continue
+		}
+		if _, err := s.attach(ctx, t); err != nil && ctx.Err() == nil && strings.Contains(t.Type, "worker") {
+			// Not asked again; it is named before the button is pressed.
+			s.mu.Lock()
+			if s.kids == nil {
+				s.kids = map[string]kid{}
+			}
+			s.kids["direct:"+t.ID] = kid{targetID: t.ID, kind: t.Type, url: trimURL(t.URL)}
+			s.mu.Unlock()
+		}
 	}
 }
 
@@ -543,11 +778,7 @@ func (s *Session) Close() {
 	s.tabs = nil
 	s.mu.Unlock()
 	for _, t := range tabs {
-		if t.id != "" {
-			blank(t.page)
-		}
-		_ = t.page.Close()
-		<-t.done
+		letGo(t)
 	}
 }
 
@@ -584,18 +815,24 @@ func (s *Session) eventLoop(t *tab) {
 		case <-t.page.Done():
 			return
 		case ev := <-t.page.Events():
-			if ev.Method == "Page.javascriptDialogOpening" {
+			switch ev.Method {
+			case "Page.javascriptDialogOpening":
 				s.dismissDialog(t.page, ev.Params)
-				continue
+			case "Target.attachedToTarget":
+				s.adopt(t, ev)
+			case "Target.detachedFromTarget":
+				s.disown(ev)
+			case "Network.requestWillBeSent":
+				if s.isFenced(t, ev.SessionID) {
+					s.fencedRequest(ev)
+				}
+			case "Fetch.requestPaused":
+				var p pausedRequest
+				if json.Unmarshal(ev.Params, &p) != nil || p.RequestID == "" {
+					continue
+				}
+				s.answer(t, ev.SessionID, p)
 			}
-			if ev.Method != "Fetch.requestPaused" {
-				continue
-			}
-			var p pausedRequest
-			if json.Unmarshal(ev.Params, &p) != nil || p.RequestID == "" {
-				continue
-			}
-			s.answer(t.page, p)
 		}
 	}
 }
@@ -614,11 +851,17 @@ func (s *Session) dismissDialog(page *cdp.Page, params json.RawMessage) {
 	_ = page.Call(ctx, "Page.handleJavaScriptDialog", map[string]any{"accept": d.Type == "beforeunload"}, nil)
 }
 
-func (s *Session) answer(page *cdp.Page, p pausedRequest) {
+// answer decides about one request the browser is holding back: one of the
+// page's own (session empty) or one of a frame or worker attached through
+// the page's connection.
+func (s *Session) answer(t *tab, session string, p pausedRequest) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	w := s.currentWatch()
 	id := map[string]any{"requestId": p.RequestID}
+	call := func(method string, params any, result any) error {
+		return t.page.CallSession(ctx, session, method, params, result)
+	}
 
 	if p.ResponseStatusCode != nil || p.ResponseErrorReason != "" {
 		// Only the replies to order previews and order submissions are read;
@@ -628,29 +871,34 @@ func (s *Session) answer(page *cdp.Page, p pausedRequest) {
 				Body          string `json:"body"`
 				Base64Encoded bool   `json:"base64Encoded"`
 			}
-			if err := page.Call(ctx, "Fetch.getResponseBody", id, &body); err == nil {
+			if err := call("Fetch.getResponseBody", id, &body); err == nil {
 				w.onResponse(p.Request.Method, p.Request.URL, *p.ResponseStatusCode, decodeBody(body.Body, body.Base64Encoded))
 			} else {
 				w.onResponse(p.Request.Method, p.Request.URL, *p.ResponseStatusCode, nil)
 			}
 		}
-		_ = page.Call(ctx, "Fetch.continueRequest", id, nil)
+		_ = call("Fetch.continueRequest", id, nil)
 		return
 	}
 
 	var allow bool
-	if w != nil {
+	switch {
+	case t.closing.Load():
+		// The page is being let go of: it gets nothing out that could
+		// change anything.
+		allow = !canChange(p.Request.Method)
+	case w != nil:
 		allow = w.onRequest(p.Request.Method, p.Request.URL, p.Request.PostData, p.Request.HasPostData)
-	} else {
+	default:
 		// No claim is in progress, so nothing should be ordering. A page
 		// left over from one must not get an order out on its own.
 		allow = !mayPlaceOrder(p.Request.Method, p.Request.URL, p.Request.PostData)
 	}
 	if allow {
-		_ = page.Call(ctx, "Fetch.continueRequest", id, nil)
+		_ = call("Fetch.continueRequest", id, nil)
 		return
 	}
-	_ = page.Call(ctx, "Fetch.failRequest", map[string]any{"requestId": p.RequestID, "errorReason": "BlockedByClient"}, nil)
+	_ = call("Fetch.failRequest", map[string]any{"requestId": p.RequestID, "errorReason": "BlockedByClient"}, nil)
 }
 
 func trimURL(u string) string {
@@ -930,10 +1178,14 @@ func (s *Session) checkout(ctx context.Context, o feed.Offer, w *orderWatch, add
 // priceEvidence weighs everything a checkout page and its network traffic
 // say about the total of the order.
 //
-// Free needs a statement of the total itself: the checkout's own total line,
-// Epic's order preview, or (on the 2026 free checkout, which has no total
-// line) the page showing no amount other than zero. Paid is anything that
-// states a total above zero, and it outweighs everything.
+// Free needs a statement of the order's total, or two things that agree:
+//   - the checkout's own total line reads zero, or
+//   - Epic's order preview gives the order a total of zero, or
+//   - (the 2026 free checkout, which has no total line) every amount of
+//     money on the page is zero AND the page says "This is free".
+//
+// Paid is anything that states a total above zero, and it outweighs
+// everything.
 func priceEvidence(st pageState, w *orderWatch) (Verdict, []string) {
 	var evidence []string
 	if w.sawPaid() {
@@ -960,25 +1212,24 @@ func priceEvidence(st pageState, w *orderWatch) (Verdict, []string) {
 	if preview != Unknown {
 		evidence = append(evidence, fmt.Sprintf("order preview (%v)", preview))
 	}
-	// Epic's 2026 free checkout has no "total" line: it shows the price
-	// (zero) and says "This is free".
 	anyZero := false
 	for _, p := range st.Prices {
 		if JudgeTotalText(p) == Free {
 			anyZero = true
 		}
 	}
-	shown := JudgePrices(st.Prices)
-	if shown == Free {
+	// Epic's 2026 free checkout has no "total" line: it shows the price
+	// (zero) and says "This is free". Neither counts without the other, and
+	// not next to any amount that is not zero or could not be read.
+	page := Unknown
+	if JudgePrices(st.Prices) == Free {
 		evidence = append(evidence, fmt.Sprintf("the only price on the page is %q", st.Prices[0]))
+		if st.SaysFree {
+			page = Free
+			evidence = append(evidence, "the page says it is free")
+		}
 	}
-	// The sentence "This is free" only counts next to a visible zero amount.
-	stated := Unknown
-	if st.SaysFree && anyZero {
-		stated = Free
-		evidence = append(evidence, "the page says it is free")
-	}
-	v := Combine(dom, preload, preview, shown, stated)
+	v := Combine(dom, preload, preview, page)
 	if v == Free && len(st.Prices) > 0 && !anyZero {
 		// Amounts are on the page and none of them is zero.
 		return Unknown, evidence
@@ -998,6 +1249,19 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 	for {
 		if ctx.Err() != nil {
 			return Result{Failed, "interrupted"}, last, false
+		}
+		// Once something has spoken of a price above zero, or a request
+		// had to be refused, this claim is over: nothing that could change
+		// anything is let out any more, so no checkout would get further.
+		if w.sawPaid() {
+			why := w.blockedReason()
+			if why == "" {
+				why = "a total above zero was stated on the network; nothing was pressed or ordered"
+			}
+			return Result{NotFree, why}, last, false
+		}
+		if why := w.blockedReason(); why != "" {
+			return Result{Failed, why}, last, false
 		}
 		// The launcher may answer a checkout address by opening its own
 		// checkout window instead of loading it in place.
@@ -1054,7 +1318,7 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 				}
 				if !ownChecked {
 					// Frames from other sites get the same supervision.
-					s.superviseFrames(ctx)
+					s.superviseFrames(ctx, nil)
 					// What does the account already have? (Asked once; it
 					// takes a moment, so the page is read afresh afterwards.)
 					ownChecked = true
@@ -1125,6 +1389,16 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 	}
 
 	w.setPreClick(pre)
+	// Everything that runs next to the checkout must be under the same
+	// supervision before anything is pressed.
+	s.superviseFrames(ctx, nil)
+	frames, workers := s.unsupervised()
+	if len(workers) > 0 {
+		s.opt.Logf("%s: note: the checkout runs %d worker(s) whose requests cannot be looked into separately (%s)", o.Title, len(workers), strings.Join(workers, ", "))
+	}
+	if len(frames) > 0 {
+		return Result{Failed, "part of the checkout could not be supervised (" + strings.Join(frames, ", ") + "); nothing was ordered"}, last, false
+	}
 	how := ""
 	if last.Guessed {
 		how = "; the order button was identified by elimination, not by its label"
@@ -1142,12 +1416,21 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 	pressed := *last.Place
 	// Words of thanks that were on the page before the press prove nothing.
 	thanksBefore := last.Success
-	if err := s.click(ctx, last.Place); err != nil {
+	// From here on, whatever is sent to where orders are taken is treated
+	// as an order (see orderWatch.onRequest).
+	w.markPressed(pre)
+	if err := s.click(ctx, last.Place, w); err != nil {
 		if errors.Is(err, cdp.ErrPressed) {
 			return Result{Failed, "interrupted after the order button was pressed; the library will be checked next time"}, last, false
 		}
 		if ctx.Err() != nil {
 			return Result{Failed, "interrupted"}, last, false
+		}
+		if errors.Is(err, errCalledOff) {
+			if w.sawPaid() {
+				return Result{NotFree, err.Error()}, last, false
+			}
+			return Result{Failed, err.Error()}, last, false
 		}
 		return Result{Failed, "could not press the order button: " + err.Error()}, last, false
 	}
@@ -1161,10 +1444,15 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 		if ctx.Err() != nil {
 			return Result{Failed, "interrupted after the order button was pressed; the library will be checked next time"}, last, false
 		}
-		// Frames that appear only now are put under supervision as well.
-		if time.Since(lastFrames) > time.Second {
+		// Frames and windows that appear only now are put under supervision
+		// as well (looked for often at first: this is when they would come).
+		every := time.Second
+		if time.Since(clickedAt) < 5*time.Second {
+			every = 200 * time.Millisecond
+		}
+		if time.Since(lastFrames) > every {
 			lastFrames = time.Now()
-			s.superviseFrames(ctx)
+			s.superviseFrames(ctx, known)
 		}
 		if reason := w.blockedReason(); reason != "" {
 			if w.sawPaid() {
@@ -1176,9 +1464,15 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 			// A total above zero turned up after the press (a re-priced
 			// preview, for instance). Nothing more is pressed, and the
 			// network watch refuses any order from here on.
+			if w.submitted() {
+				return Result{NotFree, "a total above zero appeared after an order with a total of zero had been sent; nothing further was done or let out. Check the account's order history"}, last, false
+			}
 			return Result{NotFree, "a total above zero appeared after the order button was pressed; nothing further was done and no order was let out"}, last, false
 		}
 		if ok, msg := w.confirmation(); ok {
+			if shape := w.confirmationNote(); shape != "" {
+				s.opt.Logf("%s: Epic accepted the order%s", o.Title, shape)
+			}
 			return Result{Claimed, "order confirmed by Epic"}, last, false
 		} else if msg != "" {
 			if oc, known := classifyError(msg); known {
@@ -1228,7 +1522,7 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 				// nothing speaks of a price above zero.
 				if v, _ := priceEvidence(st, w); v != Paid {
 					lastConsent = time.Now()
-					_ = s.click(ctx, st.Consent)
+					_ = s.click(ctx, st.Consent, w)
 				} else {
 					return Result{NotFree, "the checkout showed a total above zero before the final confirmation; nothing was confirmed"}, last, false
 				}
@@ -1254,7 +1548,7 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 				if v, _ := priceEvidence(st, w); v == Free {
 					clicks++
 					clickedAt = time.Now()
-					_ = s.click(ctx, st.Place)
+					_ = s.click(ctx, st.Place, w)
 				}
 			}
 		}
@@ -1276,19 +1570,57 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 	}
 }
 
-// click presses a button the way a person would, falling back to a
-// script-driven click if the browser refuses synthetic mouse input.
-func (s *Session) click(ctx context.Context, b *btn) error {
-	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+// errCalledOff marks a press that was not made because something spoke
+// against it at the last moment.
+var errCalledOff = errors.New("nothing was pressed")
+
+// stillThere reports, immediately before a press, whether it should still
+// be made: nothing has spoken of a price above zero or been refused, and
+// what lies under the pointer is still the button that was judged.
+func (s *Session) stillThere(ctx context.Context, b *btn, w *orderWatch) error {
+	if w.sawPaid() {
+		return fmt.Errorf("%w: a total above zero appeared just before the press", errCalledOff)
+	}
+	if reason := w.blockedReason(); reason != "" {
+		return fmt.Errorf("%w: %s", errCalledOff, reason)
+	}
+	var label *string
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	err := s.page.Click(cctx, b.X, b.Y)
+	if err := s.page.Eval(cctx, fmt.Sprintf("%s(%f, %f)", underPointJS, b.X, b.Y), &label); err != nil {
+		return fmt.Errorf("%w: the page could not be asked what lies under the pointer (%v)", errCalledOff, err)
+	}
+	if label == nil || *label != b.Text {
+		return fmt.Errorf("%w: the button moved or changed just before the press", errCalledOff)
+	}
+	return nil
+}
+
+// click presses a button the way a person would, falling back to a
+// script-driven click if the browser refuses synthetic mouse input. With a
+// watch given, the press is called off (errCalledOff) if, at the last
+// moment, the price is in doubt or the button is no longer where it was.
+func (s *Session) click(ctx context.Context, b *btn, w *orderWatch) error {
+	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	// (Buttons that order nothing, on a store page, are pressed as found.)
+	guard := func() error {
+		if w == nil {
+			return nil
+		}
+		return s.stillThere(cctx, b, w)
+	}
+	err := s.page.ClickIf(cctx, b.X, b.Y, guard)
 	if err == nil {
 		return nil
 	}
 	// The scripted click is only for a browser that refuses mouse input.
 	// It must not follow a mouse click that may have landed (that would be
 	// two clicks), nor a claim that has been called off.
-	if errors.Is(err, cdp.ErrPressed) || cctx.Err() != nil {
+	if errors.Is(err, cdp.ErrPressed) || errors.Is(err, errCalledOff) || cctx.Err() != nil {
+		return err
+	}
+	if err := guard(); err != nil {
 		return err
 	}
 	var ok bool

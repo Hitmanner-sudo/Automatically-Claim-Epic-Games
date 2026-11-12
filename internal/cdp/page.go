@@ -180,6 +180,13 @@ var ErrPressed = errors.New("the click may have been delivered")
 // press, brief hold, release. An error that wraps ErrPressed means the
 // button went down before something failed.
 func (p *Page) Click(ctx context.Context, x, y float64) error {
+	return p.ClickIf(ctx, x, y, nil)
+}
+
+// ClickIf is Click with a last look: once the pointer has arrived, and
+// immediately before the button goes down, guard is asked; if it returns an
+// error nothing is pressed and that error is returned.
+func (p *Page) ClickIf(ctx context.Context, x, y float64, guard func() error) error {
 	const steps = 8
 	fromX, fromY := p.mouseX, p.mouseY
 	for i := 1; i <= steps; i++ {
@@ -195,6 +202,11 @@ func (p *Page) Click(ctx context.Context, x, y float64) error {
 	}
 	p.mouseX, p.mouseY = x, y
 	click := map[string]any{"button": "left", "buttons": 1, "clickCount": 1}
+	if guard != nil {
+		if err := guard(); err != nil {
+			return err
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}

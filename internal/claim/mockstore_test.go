@@ -59,6 +59,9 @@ type scenario struct {
 	FrameOrigin   string `json:"frameOrigin"`   // that frame's origin (filled in by the store)
 	RetryOnError  bool   `json:"retryOnError"`  // the page re-sends a failed order by itself
 	ServiceWorker bool   `json:"serviceWorker"` // a service worker relays the page's requests
+	LateFrame     bool   `json:"lateFrame"`     // a frame from another site, created at the click, sends the order at once
+	ClickWorker   string `json:"clickWorker"`   // a worker sends the order: "dedicated" (started at the click) or "shared" (running since the page loaded, told to at the click)
+	SWOrder       bool   `json:"swOrder"`       // a service worker that does not control the page sends the order when told to
 	ExtraHTML     string `json:"-"`             // added to the checkout page
 	ProductExtra  string `json:"-"`             // added to the store page
 	ProductOpens  string `json:"-"`             // offer the store page's button opens (default 1-ns-id)
@@ -105,6 +108,38 @@ self.addEventListener('activate', function (e) { e.waitUntil(self.clients.claim(
 self.addEventListener('fetch', function (e) { e.respondWith(fetch(e.request)); });`)
 	})
 	mux.HandleFunc("/api/v9/acquire", m.handleConfirm)
+	orderJS := func() string {
+		total := ""
+		if m.sc.ConfirmTotal != nil {
+			total = fmt.Sprintf(", totalAmount: %d", *m.sc.ConfirmTotal)
+		}
+		return `fetch('/purchase/confirm-order', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ offers: ['1-ns-id'], syncToken: 'tok'` + total + ` }) })
+    .then(function (r) { return r.json(); }).then(function (c) { return c.error ? c.message : ''; })
+    .catch(function () { return 'Sorry, there was an error placing your order.'; })`
+	}
+	mux.HandleFunc("/worker.js", func(w http.ResponseWriter, r *http.Request) {
+		// A worker that sends the order: a dedicated one as soon as it
+		// runs, a shared one when a page tells it to.
+		w.Header().Set("Content-Type", "application/javascript")
+		_, _ = io.WriteString(w, `function order() { return `+orderJS()+`; }
+if (typeof SharedWorkerGlobalScope !== 'undefined' && self instanceof SharedWorkerGlobalScope) {
+  self.onconnect = function (e) {
+    var port = e.ports[0];
+    port.onmessage = function () { order().then(function (err) { port.postMessage({ what: 'done', error: err }); }); };
+    port.start();
+  };
+} else order().then(function (err) { self.postMessage({ what: 'done', error: err }); });`)
+	})
+	mux.HandleFunc("/sw-order.js", func(w http.ResponseWriter, r *http.Request) {
+		// A service worker that sends the order when a page tells it to.
+		w.Header().Set("Content-Type", "application/javascript")
+		_, _ = io.WriteString(w, `self.addEventListener('install', function (e) { self.skipWaiting(); });
+self.addEventListener('message', function (e) {
+  if (!e.data || e.data.what !== 'order') return;
+  var src = e.source;
+  e.waitUntil(`+orderJS()+`.then(function (err) { src.postMessage({ what: 'done', error: err }); }));
+});`)
+	})
 	mux.HandleFunc("/payframe", func(w http.ResponseWriter, r *http.Request) {
 		// A frame from another site that sends the order when told to.
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -112,7 +147,12 @@ self.addEventListener('fetch', function (e) { e.respondWith(fetch(e.request)); }
 		if m.sc.ConfirmTotal != nil {
 			total = fmt.Sprint(*m.sc.ConfirmTotal)
 		}
+		auto := ""
+		if r.URL.Query().Get("auto") != "" {
+			auto = orderJS() + `.then(function (err) { parent.postMessage({ what: 'done', error: err }, '*'); });`
+		}
 		_, _ = io.WriteString(w, `<!doctype html><body><script>
+`+auto+`
 window.addEventListener('message', function (ev) {
   if (!ev.data || ev.data.what !== 'order') return;
   var payload = { offers: ev.data.offers, syncToken: 'tok' };
@@ -421,6 +461,22 @@ function challenge() {
 }
 var swPending = !!(S.serviceWorker && navigator.serviceWorker && !sessionStorage.getItem('sw'));
 var payFrame = null;
+function done(error) {
+  if (error) fail(error);
+  else document.getElementById('purchase-app').innerHTML = '<h1>Thanks for your order!</h1>';
+}
+if (S.lateFrame) window.addEventListener('message', function (ev) { if (ev.data && ev.data.what === 'done') done(ev.data.error); });
+var sharedWorker = null;
+if (S.clickWorker === 'shared') {
+  sharedWorker = new SharedWorker('/worker.js');
+  sharedWorker.port.onmessage = function (ev) { done(ev.data.error); };
+  sharedWorker.port.start();
+}
+var swReady = null;
+if (S.swOrder) {
+  swReady = navigator.serviceWorker.register('/sw-order.js').then(function () { return navigator.serviceWorker.ready; });
+  navigator.serviceWorker.addEventListener('message', function (ev) { if (ev.data && ev.data.what === 'done') done(ev.data.error); });
+}
 if (S.frameOrder) {
   payFrame = document.createElement('iframe');
   payFrame.id = 'payframe';
@@ -455,6 +511,16 @@ else fetch('/purchase/order-preview', { method: 'POST', headers: { 'content-type
 function fail(text) { extra.innerHTML = '<div class="payment__errors">' + text + '</div>'; }
 function send() {
   if (payFrame) { payFrame.contentWindow.postMessage({ what: 'order', offers: offers }, '*'); return; }
+  if (S.lateFrame) {
+    var late = document.createElement('iframe');
+    late.src = S.frameOrigin + '/payframe?auto=1';
+    late.style.cssText = 'position:absolute;left:0;top:0;width:10px;height:10px;border:0';
+    document.body.appendChild(late);
+    return;
+  }
+  if (S.clickWorker === 'dedicated') { new Worker('/worker.js').onmessage = function (ev) { done(ev.data.error); }; return; }
+  if (sharedWorker) { sharedWorker.port.postMessage('go'); return; }
+  if (S.swOrder) { swReady.then(function (reg) { reg.active.postMessage({ what: 'order' }); }); return; }
   var payload = { useDefault: true, offers: offers, syncToken: 'tok', includeAccountBalance: false };
   if (S.confirmTotal !== null && S.confirmTotal !== undefined) payload.totalAmount = S.confirmTotal;
   var init = { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) };

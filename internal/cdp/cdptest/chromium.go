@@ -3,6 +3,7 @@ package cdptest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -60,6 +62,10 @@ func Start(t testing.TB) string {
 	const attempts = 3
 	for attempt := 1; attempt <= attempts; attempt++ {
 		base, stop, err := launch(bin)
+		if errors.Is(err, errExited) {
+			t.Logf("attempt %d of %d: %v", attempt, attempts, err)
+			continue
+		}
 		if err != nil {
 			if required {
 				t.Fatalf("cannot start %s: %v", bin, err)
@@ -76,6 +82,8 @@ func Start(t testing.TB) string {
 	t.Fatalf("Chromium did not expose a DevTools port in %d attempts (%s)", attempts, bin)
 	return ""
 }
+
+var errExited = errors.New("the browser exited at once")
 
 // launch starts the browser and waits for its DevTools endpoint. base is
 // empty if it did not come up in time; stop ends the browser and removes
@@ -97,20 +105,37 @@ func launch(bin string) (base string, stop func(), err error) {
 		"--no-first-run",
 		"--no-default-browser-check",
 		"--disable-dev-shm-usage",
+		// Nothing of the browser's own may reach out or run beside the
+		// tests: no updates, no sync, no extensions, no crash uploads.
+		"--disable-component-update",
+		"--disable-background-networking",
+		"--disable-sync",
+		"--disable-extensions",
+		"--disable-breakpad",
 		"--window-size=1280,900",
 		"about:blank",
 	)
+	var stderr tail
+	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		_ = os.RemoveAll(profile)
 		return "", nil, err
 	}
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
 	stop = func() {
 		if runtime.GOOS == "windows" {
 			// Chrome's helper processes outlive a plain kill there.
 			_ = exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(cmd.Process.Pid)).Run()
 		}
 		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
+		select {
+		case <-exited:
+		case <-time.After(10 * time.Second):
+		}
 		for i := 0; i < 20; i++ {
 			if os.RemoveAll(profile) == nil {
 				return
@@ -122,6 +147,13 @@ func launch(bin string) (base string, stop func(), err error) {
 	portFile := filepath.Join(profile, "DevToolsActivePort")
 	deadline := time.Now().Add(40 * time.Second)
 	for time.Now().Before(deadline) {
+		select {
+		case <-exited:
+			// It will not come up any more; say what it said.
+			stop()
+			return "", nil, fmt.Errorf("%w: %s", errExited, stderr.String())
+		default:
+		}
 		if data, err := os.ReadFile(portFile); err == nil {
 			line := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)[0]
 			if port, err := strconv.Atoi(strings.TrimSpace(line)); err == nil && port > 0 {
@@ -137,6 +169,28 @@ func launch(bin string) (base string, stop func(), err error) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return "", stop, nil
+}
+
+// tail keeps the last few kilobytes of what a process wrote.
+type tail struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (t *tail) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > 4096 {
+		t.buf = t.buf[len(t.buf)-4096:]
+	}
+	return len(p), nil
+}
+
+func (t *tail) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return strings.TrimSpace(string(t.buf))
 }
 
 // FirstPage returns the first page target of the browser.

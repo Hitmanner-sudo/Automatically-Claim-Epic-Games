@@ -258,10 +258,18 @@ func TestNewCheckoutLayoutWithoutOwnershipQuery(t *testing.T) {
 }
 
 func TestNewCheckoutLayoutInAnotherLanguage(t *testing.T) {
-	// No English sentence and no known label: the only price on the page
-	// is zero, and the page has a single button that is not a way out.
-	r := runScenario(t, scenario{SignedIn: true, NewLayout: true, German: true, NewPrice: "0,00 €", NoFreeText: true}, nil)
+	// No English sentence and no known label: Epic's order preview gives
+	// the order a total of zero, the only price on the page is zero, and
+	// the page has a single button that is not a way out.
+	r := runScenario(t, scenario{SignedIn: true, NewLayout: true, Real2026: true, German: true, NewPrice: "0,00 €", NoFreeText: true}, nil)
 	wantOutcome(t, r, Claimed, 1)
+	// A zero price on the page alone, with nothing else saying that the
+	// order is free, is not enough to press anything.
+	r = runScenario(t, scenario{SignedIn: true, NewLayout: true, German: true, NewPrice: "0,00 €", NoFreeText: true}, nil)
+	wantOutcome(t, r, Failed, 0)
+	if n := r.store.hitCount("place"); n != 0 {
+		t.Errorf("the button was pressed %d time(s)", n)
+	}
 }
 
 func TestUnrecognisedCheckoutIsReportedAsSuch(t *testing.T) {
@@ -557,7 +565,7 @@ func TestOrderWatchRules(t *testing.T) {
 	}
 	w = newOrderWatch(false)
 	w.onResponse("POST", confirm, 200, []byte(`{"error":"errors.x","message":"You already own this item."}`))
-	if ok, msg := w.confirmation(); ok || msg != "You already own this item." || !w.ownedHint() {
+	if ok, msg := w.confirmation(); ok || msg != "You already own this item. (errors.x)" || !w.ownedHint() {
 		t.Errorf("rejected order: %v %q", ok, msg)
 	}
 	w = newOrderWatch(false)
@@ -1426,5 +1434,211 @@ func TestPurchaseLimitAnswerMeansAlreadyOwned(t *testing.T) {
 	wantOutcome(t, r, Owned, 1)
 	if !strings.Contains(r.res.Detail, "already") {
 		t.Errorf("detail = %q", r.res.Detail)
+	}
+}
+
+// ---- what runs next to the checkout is supervised from its first moment
+
+// wantRefusedAtTheNetwork: the button was pressed once, the order that
+// followed stated a price and was stopped before it left the browser.
+func wantRefusedAtTheNetwork(t *testing.T, r run) {
+	t.Helper()
+	time.Sleep(700 * time.Millisecond)
+	if n := r.store.orderCount(); n != 0 {
+		t.Fatalf("%d order(s) reached the store: %s", n, r.store.lastOrder())
+	}
+	if r.res.Outcome != NotFree || !strings.Contains(r.res.Detail, "refused to send") {
+		t.Errorf("outcome = %v, want the order refused at the network", r.res)
+	}
+	if n := r.store.hitCount("place"); n != 1 {
+		t.Errorf("the order button was pressed %d time(s), want 1", n)
+	}
+}
+
+func TestFrameCreatedAtTheClickCannotCarryAnOrderOut(t *testing.T) {
+	// The frame does not exist until the button is pressed, belongs to
+	// another site (a process of its own), and orders the moment it loads.
+	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(1999), LateFrame: true}, nil)
+	wantRefusedAtTheNetwork(t, r)
+	// A free order sent the same way goes through.
+	r = runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), LateFrame: true}, nil)
+	wantOutcome(t, r, Claimed, 1)
+}
+
+func TestWorkersCannotCarryAnOrderOut(t *testing.T) {
+	// A worker of the page's own, started at the click; and a worker
+	// shared between pages, running since the page loaded, that is told to
+	// order at the click.
+	for _, kind := range []string{"dedicated", "shared"} {
+		r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(1999), ClickWorker: kind}, nil)
+		t.Logf("%s worker: %v", kind, r.res)
+		wantRefusedAtTheNetwork(t, r)
+	}
+	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), ClickWorker: "dedicated"}, nil)
+	wantOutcome(t, r, Claimed, 1)
+}
+
+func TestServiceWorkerToldToOrderCannotCarryItOut(t *testing.T) {
+	// A service worker that does not control the page (so the page's own
+	// requests do not pass through it) sends the order itself.
+	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(1999), SWOrder: true}, nil)
+	wantRefusedAtTheNetwork(t, r)
+}
+
+func TestOrderWatchIsStrictAboutMethodsAndBodies(t *testing.T) {
+	const confirm = "https://payment-website-pci.ol.epicgames.com/v2/purchase/confirm-order"
+	const preview = "https://payment-website-pci.ol.epicgames.com/v2/purchase/order-preview"
+
+	// Every way of writing a method that can change something counts.
+	for _, m := range []string{"post", "Post", "PUT", "PATCH", "DELETE", "put"} {
+		w := newOrderWatch(false)
+		w.setPreClick(Free)
+		if w.onRequest(m, confirm, `{"totalAmount":499}`, true) || !w.sawPaid() {
+			t.Errorf("%s with a price must be refused", m)
+		}
+		w = newOrderWatch(false)
+		if w.onRequest(m, confirm, `{"offers":["x"]}`, true) {
+			t.Errorf("%s order without evidence must be refused", m)
+		}
+	}
+
+	// However the price is written.
+	for _, body := range []string{
+		`{"total_amount":1999}`, `{"total-price":"19.99"}`, `{"TotalAmount":"$19.99"}`,
+		`{"total":{"amount":1999,"currency":"USD"}}`, `{"order":{"grandTotal":{"value":"19,99 €"}}}`,
+		`{"payload":"{\"totalAmount\":1999}"}`,
+		`totalAmount=1999&offers=x`, `offers=x&order=%7B%22totalPrice%22%3A1999%7D`,
+		"--b\r\nContent-Disposition: form-data; name=\"totalAmount\"\r\n\r\n1999\r\n--b--\r\n",
+	} {
+		w := newOrderWatch(false)
+		w.setPreClick(Free)
+		if w.onRequest("POST", confirm, body, true) || !w.sawPaid() {
+			t.Errorf("order %q must be refused as paid", body)
+		}
+	}
+	// What is not an amount is not read as one.
+	for _, body := range []string{`{"total":"3 items"}`, `{"totals":[1,2]}`, `{"subtotal":1999,"totalAmount":0}`, `totalAmount=0&offers=x`} {
+		w := newOrderWatch(false)
+		w.setPreClick(Free)
+		if !w.onRequest("POST", confirm, body, true) {
+			t.Errorf("order %q must pass", body)
+		}
+	}
+	// An order whose content cannot be read is not sent.
+	w := newOrderWatch(false)
+	w.setPreClick(Free)
+	if w.onRequest("POST", confirm, "\x00\x01\x02binary", true) || !strings.Contains(w.blockedReason(), "could not be inspected") {
+		t.Errorf("unreadable order: %q", w.blockedReason())
+	}
+	w = newOrderWatch(false)
+	w.setPreClick(Free)
+	if w.onRequest("POST", confirm, "", true) {
+		t.Error("an order whose content the browser does not show must be refused")
+	}
+
+	// Once anything has spoken of a price, nothing that could change
+	// anything is let out, wherever it is going and whatever it says.
+	w = newOrderWatch(false)
+	w.setPreClick(Free)
+	w.onResponse("POST", preview, 200, []byte(`{"orderResponse":{"totalPrice":1999}}`))
+	for _, u := range []string{confirm, "https://x.example/api/finish", "https://x.example/anything"} {
+		if w.onRequest("POST", u, `{"totalAmount":0}`, true) {
+			t.Errorf("after a paid preview, POST %s must be refused", u)
+		}
+	}
+	if !w.onRequest("GET", "https://x.example/anything", "", false) {
+		t.Error("reads still pass")
+	}
+
+	// After the press, whatever goes where orders are taken is an order.
+	const finish = "https://payment-website-pci.ol.epicgames.com/v3/purchase/finish"
+	w = newOrderWatch(false)
+	if !w.onRequest("POST", finish, `{"x":1}`, true) || w.submitted() {
+		t.Error("before the press, an unknown address is not taken for an order")
+	}
+	w.markPressed(Free)
+	if !w.onRequest("POST", finish, `{"x":1}`, true) || !w.submitted() {
+		t.Error("after the press, a request to a payment address counts as the order")
+	}
+	for _, u := range []string{preview, "https://payment-website-pci.ol.epicgames.com/v2/purchase/get-earn-reward", "https://tracking.epicgames.com/track", "https://hcaptcha.com/getcaptcha/abc"} {
+		w = newOrderWatch(false)
+		w.markPressed(Free)
+		if !w.onRequest("POST", u, `{"x":1}`, true) || w.submitted() {
+			t.Errorf("POST %s after the press is not an order", u)
+		}
+	}
+	w = newOrderWatch(true)
+	w.markPressed(Free)
+	if w.onRequest("POST", finish, `{"x":1}`, true) {
+		t.Error("a dry run sends nothing that could be an order")
+	}
+	// With no claim in progress nothing of the kind gets out at all.
+	for _, c := range []struct{ m, u, body string }{
+		{"POST", finish, `{}`}, {"put", confirm, `{"totalAmount":0}`}, {"DELETE", "https://x/v1/orders", ``}, {"POST", "https://x/api", `total=5`},
+	} {
+		if !mayPlaceOrder(c.m, c.u, c.body) {
+			t.Errorf("%s %s must not get out with no claim in progress", c.m, c.u)
+		}
+	}
+	if mayPlaceOrder("GET", confirm, "") || mayPlaceOrder("POST", "https://x/graphql", `{"query":"x"}`) {
+		t.Error("ordinary requests pass")
+	}
+}
+
+func TestOrderRepliesAreReadStrictly(t *testing.T) {
+	const confirm = "https://payment-website-pci.ol.epicgames.com/v2/purchase/confirm-order"
+	const preview = "https://payment-website-pci.ol.epicgames.com/v2/purchase/order-preview"
+	reply := func(status int, body string) (bool, string, *orderWatch) {
+		w := newOrderWatch(false)
+		w.onResponse("POST", confirm, status, []byte(body))
+		ok, msg := w.confirmation()
+		return ok, msg, w
+	}
+	for _, body := range []string{`{"confirmation":"A1","error":null}`, `{"orderComplete":true,"orderPending":false,"orderId":"A1","errors":[]}`} {
+		if ok, msg, w := reply(200, body); !ok || msg != "" || !strings.Contains(w.confirmationNote(), "reply fields:") {
+			t.Errorf("accepted %s: %v %q %q", body, ok, msg, w.confirmationNote())
+		}
+	}
+	// Not an error, but not an accepted order either: the library decides.
+	for _, body := range []string{``, `ok`, `<html></html>`, `[]`, `{"orderPending":true}`, `{"orderComplete":false,"orderId":"A1"}`, `{"redirectUrl":"https://x/3ds"}`} {
+		if ok, msg, _ := reply(200, body); ok || msg != "" {
+			t.Errorf("reply %q: confirmed=%v error=%q, want neither", body, ok, msg)
+		}
+	}
+	for _, body := range []string{`{"success":false}`, `{"status":"FAILED"}`, `{"errorCode":"errors.x.y"}`, `{"errors":[{"message":"no"}]}`} {
+		if ok, msg, _ := reply(200, body); ok || msg == "" {
+			t.Errorf("reply %q: confirmed=%v error=%q, want a rejection", body, ok, msg)
+		}
+	}
+	// The same reply always reads the same.
+	for i := 0; i < 20; i++ {
+		if _, msg, _ := reply(400, `{"message":"Nope.","errorCode":"errors.a","error":"errors.b"}`); msg != "Nope. (errors.a)" {
+			t.Fatalf("message = %q", msg)
+		}
+	}
+	// What Epic's order service answers for something the account has.
+	_, msg, w := reply(404, `{"errorCode":"errors.com.epicgames.ecommerce.orderprocessor.purchase_limit_error","errorMessage":"Purchase limit reached","numericErrorCode":1}`)
+	if oc, known := classifyError(msg); !w.ownedHint() || !known || oc != Owned {
+		t.Errorf("purchase limit: %q owned=%v", msg, w.ownedHint())
+	}
+	// Words that merely appear in a preview are not statements about the
+	// account.
+	w = newOrderWatch(false)
+	w.onResponse("POST", preview, 200, []byte(`{"orderResponse":{"totalPrice":0},"message":"ok","offer":{"description":"If you already own the base game, this is unavailable in your region."}}`))
+	if w.ownedHint() || w.regionHint() || w.previewVerdict() != Free {
+		t.Errorf("preview with words: owned=%v region=%v verdict=%v", w.ownedHint(), w.regionHint(), w.previewVerdict())
+	}
+	// A zero under some other "total" is not the order's total.
+	for body, want := range map[string]Verdict{
+		`{"rewards":{"total":0}}`: Unknown,
+		`{"orderResponse":{"totalPrice":0,"lineOffers":[{"totalPrice":0}]}}`:              Free,
+		`{"orderResponse":{"totalPrice":0,"lineOffers":[{"totalPrice":1999}]}}`:           Paid,
+		`{"orderResponse":{"currency":"USD"},"coupons":{"total":0}}`:                      Unknown,
+		`{"orderResponse":{"totalPrice":"0.00"},"rewards":{"total":0}}`:                   Free,
+		`{"orderResponse":{"totalPrice":0},"rewards":{"totalAmount":{"amount":"$5.00"}}}`: Paid,
+	} {
+		if v, facts := JudgePreview([]byte(body)); v != want {
+			t.Errorf("JudgePreview(%s) = %v %v, want %v", body, v, facts, want)
+		}
 	}
 }
