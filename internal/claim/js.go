@@ -143,11 +143,15 @@ const inspectJS = `(function () {
   var pm;
   while ((pm = priceRe.exec(checkoutText)) && out.prices.length < 40) {
     // An amount whose digits go on beyond what was recognised ("$0.0001",
-    // "1 0,00 \u20ac") has not been read: it counts as an amount that is
+    // "12.0,00 \u20ac") has not been read: it counts as an amount that is
     // not known to be zero.
     var from = pm.index + pm[0].length - pm[1].length, to = pm.index + pm[0].length;
+    // ("Dead Island 2 0,00 \u20ac" is a title and a price; "1 000,00 \u20ac"
+    // is one amount: a digit and a space before the amount belong to it
+    // only when it starts with a group of three digits.)
+    var lead = checkoutText.slice(Math.max(0, from - 2), from);
     var runsOn = /^[.,]\d/.test(checkoutText.substr(to, 2)) ||
-      (/^\d/.test(pm[1]) && /\d[ .,\u00a0\u202f]$/.test(checkoutText.slice(Math.max(0, from - 2), from)));
+      (/^\d/.test(pm[1]) && (/\d[.,]$/.test(lead) || (/\d[ \u00a0\u202f]$/.test(lead) && /^\d{3}(?!\d)/.test(pm[1]))));
     out.prices.push(runsOn ? 'an amount that could not be read' : pm[1]);
   }
   // Epic's own statement on the free checkout.

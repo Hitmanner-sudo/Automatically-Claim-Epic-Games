@@ -74,6 +74,7 @@ From a terminal in that folder:
 | `EpicAutoClaim.exe check` | Lists what is free right now; claims nothing |
 | `EpicAutoClaim.exe once` | Does one round now instead of waiting (Ctrl+C stops it cleanly) |
 | `EpicAutoClaim.exe once --dry-run` | Same, but stops just before placing the order |
+| `EpicAutoClaim.exe once --dry-run --again` | The same rehearsal, also for games it has dealt with already; records nothing |
 | `EpicAutoClaim.exe doctor --launch` | Starts the launcher hidden for a moment and reports what it found; claims nothing |
 | `EpicAutoClaim.exe stop` | Stops the background process until Windows starts it again at its daily time |
 | `EpicAutoClaim.exe install` | Installs it, or brings the installation in line with the settings (same as a double-click, without the dialog) |

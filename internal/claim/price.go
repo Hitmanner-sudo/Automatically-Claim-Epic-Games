@@ -83,9 +83,9 @@ func keyName(k string) string {
 // is itself a total ("total": {"amount": 1999, "currency": "USD"}).
 var amountKeys = map[string]bool{"amount": true, "value": true, "price": true, "total": true, "gross": true, "net": true, "due": true, "amountdue": true, "cents": true, "minor": true}
 
-// reMoneyText: a number with at most a currency sign or code before or
-// after it.
-var reMoneyText = regexp.MustCompile(`^(?:[A-Za-z]{0,3}\s?\p{Sc}?|\p{Sc})\s?-?\d[\d.,'\s\x{a0}\x{202f}]*\s?(?:\p{Sc}|[A-Za-z]{2,3}\.?)?$`)
+// reMoneyText: a number with at most a currency sign, code or word (in any
+// script: "zł", "руб.", "円", "S/") before or after it.
+var reMoneyText = regexp.MustCompile(`^(?:[\p{L}.]{0,3}[/.]{0,2}\s?\p{Sc}?|\p{Sc})\s?-?\d[\d.,'\s\x{a0}\x{202f}]*\s?(?:\p{Sc}|[\p{L}.]{1,4})?$`)
 
 // totalOf reads what stands under a total-named key: a number, a number
 // written as text ("19.99", "$19.99", "0,00 €"), or an object holding the
@@ -146,7 +146,13 @@ func walk(v any, path string, depth int, out *[]PriceFact) {
 			if totalKeys[keyName(k)] {
 				if f, ok := totalOf(child); ok {
 					*out = append(*out, PriceFact{Path: strings.TrimPrefix(p, "."), Value: f})
-					continue
+					switch child.(type) {
+					case map[string]any, []any:
+						// A total written as an object may hold further
+						// totals; they count as well.
+					default:
+						continue
+					}
 				}
 			}
 			walk(child, p, depth+1, out)

@@ -263,6 +263,10 @@ func TestNewCheckoutLayoutInAnotherLanguage(t *testing.T) {
 	// the page has a single button that is not a way out.
 	r := runScenario(t, scenario{SignedIn: true, NewLayout: true, Real2026: true, German: true, NewPrice: "0,00 €", NoFreeText: true}, nil)
 	wantOutcome(t, r, Claimed, 1)
+	// A title that ends in a number, right before a price that starts with
+	// one: two things, not one amount.
+	r = runScenario(t, scenario{SignedIn: true, NewLayout: true, Real2026: true, German: true, NewTitle: "Dead Island 2", NewPrice: "0,00 €", NoFreeText: true}, nil)
+	wantOutcome(t, r, Claimed, 1)
 	// A zero price on the page alone, with nothing else saying that the
 	// order is free, is not enough to press anything.
 	r = runScenario(t, scenario{SignedIn: true, NewLayout: true, German: true, NewPrice: "0,00 €", NoFreeText: true}, nil)
@@ -1523,6 +1527,11 @@ func TestOrderWatchIsStrictAboutMethodsAndBodies(t *testing.T) {
 		`{"payload":"{\"totalAmount\":1999}"}`,
 		`totalAmount=1999&offers=x`, `offers=x&order=%7B%22totalPrice%22%3A1999%7D`,
 		"--b\r\nContent-Disposition: form-data; name=\"totalAmount\"\r\n\r\n1999\r\n--b--\r\n",
+		`{"totalAmount":"19,99 zł"}`, `{"totalAmount":"19,99 Kč"}`, `{"totalAmount":"1 999 руб."}`, `{"totalAmount":"S/ 19.90"}`,
+		`{"totalAmount":"1999円"}`, `{"totalAmount":"1,999원"}`, `{"totalAmount":"US$19.99"}`, `{"totalAmount":"R$ 19,99"}`,
+		`order[totalAmount]=19.99`, `order.totalAmount=19.99&x=1`, "totalAmount=19.99&name=\x00",
+		`eyJ0b3RhbEFtb3VudCI6MTkuOTl9Cg==`, "{\"a\":1}\n{\"totalAmount\":19.99}", "\ufeff{\"totalAmount\":19.99}",
+		`{"total":{"amount":0,"items":[{"totalPrice":1999}]}}`,
 	} {
 		w := newOrderWatch(false)
 		w.setPreClick(Free)
@@ -1539,6 +1548,13 @@ func TestOrderWatchIsStrictAboutMethodsAndBodies(t *testing.T) {
 		}
 	}
 	// An order whose content cannot be read is not sent.
+	for _, body := range []string{`<order total="19.99"/>`, "\x1f\x8b\x08\x00binary=1", `a=1&<b c="d">=2`} {
+		w := newOrderWatch(false)
+		w.setPreClick(Free)
+		if w.onRequest("POST", confirm, body, true) || !strings.Contains(w.blockedReason(), "could not be inspected") {
+			t.Errorf("order %q: %q", body, w.blockedReason())
+		}
+	}
 	w := newOrderWatch(false)
 	w.setPreClick(Free)
 	if w.onRequest("POST", confirm, "\x00\x01\x02binary", true) || !strings.Contains(w.blockedReason(), "could not be inspected") {
@@ -1571,8 +1587,16 @@ func TestOrderWatchIsStrictAboutMethodsAndBodies(t *testing.T) {
 		t.Error("before the press, an unknown address is not taken for an order")
 	}
 	w.markPressed(Free)
-	if !w.onRequest("POST", finish, `{"x":1}`, true) || !w.submitted() {
-		t.Error("after the press, a request to a payment address counts as the order")
+	if !w.onRequest("POST", finish, `{"x":1}`, true) {
+		t.Error("after the press, a readable request to a payment address that states no price passes")
+	}
+	if w.onRequest("POST", finish, "", true) || !strings.Contains(w.blockedReason(), "could not be inspected") {
+		t.Error("after the press, a request to a payment address whose content the browser does not show is refused")
+	}
+	w = newOrderWatch(false)
+	w.markPressed(Free)
+	if w.onRequest("POST", finish, `{"amountDue":"19,99 zł"}`, true) || !w.sawPaid() {
+		t.Error("after the press, a request to a payment address that states a price is refused")
 	}
 	for _, u := range []string{preview, "https://payment-website-pci.ol.epicgames.com/v2/purchase/get-earn-reward", "https://tracking.epicgames.com/track", "https://hcaptcha.com/getcaptcha/abc"} {
 		w = newOrderWatch(false)
@@ -1619,9 +1643,24 @@ func TestOrderRepliesAreReadStrictly(t *testing.T) {
 			t.Errorf("reply %q: confirmed=%v error=%q, want neither", body, ok, msg)
 		}
 	}
-	for _, body := range []string{`{"success":false}`, `{"status":"FAILED"}`, `{"errorCode":"errors.x.y"}`, `{"errors":[{"message":"no"}]}`} {
+	for _, body := range []string{
+		`{"success":false}`, `{"status":"FAILED"}`, `{"errorCode":"errors.x.y"}`, `{"errors":[{"message":"no"}]}`,
+		`{"errorMessage":"The order could not be completed"}`, `{"errorCode":1012,"errorMessage":"Payment declined"}`,
+		`{"data":{"confirmOrder":{"errorMessage":"declined"}}}`, `{"error_message":"no"}`,
+	} {
 		if ok, msg, _ := reply(200, body); ok || msg == "" {
 			t.Errorf("reply %q: confirmed=%v error=%q, want a rejection", body, ok, msg)
+		}
+	}
+	// A flag of failure on something that merely travels inside an accepted
+	// order's reply is not a rejection of the order.
+	for _, body := range []string{
+		`{"orderComplete":true,"orderPending":false,"orderError":null,"orderId":"A1","rewards":{"success":false}}`,
+		`{"orderComplete":true,"orderId":"A1","earnRewards":{"status":"FAILED"}}`,
+		`{"confirmation":"A1","threeDS":{"ok":false}}`,
+	} {
+		if ok, msg, _ := reply(200, body); !ok || msg != "" {
+			t.Errorf("reply %q: confirmed=%v error=%q, want accepted", body, ok, msg)
 		}
 	}
 	// The same reply always reads the same.
@@ -1634,6 +1673,13 @@ func TestOrderRepliesAreReadStrictly(t *testing.T) {
 	_, msg, w := reply(404, `{"errorCode":"errors.com.epicgames.ecommerce.orderprocessor.purchase_limit_error","errorMessage":"Purchase limit reached","numericErrorCode":1}`)
 	if oc, known := classifyError(msg); !w.ownedHint() || !known || oc != Owned {
 		t.Errorf("purchase limit: %q owned=%v", msg, w.ownedHint())
+	}
+	// ...also when it is said in the message alone.
+	if _, _, w := reply(404, `{"errorMessage":"Sorry, you already own this item."}`); !w.ownedHint() {
+		t.Error("an error message saying it is owned must be recognised")
+	}
+	if ok, msg, _ := reply(200, `{"message":"Thank you!","orderId":"A1"}`); !ok || msg != "" {
+		t.Errorf("a bare message is not an error: %v %q", ok, msg)
 	}
 	// Words that merely appear in a preview are not statements about the
 	// account.
@@ -1650,6 +1696,8 @@ func TestOrderRepliesAreReadStrictly(t *testing.T) {
 		`{"orderResponse":{"currency":"USD"},"coupons":{"total":0}}`:                      Unknown,
 		`{"orderResponse":{"totalPrice":"0.00"},"rewards":{"total":0}}`:                   Free,
 		`{"orderResponse":{"totalPrice":0},"rewards":{"totalAmount":{"amount":"$5.00"}}}`: Paid,
+		`{"orderResponse":{"totalPrice":{"amount":0,"totalPrice":1999}}}`:                 Paid,
+		`{"orderResponse":{"totalPrice":0,"lineOffers":[{"totalPrice":"19,99 zł"}]}}`:     Paid,
 	} {
 		if v, facts := JudgePreview([]byte(body)); v != want {
 			t.Errorf("JudgePreview(%s) = %v %v, want %v", body, v, facts, want)

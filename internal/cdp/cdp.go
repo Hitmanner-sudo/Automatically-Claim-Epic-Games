@@ -321,6 +321,37 @@ func (c *Conn) CallSession(ctx context.Context, sessionID, method string, params
 	}
 }
 
+// Post sends a command without waiting for its reply, which is dropped.
+// For commands whose reply may be a long time coming (or never come) and
+// whose only purpose is to be carried out, in the order they were sent.
+func (c *Conn) Post(sessionID, method string, params any) error {
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return ErrClosed
+	}
+	msg := map[string]any{"id": c.nextID.Add(1), "method": method}
+	if params != nil {
+		msg["params"] = params
+	}
+	if sessionID != "" {
+		msg["sessionId"] = sessionID
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	c.writeMu.Lock()
+	_ = c.ws.SetWriteDeadline(time.Now().Add(15 * time.Second))
+	err = c.ws.WriteMessage(websocket.TextMessage, data)
+	c.writeMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("%s: %w", method, err)
+	}
+	return nil
+}
+
 func (c *Conn) forget(id int64) {
 	c.mu.Lock()
 	delete(c.pending, id)

@@ -450,16 +450,24 @@ func keepTaskCurrent(a *app) {
 }
 
 func cmdOnce(a *app, args []string) int {
-	dry := false
+	dry, again := false, false
 	for _, arg := range args {
 		switch arg {
 		case "--dry-run", "-n":
 			dry = true
+		case "--again":
+			again = true
 		default:
 			// A mistyped "--dry-run" must not turn into a real run.
 			fmt.Fprintf(a.out, "Unknown option %q for \"once\"; nothing was done.\n\n%s", arg, usage)
 			return 2
 		}
+	}
+	if again && !dry {
+		// Going through games that are already dealt with is for looking,
+		// never for ordering.
+		fmt.Fprintf(a.out, "\"--again\" only goes with \"--dry-run\"; nothing was done.\n\n%s", usage)
+		return 2
 	}
 	trial := dry && !a.cfg.DryRun
 	if dry {
@@ -530,6 +538,21 @@ func cmdOnce(a *app, args []string) int {
 		if st, err := state.Open(a.p.state); err == nil {
 			a.st = st
 		}
+	}
+	if again {
+		// A rehearsal of everything that is free right now, whatever has
+		// been claimed already: it keeps notes of its own, which are thrown
+		// away afterwards, and leaves the real ones as they are.
+		notes := filepath.Join(a.p.dir, "rehearsal.json")
+		_ = os.Remove(notes)
+		st, err := state.Open(notes)
+		if err != nil {
+			fmt.Fprintf(a.out, "Could not set up the rehearsal (%v); nothing was done.\n", err)
+			return 1
+		}
+		a.st = st
+		defer os.Remove(notes)
+		fmt.Fprintln(a.out, "Rehearsing with everything that is free right now, including what is already in the library; nothing is ordered and nothing is recorded.")
 	}
 
 	d := a.daemon()
@@ -957,6 +980,7 @@ const usage = `EpicAutoClaim - claims Epic's free games through your Epic Games 
   EpicAutoClaim.exe check        list what is free right now (does not claim)
   EpicAutoClaim.exe once         do one round now instead of waiting
   EpicAutoClaim.exe once --dry-run   same, but stop just before placing the order
+  EpicAutoClaim.exe once --dry-run --again   rehearse also with games it has dealt with already
   EpicAutoClaim.exe doctor       check the setup; add --launch to try the hidden launcher
   EpicAutoClaim.exe stop         stop the background process (Windows starts it again at its daily time)
   EpicAutoClaim.exe uninstall    stop it and remove it from Windows' schedule

@@ -4,11 +4,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // orderWatch supervises the checkout's network traffic during one claim.
@@ -86,7 +89,7 @@ var (
 	// reHarmless: requests under those addresses that are known not to
 	// order anything (seen on Epic's real checkout before the button is
 	// pressed, or self-evidently bookkeeping).
-	reHarmless = regexp.MustCompile(`(?i)(order-?preview|get-earn-reward|initiali[sz]e|developer-privacy|eligib|validat|/config|telemetry|/track|/log|metrics?|/rum|/events?)\b`)
+	reHarmless = regexp.MustCompile(`(?i)(order-?preview|get-earn-reward|initiali[sz]e|developer-privacy|eligib\w*|validat\w*|/config|telemetry|/track|/log|metrics?|/rum|/events?)\b`)
 )
 
 // looksLikeOrder reports whether a request that is not at a known order
@@ -122,33 +125,91 @@ func mayPlaceOrder(method, rawURL, postData string) bool {
 	return v == Paid
 }
 
-// judgeBody reads the totals out of a request or response body: JSON, a
-// form post, or a multi-part form. readable is false when the body is none
-// of these (compressed, binary, some format of its own): what it says about
-// the price is then simply not known.
+// judgeBody reads the totals out of a request or response body: JSON (one
+// document or several), a form post, a multi-part form, or any of these
+// wrapped in base64. readable is false when the body is none of these
+// (compressed, binary, some format of its own): what it says about the
+// price is then simply not known.
 func judgeBody(body []byte) (v Verdict, facts []PriceFact, readable bool) {
-	trimmed := strings.TrimSpace(string(body))
+	return judgeBodyDepth(body, 0)
+}
+
+// reFieldName: what the name of a form field looks like.
+var reFieldName = regexp.MustCompile(`^[\p{L}\p{N}_.\-\[\]:$ ]{1,100}$`)
+
+// lastSegment reduces a form field's name to its last part: "order[total]"
+// and "order.total" are both "total".
+func lastSegment(name string) string {
+	name = strings.TrimRight(name, "]")
+	if i := strings.LastIndexAny(name, "[."); i >= 0 {
+		name = name[i+1:]
+	}
+	return name
+}
+
+func judgeBodyDepth(body []byte, depth int) (v Verdict, facts []PriceFact, readable bool) {
+	trimmed := strings.TrimSpace(strings.TrimPrefix(string(body), "\ufeff"))
 	if trimmed == "" {
 		return Unknown, nil, true
 	}
-	if json.Valid(body) {
-		v, facts = JudgeJSON(body)
+	if json.Valid([]byte(trimmed)) {
+		v, facts = JudgeJSON([]byte(trimmed))
 		return v, facts, true
+	}
+	// Several JSON documents one after another.
+	if trimmed[0] == '{' || trimmed[0] == '[' {
+		dec := json.NewDecoder(strings.NewReader(trimmed))
+		n := 0
+		for {
+			var doc any
+			err := dec.Decode(&doc)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return Unknown, nil, false
+			}
+			n++
+			walk(doc, "", 0, &facts)
+		}
+		return JudgeTotals(facts), facts, n > 0
 	}
 	if strings.HasPrefix(trimmed, "--") && strings.Contains(trimmed, "Content-Disposition") {
 		facts = multipartTotals(trimmed)
 		return JudgeTotals(facts), facts, true
 	}
-	if strings.ContainsAny(trimmed, "\x00�") || !strings.Contains(trimmed, "=") {
+	// The same, wrapped in base64.
+	if depth < 2 && len(trimmed) >= 8 {
+		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.URLEncoding, base64.RawStdEncoding, base64.RawURLEncoding} {
+			if raw, err := enc.DecodeString(trimmed); err == nil {
+				if utf8.Valid(raw) {
+					if v, facts, ok := judgeBodyDepth(raw, depth+1); ok {
+						return v, facts, true
+					}
+				}
+				return Unknown, nil, false
+			}
+		}
+	}
+	// A form post: every part must look like "name=value".
+	if !strings.Contains(trimmed, "=") {
 		return Unknown, nil, false
 	}
 	vals, err := url.ParseQuery(trimmed)
-	if err != nil {
+	if err != nil || len(vals) == 0 {
 		return Unknown, nil, false
 	}
-	for k, vs := range vals {
-		for _, val := range vs {
-			if totalKeys[keyName(k)] {
+	keys := make([]string, 0, len(vals))
+	for k := range vals {
+		if !reFieldName.MatchString(k) {
+			return Unknown, nil, false
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		for _, val := range vals[k] {
+			if totalKeys[keyName(lastSegment(k))] {
 				if f, ok := totalOf(val); ok {
 					facts = append(facts, PriceFact{Path: k, Value: f})
 				}
@@ -172,7 +233,7 @@ func multipartTotals(body string) []PriceFact {
 	var facts []PriceFact
 	for _, m := range reFormField.FindAllStringSubmatch(body, -1) {
 		name, val := m[1], strings.TrimSpace(m[2])
-		if totalKeys[keyName(name)] {
+		if totalKeys[keyName(lastSegment(name))] {
 			if f, ok := totalOf(val); ok {
 				facts = append(facts, PriceFact{Path: name, Value: f})
 			}
@@ -232,7 +293,9 @@ func (w *orderWatch) onRequest(method, rawURL, postData string, hasPostData bool
 		return true
 	case w.dryRun:
 		refuse = "refused to send an order during a dry run"
-	case named && ((hasPostData && postData == "") || !readable):
+	case (hasPostData && postData == "") || (named && !readable):
+		// (For what is an order only by where it goes, a body in a format
+		// of its own is let pass; one the browser does not show is not.)
 		refuse = "refused to send an order whose content could not be inspected; nothing was ordered"
 	case verdict == Free:
 		// The order itself says its total is zero.
@@ -249,15 +312,125 @@ func (w *orderWatch) onRequest(method, rawURL, postData string, hasPostData bool
 		rec.Action = "BLOCKED"
 		return false
 	}
+	if !named {
+		rec.Action = "allowed (sent to a payment address after the press; nothing in it speaks of a price)"
+		return true
+	}
 	w.sent = true
 	rec.Action = "allowed (order)"
-	if !named {
-		rec.Action = "allowed (taken for an order: sent to a payment address after the press)"
-	}
 	return true
 }
 
 var reBadStatus = regexp.MustCompile(`(?i)^(fail|error|declin|reject)`)
+
+// errorOf collects what a JSON reply says went wrong: its error code and
+// its error message, whichever fields they sit in. Both are empty when the
+// reply reports no error. The same reply always reads the same.
+func errorOf(v any, depth int) (code, message string) {
+	if depth > 6 {
+		return "", ""
+	}
+	str := func(x any) string {
+		switch c := x.(type) {
+		case string:
+			return strings.TrimSpace(c)
+		case float64:
+			if c != 0 {
+				return strconv.FormatFloat(c, 'f', -1, 64)
+			}
+		case map[string]any:
+			if len(c) == 0 {
+				return ""
+			}
+			if m, ok := c["message"].(string); ok && strings.TrimSpace(m) != "" {
+				return strings.TrimSpace(m)
+			}
+			raw, _ := json.Marshal(c)
+			return string(raw)
+		case []any:
+			if len(c) == 0 {
+				return ""
+			}
+			raw, _ := json.Marshal(c)
+			return string(raw)
+		case bool:
+			if c {
+				return "error"
+			}
+		}
+		return ""
+	}
+	switch n := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(n))
+		for k := range n {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		// lookup finds the first of the wanted names (in that order) that
+		// the reply carries with something in it.
+		lookup := func(wanted ...string) string {
+			for _, want := range wanted {
+				for _, k := range keys {
+					if keyName(k) == want {
+						if got := str(n[k]); got != "" {
+							return got
+						}
+					}
+				}
+			}
+			return ""
+		}
+		code = lookup("errorcode", "error", "errors", "ordererror", "numericerrorcode")
+		// An error message is an error by itself; a bare "message" is one
+		// only next to something else that reports a failure.
+		message = lookup("errormessage", "errordescription")
+		// Flags of failure count on the reply itself, not on something that
+		// merely travels inside it (a reward that was not earned).
+		if code == "" && message == "" && depth == 0 {
+			for _, k := range keys {
+				child := n[k]
+				switch keyName(k) {
+				case "success", "ok":
+					if b, isBool := child.(bool); isBool && !b {
+						code = "the reply says it did not succeed"
+					}
+				case "failed":
+					if b, isBool := child.(bool); isBool && b {
+						code = "the reply says it failed"
+					}
+				case "status":
+					if t, isText := child.(string); isText && reBadStatus.MatchString(t) {
+						code = "status " + t
+					}
+				}
+				if code != "" {
+					break
+				}
+			}
+		}
+		if code != "" || message != "" {
+			if message == "" {
+				if m, ok := n["message"].(string); ok {
+					message = strings.TrimSpace(m)
+				}
+			}
+			return code, message
+		}
+		for _, k := range keys {
+			if c, m := errorOf(n[k], depth+1); c != "" || m != "" {
+				return c, m
+			}
+		}
+	case []any:
+		for _, child := range n {
+			if c, m := errorOf(child, depth+1); c != "" || m != "" {
+				return c, m
+			}
+		}
+	}
+	return "", ""
+}
 
 // onFenced records a request that a background worker made to an order
 // address and that the browser stopped (see fence in claim.go). What such a
@@ -283,99 +456,20 @@ func (w *orderWatch) onFenced(method, rawURL, postData string) {
 	}
 }
 
-// errorOf collects what a JSON reply says went wrong: its error code and
-// its error message, in that order and whichever fields they sit in. Both
-// are empty when the reply reports no error.
-func errorOf(v any, depth int) (code, message string) {
-	if depth > 6 {
-		return "", ""
+// refuse ends the claim from outside the request rules: from here on
+// nothing that could change anything is let out.
+func (w *orderWatch) refuse(reason string) {
+	w.mu.Lock()
+	if w.blocked == "" {
+		w.blocked = reason
 	}
-	str := func(x any) string {
-		switch c := x.(type) {
-		case string:
-			return strings.TrimSpace(c)
-		case map[string]any:
-			if len(c) == 0 {
-				return ""
-			}
-			if m, ok := c["message"].(string); ok && strings.TrimSpace(m) != "" {
-				return strings.TrimSpace(m)
-			}
-			raw, _ := json.Marshal(c)
-			return string(raw)
-		case []any:
-			if len(c) == 0 {
-				return ""
-			}
-			raw, _ := json.Marshal(c)
-			return string(raw)
-		case bool:
-			if c {
-				return "error"
-			}
-		}
-		return ""
-	}
-	switch n := v.(type) {
-	case map[string]any:
-		// A fixed order, so that the same reply always reads the same.
-		for _, k := range []string{"errorCode", "error_code", "errorcode", "error", "errors", "orderError", "ordererror"} {
-			for name, child := range n {
-				if strings.EqualFold(name, k) && code == "" {
-					code = str(child)
-				}
-			}
-		}
-		for _, k := range []string{"errorMessage", "error_message", "errormessage", "message"} {
-			for name, child := range n {
-				if strings.EqualFold(name, k) && message == "" {
-					if m, ok := child.(string); ok {
-						message = strings.TrimSpace(m)
-					}
-				}
-			}
-		}
-		if code == "" {
-			// "message" alone is not an error; and failure flags count.
-			message = ""
-			for name, child := range n {
-				switch keyName(name) {
-				case "success", "ok":
-					if b, isBool := child.(bool); isBool && !b {
-						code = "the reply says it did not succeed"
-					}
-				case "failed":
-					if b, isBool := child.(bool); isBool && b {
-						code = "the reply says it failed"
-					}
-				case "status":
-					if t, isText := child.(string); isText && reBadStatus.MatchString(t) {
-						code = "status " + t
-					}
-				}
-			}
-		}
-		if code != "" || message != "" {
-			return code, message
-		}
-		keys := make([]string, 0, len(n))
-		for k := range n {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			if c, m := errorOf(n[k], depth+1); c != "" || m != "" {
-				return c, m
-			}
-		}
-	case []any:
-		for _, child := range n {
-			if c, m := errorOf(child, depth+1); c != "" || m != "" {
-				return c, m
-			}
-		}
-	}
-	return "", ""
+	w.mu.Unlock()
+}
+
+func (w *orderWatch) isPressed() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.pressed
 }
 
 // notDone reports a reply to an order that, without reporting an error,

@@ -275,15 +275,17 @@ type kid struct {
 	kind, url  string
 	supervised bool // its requests pass through this program
 	fenced     bool // it cannot reach an order address at all (see fence)
+	via        *tab // the attached page whose connection it came over
 }
 
 // orderWords are what the address of a request that places an order (or
 // goes where orders are taken) contains. See fence.
 var orderWords = []string{
-	"confirm-order", "confirmOrder", "confirm_order", "place-order", "placeOrder", "place_order",
-	"submit-order", "submitOrder", "submit_order", "create-order", "createOrder", "complete-order", "completeOrder",
-	"quickPurchase", "quickpurchase", "/purchase/", "/checkout/", "/orders", "/order/", "/payment/", "/payments", "/pay/",
-	"/acquire", "/redeem", "://payment-", "://payments.", "://checkout.",
+	"confirm-order", "confirmOrder", "confirm_order", "ConfirmOrder", "place-order", "placeOrder", "place_order", "PlaceOrder",
+	"submit-order", "submitOrder", "submit_order", "SubmitOrder", "create-order", "createOrder", "CreateOrder",
+	"complete-order", "completeOrder", "CompleteOrder", "quickPurchase", "quickpurchase", "QuickPurchase",
+	"/purchase/", "/Purchase/", "/checkout/", "/Checkout/", "/order", "/Order", "/payment", "/Payment", "/pay/",
+	"/acquire", "/redeem", "/claim/", "/transaction", "://payment", "://checkout", ".payment", ".checkout.",
 }
 
 func reachesOrders(rawURL string) bool {
@@ -339,7 +341,7 @@ func (s *Session) fencedRequest(ev cdp.Event) {
 // isFenced reports whether events of this origin come from a fenced worker.
 func (s *Session) isFenced(t *tab, session string) bool {
 	if session == "" {
-		return t.fenced
+		return t.fenced.Load()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -362,9 +364,96 @@ type tab struct {
 	closing atomic.Bool
 	// fenced: this is a background worker that was already running; it is
 	// kept away from order addresses (see fence).
-	fenced bool
+	fenced atomic.Bool
 	kind   string // the target's type: page, iframe, worker, ...
+	// lanes: one for each frame or worker attached through this page's
+	// connection, by session id. Only the page's event loop touches it.
+	lanes map[string]*lane
 }
+
+// lane handles what concerns one frame or worker attached through a page's
+// connection, one thing after another and apart from the page itself. The
+// launcher's browser never answers a command sent to a frame that has just
+// gone away; whoever waits for such an answer must not be the one who
+// answers for the page.
+type lane struct {
+	session string
+	ctx     context.Context
+	cancel  context.CancelFunc
+	mu      sync.Mutex
+	jobs    []func()
+	wake    chan struct{}
+	gone    atomic.Bool
+}
+
+func (l *lane) push(job func()) {
+	l.mu.Lock()
+	l.jobs = append(l.jobs, job)
+	l.mu.Unlock()
+	select {
+	case l.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (l *lane) run() {
+	for {
+		l.mu.Lock()
+		var job func()
+		if len(l.jobs) > 0 {
+			job, l.jobs = l.jobs[0], l.jobs[1:]
+		}
+		l.mu.Unlock()
+		if l.ctx.Err() != nil {
+			return
+		}
+		if job == nil {
+			select {
+			case <-l.wake:
+			case <-l.ctx.Done():
+				return
+			}
+			continue
+		}
+		job()
+	}
+}
+
+var errGone = errors.New("the frame or worker has gone away")
+
+// call sends a command to the lane's frame or worker and waits a short
+// while for the answer. One that does not come means it has gone away;
+// nothing more is sent to it then.
+func (l *lane) call(page *cdp.Page, method string, params, result any) error {
+	if l.gone.Load() {
+		return errGone
+	}
+	ctx, cancel := context.WithTimeout(l.ctx, 8*time.Second)
+	defer cancel()
+	err := page.CallSession(ctx, l.session, method, params, result)
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		l.gone.Store(true)
+	}
+	return err
+}
+
+// laneOf returns the lane of a session of this page's connection, starting
+// it if need be. Called from the page's event loop only.
+func (t *tab) laneOf(session string) *lane {
+	if l := t.lanes[session]; l != nil {
+		return l
+	}
+	if t.lanes == nil {
+		t.lanes = map[string]*lane{}
+	}
+	l := &lane{session: session, wake: make(chan struct{}, 1)}
+	l.ctx, l.cancel = context.WithCancel(context.Background())
+	t.lanes[session] = l
+	go l.run()
+	return l
+}
+
+func (t *tab) isWorker() bool { return strings.Contains(t.kind, "worker") }
 
 // autoAttach asks the browser to attach every frame of another site and
 // every worker a page creates to the page's own connection, and to hold
@@ -411,8 +500,8 @@ func (s *Session) attach(ctx context.Context, t cdp.Target) (*tab, error) {
 	if backgroundWorker(t.Type) {
 		// Found already running: holding its requests back is not to be
 		// relied on, so it is fenced off as well.
-		nt.fenced = fence(pctx, page, "")
-		if nt.fenced {
+		if fence(pctx, page, "") {
+			nt.fenced.Store(true)
 			err = nil
 		}
 	}
@@ -436,59 +525,91 @@ func (s *Session) attach(ctx context.Context, t cdp.Target) (*tab, error) {
 	// handed over as they appear. (Where the browser cannot do that, they
 	// are looked for at intervals instead: see superviseFrames.)
 	nt.auto = page.Call(pctx, "Target.setAutoAttach", autoAttach, nil) == nil
+	// A frame or worker that is being held for whoever attaches to it (the
+	// launcher's browser holds a worker that starts afresh while attached)
+	// is let run now that it is supervised.
+	_ = page.Post("", "Runtime.runIfWaitingForDebugger", nil)
 	return nt, nil
+}
+
+// attachedChild is what the browser says when it has attached a frame or
+// worker to a page's connection.
+type attachedChild struct {
+	SessionID  string `json:"sessionId"`
+	TargetInfo struct {
+		TargetID string `json:"targetId"`
+		Type     string `json:"type"`
+		URL      string `json:"url"`
+	} `json:"targetInfo"`
+	// Held: it has not run anything yet and waits to be let go.
+	Held bool `json:"waitingForDebugger"`
 }
 
 // adopt puts a frame or worker that the browser has just attached to a
 // page's connection under the same request supervision as the page, and
-// only then lets it run.
-func (s *Session) adopt(t *tab, ev cdp.Event) {
-	var p struct {
-		SessionID  string `json:"sessionId"`
-		TargetInfo struct {
-			TargetID string `json:"targetId"`
-			Type     string `json:"type"`
-			URL      string `json:"url"`
-		} `json:"targetInfo"`
-		// Held: it has not run anything yet and waits to be let go.
-		Held bool `json:"waitingForDebugger"`
-	}
-	if json.Unmarshal(ev.Params, &p) != nil || p.SessionID == "" {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	k := kid{targetID: p.TargetInfo.TargetID, kind: p.TargetInfo.Type, url: trimURL(p.TargetInfo.URL)}
-	k.supervised = t.page.CallSession(ctx, p.SessionID, "Fetch.enable", map[string]any{"patterns": fetchPatterns()}, nil) == nil
-	if strings.Contains(k.kind, "worker") && !p.Held {
+// only then lets it run. It runs in the child's own lane.
+func (s *Session) adopt(t *tab, l *lane, p attachedChild) {
+	k := kid{targetID: p.TargetInfo.TargetID, kind: p.TargetInfo.Type, url: trimURL(p.TargetInfo.URL), via: t}
+	isWorker := strings.Contains(k.kind, "worker")
+	// Whatever happens below, a child that was held is let go in the end
+	// (unless that is refused on purpose): one left held would freeze a
+	// part of the checkout.
+	resume := func() { _ = t.page.Post(l.session, "Runtime.runIfWaitingForDebugger", nil) }
+
+	k.supervised = l.call(t.page, "Fetch.enable", map[string]any{"patterns": fetchPatterns()}, nil) == nil
+	if isWorker && !p.Held {
 		// A worker that was already under way: the browser does not hold
 		// its requests back from now on, whatever it answered.
 		k.supervised = false
-		if backgroundWorker(k.kind) {
-			k.fenced = fence(ctx, t.page, p.SessionID)
-		}
 	}
-	// Its own frames and workers in turn.
-	_ = t.page.CallSession(ctx, p.SessionID, "Target.setAutoAttach", autoAttach, nil)
+	if backgroundWorker(k.kind) && !k.supervised {
+		fctx, cancel := context.WithTimeout(l.ctx, 5*time.Second)
+		k.fenced = fence(fctx, t.page, l.session)
+		cancel()
+	}
+	// Its own frames and workers in turn. (Not waited for: the launcher's
+	// browser answers this one only once the child is running.)
+	_ = t.page.Post(l.session, "Target.setAutoAttach", autoAttach)
 	s.mu.Lock()
 	if s.kids == nil {
 		s.kids = map[string]kid{}
 	}
-	s.kids[p.SessionID] = k
+	if l.ctx.Err() == nil { // (not one that has gone away meanwhile)
+		s.kids[l.session] = k
+	}
 	s.mu.Unlock()
-	_ = t.page.CallSession(ctx, p.SessionID, "Runtime.runIfWaitingForDebugger", nil, nil)
+
+	if !isWorker && !k.supervised {
+		// A frame that cannot be supervised over its page's connection is
+		// tried over one of its own, while it is still held.
+		actx, cancel := context.WithTimeout(l.ctx, 10*time.Second)
+		direct := cdp.Target{ID: k.targetID, Type: k.kind, URL: p.TargetInfo.URL, WebSocketDebuggerURL: s.socketOf(k.targetID)}
+		_, err := s.attach(actx, direct)
+		cancel()
+		if err != nil && p.Held {
+			if w := s.currentWatch(); w != nil && w.isPressed() {
+				// It came into being after the order button was pressed
+				// and nothing can look at what it sends: it is not let run,
+				// and the claim ends here.
+				w.refuse("a part of the checkout that appeared after the order button was pressed could not be supervised (" + k.kind + " " + k.url + "); it was not let run, and nothing further was let out")
+				return
+			}
+			// Before the press it may run: the button is not pressed while
+			// anything is unsupervised (see order).
+		}
+	}
+	resume()
+}
+
+// socketOf is the DevTools address of a target of this browser.
+func (s *Session) socketOf(targetID string) string {
+	return "ws" + strings.TrimPrefix(s.base, "http") + "/devtools/page/" + targetID
 }
 
 // disown forgets a frame or worker that has gone away.
-func (s *Session) disown(ev cdp.Event) {
-	var p struct {
-		SessionID string `json:"sessionId"`
-	}
-	if json.Unmarshal(ev.Params, &p) != nil {
-		return
-	}
+func (s *Session) disown(session string) {
 	s.mu.Lock()
-	delete(s.kids, p.SessionID)
+	delete(s.kids, session)
 	s.mu.Unlock()
 }
 
@@ -532,7 +653,7 @@ func (s *Session) watching() string {
 	for i, t := range s.tabs {
 		auto = auto || t.auto
 		if i > 0 && t.page != s.page {
-			count(t.kind, true, t.fenced)
+			count(t.kind, true, t.fenced.Load())
 		}
 	}
 	how := "found by looking at intervals"
@@ -592,31 +713,72 @@ func blank(page *cdp.Page) {
 // session started on.
 func (s *Session) goHome() {
 	s.mu.Lock()
-	var extra []*tab
-	if len(s.tabs) > 1 {
-		extra = append(extra, s.tabs[1:]...)
-		s.tabs = s.tabs[:1]
+	var keep, extra []*tab
+	for i, t := range s.tabs {
+		// (Background workers found running stay fenced for as long as the
+		// session lasts: see Close.)
+		if i == 0 || t.isWorker() {
+			keep = append(keep, t)
+		} else {
+			extra = append(extra, t)
+		}
 	}
+	s.tabs = keep
 	s.mu.Unlock()
 	for _, t := range extra {
-		letGo(t)
+		s.letGo(t)
 	}
 	if s.home != nil {
 		s.page = s.home.page
 	}
 }
 
-// letGo ends the supervision of a page without giving anything it still has
-// in hand a way out: from here on nothing that could change anything is let
-// through, its content is taken off, what was held back at that moment is
-// answered, and only then is the connection closed (which would release
-// whatever was still held).
-func letGo(t *tab) {
+// stopServiceWorkers stops the browser's service workers. One that a page
+// set going outlives the page, and with the page goes the supervision of
+// what it sends; stopped, it sends nothing. (They start again by themselves
+// when a page needs them.)
+func stopServiceWorkers(page *cdp.Page) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	if page.Call(ctx, "ServiceWorker.enable", nil, nil) != nil {
+		return
+	}
+	_ = page.Call(ctx, "ServiceWorker.stopAllWorkers", nil, nil)
+	_ = page.Call(ctx, "ServiceWorker.disable", nil, nil)
+}
+
+// retire takes a page out of use without giving anything it still has in
+// hand a way out: from here on nothing that could change anything is let
+// through, its content is taken off, and the service workers it may have
+// set going are stopped.
+func retire(t *tab) {
 	t.closing.Store(true)
-	blank(t.page)
+	if !t.isWorker() {
+		blank(t.page)
+		stopServiceWorkers(t.page)
+	}
+}
+
+// letGo ends the supervision of a page: it is retired, what was held back
+// at that moment is answered, and only then is the connection closed (which
+// would release whatever was still held).
+func (s *Session) letGo(t *tab) {
+	retire(t)
 	time.Sleep(150 * time.Millisecond)
+	s.disconnect(t)
+}
+
+func (s *Session) disconnect(t *tab) {
+	t.closing.Store(true)
 	_ = t.page.Close()
 	<-t.done
+	s.mu.Lock()
+	for id, k := range s.kids {
+		if k.via == t {
+			delete(s.kids, id)
+		}
+	}
+	s.mu.Unlock()
 }
 
 // currentTab is the attached page being driven.
@@ -643,6 +805,17 @@ func (s *Session) superviseFrames(ctx context.Context, known map[string]bool) {
 	if err != nil {
 		return
 	}
+	listed := map[string]bool{}
+	for _, t := range targets {
+		listed[t.ID] = true
+	}
+	s.mu.Lock()
+	for id, k := range s.kids {
+		if k.via == nil && !listed[k.targetID] {
+			delete(s.kids, id) // a worker that could not be looked into, and is gone
+		}
+	}
+	s.mu.Unlock()
 	for _, t := range targets {
 		if t.WebSocketDebuggerURL == "" || s.attached(t.ID) != nil || s.adopted(t.ID) {
 			continue
@@ -686,17 +859,23 @@ func isCheckoutURL(raw string, bases []string) bool {
 	return epic && (strings.Contains(path, "/purchase") || strings.Contains(path, "/checkout"))
 }
 
-// targetIDs lists the launcher's current pages.
+// targetIDs lists the launcher's current pages and other targets. It
+// returns nil when the browser does not answer: "unknown" must not be taken
+// for "there are none" (every window would then count as new).
 func (s *Session) targetIDs(ctx context.Context) map[string]bool {
-	out := map[string]bool{}
-	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if targets, err := cdp.Targets(tctx, s.base); err == nil {
-		for _, t := range targets {
-			out[t.ID] = true
+	for attempt := 0; attempt < 2 && ctx.Err() == nil; attempt++ {
+		tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		targets, err := cdp.Targets(tctx, s.base)
+		cancel()
+		if err == nil {
+			out := map[string]bool{}
+			for _, t := range targets {
+				out[t.ID] = true
+			}
+			return out
 		}
 	}
-	return out
+	return nil
 }
 
 // adoptCheckout looks for a checkout window the launcher has opened by
@@ -819,8 +998,24 @@ func (s *Session) Close() {
 	tabs := append([]*tab(nil), s.tabs...)
 	s.tabs = nil
 	s.mu.Unlock()
+	// The pages first, so that nothing they feed (a worker shared between
+	// pages, a service worker) is still being fed when its own supervision
+	// ends; then every connection.
 	for _, t := range tabs {
-		letGo(t)
+		if !t.isWorker() {
+			retire(t)
+		}
+	}
+	time.Sleep(150 * time.Millisecond)
+	for _, t := range tabs {
+		if !t.isWorker() {
+			s.disconnect(t)
+		}
+	}
+	for _, t := range tabs {
+		if t.isWorker() {
+			s.disconnect(t)
+		}
 	}
 }
 
@@ -849,31 +1044,83 @@ type pausedRequest struct {
 }
 
 // eventLoop answers every paused request. A request the browser has paused
-// stays paused until answered, so this must never block on anything else.
+// stays paused until answered, so this must never block on anything else:
+// what concerns a frame or worker attached through the page's connection is
+// handed to that child's lane.
 func (s *Session) eventLoop(t *tab) {
 	defer close(t.done)
+	defer func() {
+		for _, l := range t.lanes {
+			l.cancel()
+		}
+	}()
 	for {
 		select {
 		case <-t.page.Done():
 			return
 		case ev := <-t.page.Events():
 			switch ev.Method {
-			case "Page.javascriptDialogOpening":
-				s.dismissDialog(t.page, ev.Params)
 			case "Target.attachedToTarget":
-				s.adopt(t, ev)
+				var p attachedChild
+				if json.Unmarshal(ev.Params, &p) != nil || p.SessionID == "" {
+					continue
+				}
+				l := t.laneOf(p.SessionID)
+				l.push(func() { s.adopt(t, l, p) })
+				continue
 			case "Target.detachedFromTarget":
-				s.disown(ev)
+				var p struct {
+					SessionID string `json:"sessionId"`
+				}
+				if json.Unmarshal(ev.Params, &p) == nil && p.SessionID != "" {
+					if l := t.lanes[p.SessionID]; l != nil {
+						l.gone.Store(true)
+						l.cancel()
+						delete(t.lanes, p.SessionID)
+					}
+					s.disown(p.SessionID)
+				}
+				continue
 			case "Network.requestWillBeSent":
 				if s.isFenced(t, ev.SessionID) {
 					s.fencedRequest(ev)
 				}
+				continue
+			case "Inspector.targetReloadedAfterCrash":
+				// A worker that started afresh while attached is held by
+				// the launcher's browser until told to run.
+				_ = t.page.Post(ev.SessionID, "Runtime.runIfWaitingForDebugger", nil)
+				continue
+			}
+			if ev.SessionID != "" {
+				// A frame's or worker's own request.
+				if ev.Method != "Fetch.requestPaused" {
+					continue
+				}
+				var p pausedRequest
+				if json.Unmarshal(ev.Params, &p) != nil || p.RequestID == "" {
+					continue
+				}
+				l := t.lanes[ev.SessionID]
+				if l == nil {
+					continue // it has gone away; nobody is left to answer
+				}
+				l.push(func() {
+					s.answer(t, p, func(method string, params, result any) error { return l.call(t.page, method, params, result) })
+				})
+				continue
+			}
+			switch ev.Method {
+			case "Page.javascriptDialogOpening":
+				s.dismissDialog(t.page, ev.Params)
 			case "Fetch.requestPaused":
 				var p pausedRequest
 				if json.Unmarshal(ev.Params, &p) != nil || p.RequestID == "" {
 					continue
 				}
-				s.answer(t, ev.SessionID, p)
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				s.answer(t, p, func(method string, params, result any) error { return t.page.Call(ctx, method, params, result) })
+				cancel()
 			}
 		}
 	}
@@ -894,16 +1141,11 @@ func (s *Session) dismissDialog(page *cdp.Page, params json.RawMessage) {
 }
 
 // answer decides about one request the browser is holding back: one of the
-// page's own (session empty) or one of a frame or worker attached through
-// the page's connection.
-func (s *Session) answer(t *tab, session string, p pausedRequest) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
+// page's own or one of a frame or worker attached through the page's
+// connection (call reaches whichever it is).
+func (s *Session) answer(t *tab, p pausedRequest, call func(method string, params, result any) error) {
 	w := s.currentWatch()
 	id := map[string]any{"requestId": p.RequestID}
-	call := func(method string, params any, result any) error {
-		return t.page.CallSession(ctx, session, method, params, result)
-	}
 
 	if p.ResponseStatusCode != nil || p.ResponseErrorReason != "" {
 		// Only the replies to order previews and order submissions are read;
@@ -1139,6 +1381,7 @@ func (s *Session) Claim(ctx context.Context, o feed.Offer) Result {
 		// claim's supervision of the network ends.
 		s.goHome()
 		blank(s.home.page)
+		stopServiceWorkers(s.home.page)
 		s.setWatch(nil)
 	}()
 

@@ -47,6 +47,7 @@ type scenario struct {
 	FormPost     bool   `json:"formPost"`     // order is sent as a form, not JSON
 	NewLayout    bool   `json:"newLayout"`    // Epic's 2026 free checkout: no "total" line, "Add to library"
 	NewPrice     string `json:"newPrice"`     // price shown by the new layout (default "$0.00")
+	NewTitle     string `json:"newTitle"`     // the game's name in the new layout (default "Flotsam")
 	NoFreeText   bool   `json:"noFreeText"`   // new layout without the "This is free" sentence
 	Throttled    bool   `json:"throttled"`    // "unable to download any more free games"
 	// DirectBlocked makes the checkout refuse to open unless it is reached
@@ -388,6 +389,7 @@ window.clicks = [];
 var offers = new URLSearchParams(location.search).getAll('offers');
 var btn = document.getElementById('go');
 document.getElementById('cost').textContent = S.newPrice || '$0.00';
+if (S.newTitle) document.querySelector('._item_x1a').textContent = S.newTitle;
 if (!S.noFreeText) document.getElementById('free-note').textContent = 'This is free. Add it to your library to get started.';
 if (S.german) { btn.textContent = 'Zur Bibliothek hinzufügen'; document.getElementById('free-note').textContent = S.noFreeText ? '' : 'Dies ist kostenlos.'; }
 if (S.throttled) document.getElementById('extra').textContent = 'Your account is unable to download any more free games at this time. Please wait 24 hours before trying to redeem a free game again.';
