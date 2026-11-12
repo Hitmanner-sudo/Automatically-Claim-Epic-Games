@@ -9,7 +9,7 @@ Once a day it looks at Epic's free-games list, and when there is a giveaway you 
 ## Setup
 
 1. Install the Epic Games Launcher and sign in once with **Remember me** ticked. (If you already use the launcher, this is done.)
-2. Get `EpicAutoClaim.exe`. If this repository has a release, take the file from the **Releases** page. Otherwise, signed in to GitHub, open the **Actions** tab, the newest green **Build and test** run, and download the **EpicAutoClaim** artifact (a zip; extract the exe from it). Artifacts expire after about three months; running the **Release** workflow from the Actions tab publishes a release that does not.
+2. Get `EpicAutoClaim.exe`. If this repository has a release, take the file from the **Releases** page. Otherwise, signed in to GitHub, open the **Actions** tab, the newest green **Build and test** run, and download the **EpicAutoClaim** artifact (a zip; extract the exe from it). Artifacts expire after about three months; running the **Release** workflow from the Actions tab publishes a release that does not. (Which build has been tried on a real account is said under *What has been tested*.)
 3. Double-click `EpicAutoClaim.exe`.
 
 A single dialog confirms the installation. That is the only window the program ever shows. From then on Windows starts it once a day (it adds a task of its own to Windows' Task Scheduler; no administrator rights are needed) and it works on its own.
@@ -113,6 +113,8 @@ Tested on a real PC with a real, signed-in account (Windows 11, launcher 20.3.8,
 - a rehearsal (`once --dry-run`) reached Epic's real checkout for both games that were free that day and found the zero total three ways (Epic's order preview, the page's only price "$0.00", and its sentence "This is free");
 - the real run then claimed a game: **order confirmed by Epic**, in 24 seconds from start to finish;
 - for the other game, which the account already had, Epic refused the order ("you already own this item"); the program now records that as "already owned".
+
+That run was made with build 0.1.18. The order safeguards were tightened further afterwards (see *What it will not do*), and the later builds pass every test above except that last one: they have not met Epic's real checkout yet. Windows Smart App Control on the test PC refused the one later build that was tried there (0.1.23), and that refusal was left alone. Until a later build has been rehearsed with `once --dry-run` on a signed-in PC, **0.1.18 is the build known to work from start to finish**.
 
 What a single test cannot show is how Epic's pages will change. The program is written to fail safely when they do: if the checkout does not look the way it expects, it places no order, saves what it saw under `diagnostics\`, and tries again later. If a giveaway is not claimed, the log and that folder say why.
 
