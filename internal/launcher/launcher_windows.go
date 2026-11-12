@@ -26,6 +26,11 @@ type Install struct {
 	Gen Generation
 }
 
+// ErrUserStarted is returned when the user started the launcher while this
+// program had it running for a self-update. The launcher is then left
+// running for them.
+var ErrUserStarted = errors.New("the user started the launcher")
+
 // ErrNotInstalled is returned when the launcher cannot be found.
 var ErrNotInstalled = errors.New("the Epic Games Launcher was not found on this PC")
 
@@ -406,12 +411,30 @@ func (in *Instance) isMine(pid uint32, job map[uint32]bool) (mine, known bool) {
 	return v, true
 }
 
+// startedFromOutside reports whether a launcher process was started by
+// something other than the launcher's own machinery (which re-executes and
+// updates itself through helper processes): its parent is alive and is not
+// an Epic program. When in doubt the answer is no: wrongly stepping aside
+// would put a launcher window on the user's screen.
+func startedFromOutside(p win.ProcInfo, byPID map[uint32]win.ProcInfo) bool {
+	parent, ok := byPID[p.PPID]
+	if !ok {
+		return false
+	}
+	n := strings.ToLower(parent.Name)
+	return !strings.HasPrefix(n, "epic") && !strings.HasPrefix(n, "eos")
+}
+
 // launchers splits the running launcher processes into this instance's own
 // and those started by someone else.
 func (in *Instance) launchers() (mine, foreign []win.ProcInfo) {
 	procs, err := win.Processes()
 	if err != nil || in.proc == nil {
 		return nil, nil
+	}
+	byPID := make(map[uint32]win.ProcInfo, len(procs))
+	for _, p := range procs {
+		byPID[p.PID] = p
 	}
 	job := in.proc.PIDs()
 	for _, p := range procs {
@@ -422,7 +445,7 @@ func (in *Instance) launchers() (mine, foreign []win.ProcInfo) {
 		switch {
 		case m:
 			mine = append(mine, p)
-		case known:
+		case known && startedFromOutside(p, byPID):
 			foreign = append(foreign, p)
 		}
 	}
@@ -567,7 +590,35 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 	if err != nil {
 		return err
 	}
-	defer proc.Close()
+	handedOver := false
+	defer func() {
+		if !handedOver {
+			proc.Close()
+		}
+	}()
+
+	// userCommand returns the command line of a launcher start that is not
+	// part of this run: the user asking for the launcher.
+	userCommand := func() (string, bool) {
+		procs, err := win.Processes()
+		if err != nil {
+			return "", false
+		}
+		byPID := make(map[uint32]win.ProcInfo, len(procs))
+		for _, p := range procs {
+			byPID[p.PID] = p
+		}
+		for _, p := range procs {
+			if !strings.EqualFold(p.Name, ExeName) || !startedFromOutside(p, byPID) {
+				continue
+			}
+			cmd := win.CommandLine(p.PID)
+			if cmd != "" && !strings.Contains(cmd, flag) && !strings.Contains(cmd, "-Commandlet=") {
+				return cmd, true
+			}
+		}
+		return "", false
+	}
 
 	stopGuard := make(chan struct{})
 	var guardDone sync.WaitGroup
@@ -620,6 +671,17 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 	deadline := time.Now().Add(10 * time.Minute)
 	ok := false
 	for time.Now().Before(deadline) && ctx.Err() == nil {
+		if cmd, yes := userCommand(); yes {
+			// Their start was absorbed by the launcher running here. Stop
+			// hiding its windows, let it live, and repeat their start so
+			// that it shows itself.
+			stopGuardNow()
+			proc.Release()
+			handedOver = true
+			_ = win.StartDetached(inst.Exe, userArgs(cmd), inst.Dir)
+			logf("the launcher was started by the user while it was updating; leaving it to them")
+			return ErrUserStarted
+		}
 		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		_, verr := cdp.Version(cctx, base)
 		cancel()
@@ -629,7 +691,7 @@ func UpdateRun(ctx context.Context, inst Install, logf func(string, ...any)) err
 		}
 		select {
 		case <-ctx.Done():
-		case <-time.After(time.Second):
+		case <-time.After(400 * time.Millisecond):
 		}
 	}
 	if ok {

@@ -370,6 +370,24 @@ func (p *Process) Kill() {
 	}
 }
 
+// Release lets the process tree go: it keeps running after this program
+// has let go of it and after this program exits.
+func (p *Process) Release() {
+	if p == nil {
+		return
+	}
+	if p.job != 0 {
+		info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
+		_, _ = windows.SetInformationJobObject(p.job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)))
+		_ = windows.CloseHandle(p.job)
+		p.job = 0
+	}
+	if p.h != 0 {
+		_ = windows.CloseHandle(p.h)
+		p.h = 0
+	}
+}
+
 // Close kills whatever is left and releases the handles.
 func (p *Process) Close() {
 	if p == nil {

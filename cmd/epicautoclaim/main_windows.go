@@ -227,9 +227,11 @@ func cmdRun(a *app) int {
 }
 
 func cmdOnce(a *app, args []string) int {
+	trial := false
 	for _, arg := range args {
-		if arg == "--dry-run" || arg == "-n" {
+		if (arg == "--dry-run" || arg == "-n") && !a.cfg.DryRun {
 			a.cfg.DryRun = true
+			trial = true
 		}
 	}
 	if daemonRunning() {
@@ -245,7 +247,18 @@ func cmdOnce(a *app, args []string) int {
 		}
 	}
 	next := d.Tick(context.Background())
-	fmt.Fprintf(a.out, "\nDone. The background process would check again at %s.\n", next.Local().Format("Mon 2 Jan 15:04"))
+	if trial {
+		// A one-off trial must not hold up the real thing: the background
+		// process may claim these as soon as it looks.
+		for key, e := range a.st.All() {
+			if !e.Status.Done() {
+				_ = a.st.Update(key, func(e *state.Entry) { e.NextAttempt = time.Time{} })
+			}
+		}
+		fmt.Fprintln(a.out, "\nTrial finished; nothing was ordered.")
+	} else {
+		fmt.Fprintf(a.out, "\nDone. The background process would check again at %s.\n", next.Local().Format("Mon 2 Jan 15:04"))
+	}
 	printState(a)
 	return 0
 }

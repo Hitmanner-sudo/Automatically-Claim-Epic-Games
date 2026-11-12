@@ -68,6 +68,9 @@ func (r *Runner) startHidden(ctx context.Context, inst launcher.Install) (*launc
 		if exited && attempt == 0 && inst.Gen == launcher.Legacy {
 			r.logf("the launcher closed itself right after starting, which it does when it has an update of its own to install; letting it update in the tray first")
 			if err := launcher.UpdateRun(ctx, inst, r.logf); err != nil {
+				if errors.Is(err, launcher.ErrUserStarted) {
+					return nil, "", err
+				}
 				return nil, "", fmt.Errorf("launcher self-update: %w", err)
 			}
 			continue
@@ -165,6 +168,10 @@ func (r *Runner) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]
 	started := time.Now()
 	in, base, err := r.startHidden(sctx, inst)
 	if err != nil {
+		if errors.Is(err, launcher.ErrUserStarted) {
+			yielded = true // the launcher is running for the user now
+			return results, daemon.ErrYielded
+		}
 		return results, err
 	}
 	defer in.Stop(8 * time.Second)
