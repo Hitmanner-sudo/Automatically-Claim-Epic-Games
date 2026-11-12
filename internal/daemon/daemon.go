@@ -552,6 +552,10 @@ type RunOptions struct {
 	// round is further away than this. (Windows starts the program again on
 	// its daily schedule.) Zero means stay and wait.
 	ExitWhenIdleFor time.Duration
+	// Waiting is called with true before a wait between rounds and with
+	// false when it is over, so that the program can make itself small
+	// meanwhile. May be nil.
+	Waiting func(waiting bool)
 }
 
 // Run does the rounds that are due, one after the other, until the context
@@ -563,7 +567,14 @@ func (d *Daemon) Run(ctx context.Context, opt RunOptions) {
 			d.logf("nothing to do before %s; leaving it to the daily schedule", next.Local().Format("Mon 2 Jan 15:04"))
 			return
 		}
-		if !sleepUntil(ctx, next, d.now) {
+		if wait := next.Sub(d.now()); wait > 5*time.Second && opt.Waiting != nil {
+			opt.Waiting(true)
+			ok := sleepUntil(ctx, next, d.now)
+			opt.Waiting(false)
+			if !ok {
+				return
+			}
+		} else if !sleepUntil(ctx, next, d.now) {
 			return
 		}
 		if opt.Settle != nil {
@@ -594,7 +605,8 @@ func (d *Daemon) Run(ctx context.Context, opt RunOptions) {
 // (during which timers do not advance) notices at once that the time has
 // come. It returns false when the context ends first.
 func sleepUntil(ctx context.Context, when time.Time, now func() time.Time) bool {
-	const step = 20 * time.Second
+	// One look at the clock a minute is all a wait costs.
+	const step = time.Minute
 	for {
 		remaining := when.Sub(now())
 		if remaining <= 0 {

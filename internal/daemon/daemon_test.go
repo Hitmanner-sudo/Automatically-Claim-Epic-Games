@@ -995,3 +995,57 @@ func TestStoredTimesAreInThePCsClock(t *testing.T) {
 		t.Fatalf("an ended giveaway was attempted from memory: %v", r.claim.calls)
 	}
 }
+
+func TestRunSaysWhenItIsWaiting(t *testing.T) {
+	// The program makes itself small during waits: Run announces each wait
+	// and its end, and never starts a round while "waiting".
+	r := newRig(t)
+	r.d.Now = time.Now
+	var mu sync.Mutex
+	var events []string
+	waiting := false
+	r.claim.during = func() {
+		mu.Lock()
+		if waiting {
+			events = append(events, "ROUND WHILE WAITING")
+		}
+		mu.Unlock()
+	}
+	a := feed.Offer{Title: "Game a", Namespace: "ns", OfferID: "a", Start: time.Now().Add(-time.Hour), End: time.Now().Add(48 * time.Hour)}
+	r.feed.snap = feed.Snapshot{FreeNow: []feed.Offer{a}}
+	r.claim.results[a.Key()] = claim.Result{Outcome: claim.Claimed}
+	_ = r.d.State.SetSchedule(func(sc *state.Schedule) { sc.NextDue = time.Now().Add(6 * time.Second) })
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		r.d.Run(ctx, RunOptions{Waiting: func(w bool) {
+			mu.Lock()
+			waiting = w
+			if w {
+				events = append(events, "wait")
+			} else {
+				events = append(events, "awake")
+			}
+			mu.Unlock()
+		}})
+		close(done)
+	}()
+	deadline := time.After(20 * time.Second)
+	for len(r.claim.calls) == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("the round never ran")
+		default:
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	time.Sleep(200 * time.Millisecond) // into the wait for the next day
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	got := strings.Join(events, ",")
+	if got != "wait,awake,wait,awake" {
+		t.Fatalf("events = %s", got)
+	}
+}

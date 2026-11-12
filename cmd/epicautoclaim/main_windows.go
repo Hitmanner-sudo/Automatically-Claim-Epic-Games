@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -378,7 +379,15 @@ func cmdRun(a *app, scheduled bool, afterPID uint32) int {
 		a.log.Printf("%v", a.cfgErr)
 	}
 	d := a.daemon()
-	opt := daemon.RunOptions{Settle: settle}
+	// While it waits the program makes itself as small as it can: it gives
+	// its memory back to Windows and drops to the lowest priority for the
+	// processor, the disk and memory (Windows' "efficiency mode").
+	opt := daemon.RunOptions{Settle: settle, Waiting: func(waiting bool) {
+		if waiting {
+			debug.FreeOSMemory()
+		}
+		win.Background(waiting)
+	}}
 	if scheduled {
 		opt.ExitWhenIdleFor = idleExit
 	}
@@ -958,6 +967,10 @@ func main() {
 
 	// The background process: no console, no windows, only the log file.
 	if len(args) > 0 && args[0] == "run" {
+		// It has next to nothing to compute, so it is told to keep its own
+		// memory small rather than fast.
+		debug.SetGCPercent(25)
+		debug.SetMemoryLimit(48 << 20)
 		a, err := newApp(io.Discard, false)
 		if err != nil {
 			os.Exit(1)

@@ -690,6 +690,44 @@ func SignedInSince() (t time.Time, ok bool) {
 	return t, true
 }
 
+var procSetProcessInformation = kernel32.NewProc("SetProcessInformation")
+
+// processPowerThrottling is PROCESS_POWER_THROTTLING_STATE.
+type processPowerThrottling struct {
+	Version     uint32
+	ControlMask uint32
+	StateMask   uint32
+}
+
+// Background puts this process into the background while it has nothing to
+// do, and takes it out again: lowest priority for the processor, the disk
+// and memory, Windows' "efficiency mode" where there is one, and its
+// memory handed back to Windows (a waiting process then holds on to very
+// little). It must be taken out of the background before it starts another
+// program, which would otherwise inherit the low disk and memory priority.
+func Background(on bool) {
+	const (
+		processModeBackgroundEnd = 0x00200000
+		powerThrottlingClass     = 4 // ProcessPowerThrottling
+		throttleExecutionSpeed   = 0x1
+	)
+	h := windows.CurrentProcess()
+	eco := processPowerThrottling{Version: 1, ControlMask: throttleExecutionSpeed}
+	if on {
+		eco.StateMask = throttleExecutionSpeed
+		_ = windows.SetPriorityClass(h, windows.PROCESS_MODE_BACKGROUND_BEGIN)
+	} else {
+		_ = windows.SetPriorityClass(h, processModeBackgroundEnd)
+	}
+	if procSetProcessInformation.Find() == nil {
+		_, _, _ = procSetProcessInformation.Call(uintptr(h), powerThrottlingClass, uintptr(unsafe.Pointer(&eco)), unsafe.Sizeof(eco))
+	}
+	if on {
+		// Hand back every page that is not needed right now.
+		_ = windows.SetProcessWorkingSetSizeEx(h, ^uintptr(0), ^uintptr(0), 0)
+	}
+}
+
 // LockHeld reports whether some process holds the named single-instance
 // lock, without creating it. A lock that exists but may not be opened (its
 // holder runs with higher rights) counts as held.

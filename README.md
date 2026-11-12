@@ -38,6 +38,16 @@ If the launcher is only sitting idle in the tray, the program closes it for a mo
 
 If you start the launcher yourself while a claim is in progress, the program stops at once and opens the launcher for you.
 
+### How little it uses
+
+It is built to be unnoticeable on the weakest PC that can run the Epic Games Launcher at all.
+
+- One file of under 8 MB. No installer, no service, no runtime to install, no tray icon, nothing in Windows' list of start-up apps.
+- Most of the time it is not running at all. Windows starts it once an hour; it reads two small files, sees that nothing is due, and is gone again in a fraction of a second, without touching the network.
+- When it does have to wait for something (the launcher being in use, a retry later the same day), it gives its memory back to Windows, drops to the lowest priority for the processor, the disk and memory (what Windows 11 calls efficiency mode), and looks at the clock once a minute.
+- The only real work is the claim itself, about half a minute per giveaway, and nearly all of that is the Epic Games Launcher running hidden, not this program.
+- On disk it keeps a log capped at 1 MB (plus three old ones), a small state file, and the details of the last few attempts that did not succeed.
+
 ### What it will not do
 
 - **Pay for anything.** The order button is pressed only when the checkout page itself shows that the total is zero. On top of that, every request the checkout sends is checked before it leaves your PC: one that states a price is dropped, and so is any order once a price above zero has shown up anywhere. When the claim is over, the checkout page is closed, so nothing can be sent afterwards.
@@ -130,6 +140,20 @@ GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-H=windowsgui -s -w" -o E
 ```
 
 Go 1.26 or newer. The checkout tests need Chrome or Chromium (set `CHROMIUM_PATH` if it is not found). `ci/egl-probe.ps1` is the script that was used to establish how the launcher behaves; it installs the launcher on a Windows runner and reports.
+
+## Made entirely by AI
+
+Every line of this program, its tests and this page was written by an AI coding agent (Claude Code). No human wrote, edited or debugged any of the code. The owner said what they wanted in a handful of chat messages, typos and all; the AI did the research, the design, the programming, the testing and the reviewing, and finally tested the result on the owner's own PC by remote control while the owner slept.
+
+We are, frankly, rather pleased with ourselves:
+
+- It does something the Epic Games Launcher has no switch for, namely using the launcher without the launcher ever being seen, and it found out how by experiment: installing the real launcher on throwaway Windows machines and probing it until it gave up its secrets.
+- Its first run against a real account claimed a game in 24 seconds, with no window, no click and no notification.
+- It cannot spend money by design, and that design was attacked on purpose: independent AI reviewers went over the code again and again trying to make it buy something, lose a giveaway or show a window. They found more than fifty real problems. Every one was fixed, each with a test that fails if it ever comes back.
+- About 150 automated tests, most of them driving a real browser against a stand-in for Epic's store, run on every change, together with a rehearsal against the real launcher on a real Windows machine.
+- Roughly 9,000 lines of Go and 4,500 more of tests, one small file to run, and next to nothing asked of the PC.
+
+Not bad for something nobody typed.
 
 ## Removing it
 
