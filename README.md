@@ -19,7 +19,7 @@ Windows may warn about an unknown publisher the first time, because the file is 
 ## What it does
 
 - Looks **once a day**, at about half an hour after the time Epic changes its giveaways (16:30 UTC; you can choose another time). If the PC was off at that time, it looks later the same day instead, but not in the first ten minutes after you sign in to Windows: nothing happens merely because the PC was turned on, and restarting the PC does not cause another look.
-- Reads Epic's public free-games list. If nothing is new, that is all it does, and it ends until the next day.
+- Reads Epic's public free-games list, and does not give up on it easily: it tries both of Epic's servers several times over, reads the list again when it comes back empty or half-updated, goes by Epic's clock when the PC's is wrong, and, while the list cannot be read at all, still claims giveaways it already knows to be running. If nothing is new, that is all it does, and it ends until the next day.
 - When something is free and not yet claimed, it starts the launcher on a separate Windows desktop that is never displayed, opens Epic's checkout inside it, confirms that the price is zero, and places the order. If the checkout cannot be opened directly, it goes the way you would: the game's store page, **Get**, and the launcher's own checkout window.
 - Closes the hidden launcher again. The whole thing takes about a minute.
 - If a claim could not be made (see below), it stays in the background and tries again later the same day; what is still open after that is taken up at the next daily round.

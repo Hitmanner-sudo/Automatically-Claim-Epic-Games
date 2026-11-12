@@ -541,6 +541,13 @@ func cmdCheck(a *app) int {
 		fmt.Fprintf(a.out, "Could not read the free-games list: %v\n", err)
 		return 1
 	}
+	if snap.Country != "" && !strings.EqualFold(snap.Country, c) && !(strings.EqualFold(c, "UK") && snap.Country == "GB") {
+		fmt.Fprintf(a.out, "Epic has no free-games list for %s; this is the one for %s.\n", c, snap.Country)
+		c = snap.Country
+	}
+	if snap.ClockSkew != 0 {
+		fmt.Fprintf(a.out, "This PC's clock differs from Epic's by %v; Epic's time is used to tell what is free.\n", (-snap.ClockSkew).Round(time.Minute))
+	}
 	fmt.Fprintf(a.out, "Free right now in %s:\n", c)
 	if len(snap.FreeNow) == 0 {
 		fmt.Fprintln(a.out, "  (nothing)")
@@ -662,6 +669,11 @@ func cmdDoctor(a *app, args []string) int {
 		fmt.Fprintln(a.out, "The launcher is running idle in the tray.")
 	}
 	fmt.Fprintf(a.out, "Full-screen app in front: %v; keyboard/mouse idle for %v\n", win.FullscreenActivity(), win.IdleFor().Round(time.Second))
+	if since, ok := win.SignedInSince(); ok {
+		fmt.Fprintf(a.out, "Signed in to Windows since %s (%v ago)\n", since.Local().Format("Mon 2 Jan 15:04"), time.Since(since).Round(time.Minute))
+	} else {
+		fmt.Fprintln(a.out, "Signed in to Windows since: Windows does not say (the wait after sign-in is then skipped)")
+	}
 	if !launch {
 		fmt.Fprintln(a.out, "\nRun \"doctor --launch\" to try starting the launcher hidden (nothing is claimed).")
 		return 0
