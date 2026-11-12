@@ -831,13 +831,55 @@ func (s *Session) checkout(ctx context.Context, o feed.Offer, w *orderWatch, add
 	return s.order(ctx, o, w, mayFallThrough, known)
 }
 
+// priceEvidence weighs everything a checkout page and its network traffic
+// say about the total of the order.
+func priceEvidence(st pageState, w *orderWatch) (Verdict, []string) {
+	var evidence []string
+	dom := Unknown
+	for _, t := range st.Totals {
+		v := JudgeTotalText(t)
+		dom = Combine(dom, v)
+		if v != Unknown {
+			evidence = append(evidence, fmt.Sprintf("page shows %q (%v)", t, v))
+		}
+	}
+	preload := Unknown
+	if st.Preload != "" {
+		var facts []PriceFact
+		preload, facts = JudgeJSON([]byte(st.Preload))
+		if preload != Unknown {
+			evidence = append(evidence, fmt.Sprintf("page data totals %v (%v)", facts, preload))
+		}
+	}
+	preview := w.previewVerdict()
+	if preview != Unknown {
+		evidence = append(evidence, fmt.Sprintf("order preview (%v)", preview))
+	}
+	// Epic's newer free checkout has no "total" line: it shows the price
+	// (zero) and says "This is free".
+	shown := JudgePrices(st.Prices)
+	if shown == Free {
+		evidence = append(evidence, fmt.Sprintf("the only price on the page is %q", st.Prices[0]))
+	}
+	// Epic's sentence "This is free" counts only while no amount above zero
+	// appears anywhere on the page.
+	stated := Unknown
+	if st.SaysFree && (len(st.Prices) == 0 || shown == Free) {
+		stated = Free
+		evidence = append(evidence, "the page says it is free")
+	}
+	return Combine(dom, preload, preview, shown, stated), evidence
+}
+
 // order takes it from a checkout that is loading (in the current page, or
 // in a window the launcher opens for it) to a placed order.
 func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFallThrough bool, known map[string]bool) (res Result, last pageState, tryNext bool) {
-	// ---- wait for the checkout to be ready
+	// ---- wait until the checkout is ready AND proves the price is zero
 	deadline := time.Now().Add(s.opt.CheckoutWait)
 	var errorSince, strangerSince, lastAdopt time.Time
-	adopted, sawBrowserCheck := false, false
+	adopted, sawBrowserCheck, ownChecked, sawButton := false, false, false, false
+	var evidence []string
+	pre := Unknown
 	for {
 		if ctx.Err() != nil {
 			return Result{Failed, "interrupted"}, last, false
@@ -886,7 +928,30 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 				}
 			}
 			if st.Place.clickable() && !st.BrowserCheck {
-				break
+				sawButton = true
+				if !ownChecked {
+					// What does the account already have? (Asked once; it
+					// takes a moment, so the page is read afresh afterwards.)
+					ownChecked = true
+					switch s.ownership(ctx, st, o) {
+					case ownYes:
+						return Result{Owned, "already in the library"}, last, false
+					case ownBlocked:
+						return Result{Unavailable, "the store says this account cannot get the offer (a required base game is missing, or it conflicts with something owned)"}, last, false
+					}
+					continue
+				}
+				// Is it really free? Judged on the page as it is right now;
+				// the click follows at once.
+				pre, evidence = priceEvidence(st, w)
+				if pre == Paid {
+					return Result{NotFree, "the checkout does not show a zero total; nothing was ordered: " + strings.Join(evidence, "; ")}, last, false
+				}
+				if pre == Free {
+					break
+				}
+				// The button is there but the proof is not (yet): the page
+				// may still be filling in. Keep looking until the deadline.
 			}
 			if st.AppError != "" && st.Place == nil {
 				if errorSince.IsZero() {
@@ -912,14 +977,16 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 			}
 		}
 		if time.Now().After(deadline) {
-			if last.BrowserCheck {
+			switch {
+			case last.BrowserCheck:
 				// Backs off like a CAPTCHA: asking again soon would not help.
 				return Result{Captcha, "Epic's site kept showing its browser check instead of the checkout"}, last, false
-			}
-			if ierr != nil {
+			case sawButton:
+				// No button is pressed without positive evidence of a zero price.
+				return Result{Failed, fmt.Sprintf("the price could not be confirmed to be zero from the checkout page (amounts seen: %q); nothing was ordered", last.Prices)}, last, false
+			case ierr != nil:
 				return Result{Failed, "the checkout page could not be read: " + ierr.Error()}, last, mayFallThrough
-			}
-			if last.App && last.AppError == "" && len(last.Buttons) > 0 {
+			case last.App && last.AppError == "" && len(last.Buttons) > 0:
 				// A checkout did come up; another address would look the same.
 				return Result{Failed, fmt.Sprintf("the checkout loaded but its order button was not recognised or never became ready (buttons on the page: %q)", last.Buttons)}, last, false
 			}
@@ -930,57 +997,6 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 		}
 	}
 
-	// ---- what does the account already have?
-	switch s.ownership(ctx, last, o) {
-	case ownYes:
-		return Result{Owned, "already in the library"}, last, false
-	case ownBlocked:
-		return Result{Unavailable, "the store says this account cannot get the offer (a required base game is missing, or it conflicts with something owned)"}, last, false
-	}
-
-	// ---- is it really free?
-	var evidence []string
-	dom := Unknown
-	for _, t := range last.Totals {
-		v := JudgeTotalText(t)
-		dom = Combine(dom, v)
-		if v != Unknown {
-			evidence = append(evidence, fmt.Sprintf("page shows %q (%v)", t, v))
-		}
-	}
-	preload := Unknown
-	if last.Preload != "" {
-		var facts []PriceFact
-		preload, facts = JudgeJSON([]byte(last.Preload))
-		if preload != Unknown {
-			evidence = append(evidence, fmt.Sprintf("page data totals %v (%v)", facts, preload))
-		}
-	}
-	preview := w.previewVerdict()
-	if preview != Unknown {
-		evidence = append(evidence, fmt.Sprintf("order preview (%v)", preview))
-	}
-	// Epic's newer free checkout has no "total" line: it shows the price
-	// (zero) and says "This is free".
-	shown := JudgePrices(last.Prices)
-	if shown == Free {
-		evidence = append(evidence, fmt.Sprintf("the only price on the page is %q", last.Prices[0]))
-	}
-	// Epic's sentence "This is free" counts only while no amount above zero
-	// appears anywhere on the page.
-	stated := Unknown
-	if last.SaysFree && (len(last.Prices) == 0 || shown == Free) {
-		stated = Free
-		evidence = append(evidence, "the page says it is free")
-	}
-	pre := Combine(dom, preload, preview, shown, stated)
-	if pre == Paid {
-		return Result{NotFree, "the checkout does not show a zero total; nothing was ordered: " + strings.Join(evidence, "; ")}, last, false
-	}
-	if pre != Free {
-		// No button is pressed without positive evidence of a zero price.
-		return Result{Failed, fmt.Sprintf("the price could not be confirmed to be zero from the checkout page (amounts seen: %q); nothing was ordered", last.Prices)}, last, false
-	}
 	w.setPreClick(pre)
 	how := ""
 	if last.Guessed {
@@ -993,13 +1009,16 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 	}
 
 	// ---- place the order
+	pressed := *last.Place
+	// Words of thanks that were on the page before the press prove nothing.
+	thanksBefore := last.Success
 	if err := s.click(ctx, last.Place); err != nil {
 		return Result{Failed, "could not press the order button: " + err.Error()}, last, false
 	}
 	clickedAt := time.Now()
 	clicks := 1
 	deadline = time.Now().Add(s.opt.OrderWait)
-	var lastConsent, lastOwnCheck, errSeen time.Time
+	var lastConsent, lastOwnCheck, errSeen, thanksSince time.Time
 	var errText string
 	for {
 		if ctx.Err() != nil {
@@ -1024,8 +1043,6 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 		if ierr == nil {
 			last = st
 			switch {
-			case st.Success:
-				return Result{Claimed, "the checkout shows the order confirmation"}, last, false
 			case st.Throttled:
 				return Result{Throttled, "Epic says this account cannot claim more free games right now"}, last, false
 			case st.Captcha:
@@ -1036,6 +1053,23 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 				return Result{Unavailable, "not available in this account's region"}, last, false
 			case st.Login:
 				return Result{NotSignedIn, "Epic's sign-in page came up during the order"}, last, false
+			}
+			if st.Success && !thanksBefore {
+				// The page thanks for the order. "Claimed" is final, so the
+				// library gets a say when it will answer: if it still does
+				// not list the game after a while, the attempt is counted
+				// as failed and repeated later (which settles it either way).
+				if thanksSince.IsZero() {
+					thanksSince = time.Now()
+				}
+				switch s.ownership(ctx, st, o) {
+				case ownNo:
+					if time.Since(thanksSince) > 20*time.Second {
+						return Result{Failed, "the checkout showed its confirmation but the library does not list the game yet; will check again later"}, last, false
+					}
+				default:
+					return Result{Claimed, "the checkout shows the order confirmation"}, last, false
+				}
 			}
 			if st.Consent.clickable() && time.Since(lastConsent) > 2*time.Second {
 				// EU/UK accounts must confirm they waive the withdrawal
@@ -1056,11 +1090,16 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 			} else {
 				errSeen = time.Time{}
 			}
-			// The first press can land before the page is listening.
-			if st.Place.clickable() && st.Consent == nil && !w.submitted() && clicks < 3 && time.Since(clickedAt) > 12*time.Second {
-				clicks++
-				clickedAt = time.Now()
-				_ = s.click(ctx, st.Place)
+			// The first press can land before the page is listening. Press
+			// again only if it is unmistakably the same button, in the same
+			// place, on a page whose price is still proven to be zero.
+			if st.Place.clickable() && !st.Guessed && st.Consent == nil && !st.Success && !w.submitted() && clicks < 3 &&
+				time.Since(clickedAt) > 12*time.Second && st.Place.Text == pressed.Text {
+				if v, _ := priceEvidence(st, w); v == Free {
+					clicks++
+					clickedAt = time.Now()
+					_ = s.click(ctx, st.Place)
+				}
 			}
 		}
 		if time.Since(lastOwnCheck) > 4*time.Second {
@@ -1073,7 +1112,7 @@ func (s *Session) order(ctx context.Context, o feed.Offer, w *orderWatch, mayFal
 			if w.submitted() {
 				return Result{Failed, "the order was sent but no confirmation arrived in time; the library will be checked next time"}, last, false
 			}
-			return Result{Failed, "pressing the order button had no effect"}, last, false
+			return Result{Failed, "no confirmation appeared after the order button was pressed; the library will be checked next time"}, last, false
 		}
 		if err := sleep(ctx, 400*time.Millisecond); err != nil {
 			return Result{Failed, "interrupted after the order button was pressed; the library will be checked next time"}, last, false

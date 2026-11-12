@@ -56,7 +56,7 @@ const inspectJS = `(function () {
 
   function pick(test) { for (var i = 0; i < buttons.length; i++) if (test(buttons[i])) return buttons[i]; return null; }
   var consent = pick(function (b) { return /payment-confirm__btn/.test(cls(b)) && !/secondary|cancel/i.test(cls(b)); }) ||
-    pick(function (b) { return /^(i accept|i agree|accept|akzeptieren|ich stimme zu)$/i.test(text(b)); });
+    pick(function (b) { return /^(i accept|i agree|ich stimme zu)$/i.test(text(b)); });
   // Epic renamed the button from "Place Order" to "Add to library" for free
   // offers in 2026; both are in use.
   var place = pick(function (b) { return /payment-order-confirm__btn/.test(cls(b)); }) ||
