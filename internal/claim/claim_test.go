@@ -1017,6 +1017,14 @@ func TestIsCheckoutURL(t *testing.T) {
 func TestBrowserCheckIsWaitedOut(t *testing.T) {
 	// The check passes by itself after a few seconds; nothing is clicked
 	// meanwhile, and the claim then goes ahead.
+	if os.Getenv("CDP_BASE") != "" {
+		// The launcher hands a page's own reloads to the system's browser
+		// when the address is not one of Epic's (the stand-in store's is
+		// not), so the stand-in check never "passes" in its own browser:
+		// the checkout was asked for two or three times in ninety seconds,
+		// and a Microsoft Edge was left running on the test machine.
+		t.Skip("the launcher's browser does not follow a reload to an address that is not Epic's")
+	}
 	r := runScenario(t, scenario{SignedIn: true, DomTotal: "$0.00", ConfirmTotal: intp(0), ChallengeFor: 4 * time.Second}, func(o *Options) {
 		o.CheckoutWait = 3 * time.Second // shorter than the check lasts
 		o.BrowserCheckWait = patience(30 * time.Second)
