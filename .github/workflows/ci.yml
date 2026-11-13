@@ -29,12 +29,16 @@ jobs:
           test -z "$(gofmt -l .)"
           go vet ./...
           GOOS=windows go vet ./...
+          GOOS=windows go vet -tags memdiag ./cmd/...
       - name: Test
         # The checkout driver is exercised in a real Chrome against a
-        # stand-in for Epic's store.
+        # stand-in for Epic's store. With two threads of its own, as the
+        # background process runs (see tuning); the Windows job below runs
+        # the same tests with one per processor, as a command run by hand
+        # does.
         env:
           CHROMIUM_REQUIRED: '1'
-        run: go test ./... -count=1 -race -timeout 20m
+        run: go test ./... -count=1 -race -cpu 2 -timeout 20m
 
   windows:
     name: Build and try on Windows with the real launcher
@@ -76,6 +80,45 @@ jobs:
           name: EpicAutoClaim
           path: dist/EpicAutoClaim.exe
           if-no-files-found: error
+      - name: What a look at the list costs in memory
+        shell: pwsh
+        run: |
+          # The measuring build (never released: see memdiag_windows.go)
+          # writes into its log what the process holds at each stage of a
+          # look. No launcher is installed yet, so the look is: download the
+          # list, see what is free, find no launcher, go back to waiting.
+          $dir = Join-Path $env:RUNNER_TEMP 'memdiag'
+          go build -tags memdiag -trimpath -ldflags "-H=windowsgui -s -w -X main.version=memdiag" -o "$dir\EpicAutoClaim.exe" ./cmd/epicautoclaim
+          if ($LASTEXITCODE -ne 0) { throw 'the measuring build failed' }
+          $exe = "$dir\EpicAutoClaim.exe"
+          $data = Join-Path $env:LOCALAPPDATA 'EpicAutoClaim'
+          $log = Join-Path $data 'logs\EpicAutoClaim.log'
+          Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath $exe -ArgumentList 'run' -PassThru
+          try {
+            $deadline = (Get-Date).AddSeconds(90)
+            while ((Get-Date) -lt $deadline -and -not ((Test-Path $log) -and (Select-String -Path $log -Pattern 'mem asleep' -Quiet))) { Start-Sleep -Milliseconds 200 }
+            if (Test-Path $log) { Get-Content $log } else { throw 'the measuring build wrote no log' }
+            function Own([string]$label) {
+              $m = Select-String -Path $log -Pattern ('mem ' + $label + '\s+ws=\S+ privateWS=([0-9.]+)') | Select-Object -Last 1
+              if (-not $m) { throw "the log has no '$label' line with the memory of the process's own" }
+              [double]$m.Matches[0].Groups[1].Value
+            }
+            $start = Own 'started'; $look = Own 'end of look'; $asleep = Own 'asleep'
+            "memory of its own, in MB: $start at start, $look at the end of a look, $asleep asleep"
+            # What it may cost. Measured on these machines after the
+            # start-up was put right: 2.4 to 3.0 at start, 7.2 to 7.8 at the
+            # end of a look (most of the difference is Windows' own name
+            # lookup and certificate check), 0.2 to 0.3 asleep. Before:
+            # 7.4 at start and 11 at the end of a look.
+            if ($start -gt 4.5) { throw "the program holds $start MB of its own right after starting; it may hold 4.5 (something is prepared at start-up that should wait for its first use)" }
+            if ($look -gt 10) { throw "the program holds $look MB of its own at the end of a look; it may hold 10" }
+            if ($asleep -gt 1.5) { throw "the program holds $asleep MB of its own when it has gone back to waiting; it may hold 1.5" }
+          } finally {
+            Start-Process -FilePath $exe -ArgumentList 'stop' -Wait
+            if (-not $p.WaitForExit(20000)) { Stop-Process -Id $p.Id -Force }
+            Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue
+          }
       - name: Install the Epic Games Launcher
         shell: pwsh
         run: |

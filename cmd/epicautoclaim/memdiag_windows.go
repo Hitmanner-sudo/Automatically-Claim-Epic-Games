@@ -35,7 +35,6 @@ func memKnobs(t *tuning) {
 	mb := int(t.limit >> 20)
 	envInt("EAC_LIMIT_MB", &mb)
 	t.limit = int64(mb) << 20
-	envInt("EAC_HTTP", &t.http)
 }
 
 // processMemoryCountersEx2 is PROCESS_MEMORY_COUNTERS_EX2.
