@@ -22,6 +22,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/win"
 )
 
 func envInt(name string, into *int) {
@@ -37,6 +39,7 @@ func memKnobs(t *tuning) {
 	capKB := int(t.wsCap >> 10)
 	envInt("EAC_WSCAP_KB", &capKB)
 	t.wsCap = int64(capKB) << 10
+	envInt("EAC_TRIM", &memTrim)
 	mb := int(t.limit >> 20)
 	envInt("EAC_LIMIT_MB", &mb)
 	t.limit = int64(mb) << 20
@@ -58,6 +61,10 @@ type processMemoryCountersEx2 struct {
 	privateWorkingSetSize      uintptr
 	sharedCommitUsage          uint64
 }
+
+// memTrim: 1 hands the working set back at the stages of a download (when
+// the connection stands, and when the first byte of the answer is in).
+var memTrim int
 
 // memStart is when the program started, near enough.
 var memStart = time.Now()
@@ -91,8 +98,8 @@ func memMark(logf func(string, ...any), label string) {
 	runtime.ReadMemStats(&m)
 	// (No runtime/pprof here: with it in the program the runtime keeps a
 	// table for memory profiling, 1.4 MB that a released build does not have.)
-	logf("mem %-22s t=%dms faults=%d ws=%s privateWS=%s peakWS=%s commit=%s | go: mapped=%.1f heapInuse=%.1f heapIdle-released=%.1f stacks=%.1f gcSys=%.1f spans+caches=%.1f profiling=%.1f other=%.1f totalAlloc=%.1f numGC=%d | goroutines=%d procs=%d modules=%d",
-		label, time.Since(memStart).Milliseconds(), c.pageFaultCount, mb(c.workingSetSize), private, mb(c.peakWorkingSetSize), mb(c.privateUsage),
+	logf("mem %-22s t=%dms faults=%d cap=%s ws=%s privateWS=%s peakWS=%s commit=%s | go: mapped=%.1f heapInuse=%.1f heapIdle-released=%.1f stacks=%.1f gcSys=%.1f spans+caches=%.1f profiling=%.1f other=%.1f totalAlloc=%.1f numGC=%d | goroutines=%d procs=%d modules=%d",
+		label, time.Since(memStart).Milliseconds(), c.pageFaultCount, mb(win.WorkingSetCap()), mb(c.workingSetSize), private, mb(c.peakWorkingSetSize), mb(c.privateUsage),
 		float64(m.Sys-m.HeapReleased)/(1<<20), float64(m.HeapInuse)/(1<<20), float64(m.HeapIdle-m.HeapReleased)/(1<<20),
 		float64(m.StackSys)/(1<<20), float64(m.GCSys)/(1<<20), float64(m.MSpanSys+m.MCacheSys)/(1<<20), float64(m.BuckHashSys)/(1<<20), float64(m.OtherSys)/(1<<20),
 		float64(m.TotalAlloc)/(1<<20), m.NumGC,
@@ -140,12 +147,25 @@ func (t markingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 	mark("http: before")
+	if memTrim > 0 {
+		win.TrimWorkingSet()
+	}
 	trace := &httptrace.ClientTrace{
-		DNSDone:              func(httptrace.DNSDoneInfo) { mark("http: name looked up") },
-		ConnectDone:          func(string, string, error) { mark("http: connected") },
-		TLSHandshakeStart:    func() { mark("http: TLS starts") },
-		TLSHandshakeDone:     func(tls.ConnectionState, error) { mark("http: TLS done") },
-		GotFirstResponseByte: func() { mark("http: first byte") },
+		DNSDone: func(httptrace.DNSDoneInfo) { mark("http: name looked up") },
+		ConnectDone: func(string, string, error) {
+			mark("http: connected")
+			if memTrim > 0 {
+				win.TrimWorkingSet()
+			}
+		},
+		TLSHandshakeStart: func() { mark("http: TLS starts") },
+		TLSHandshakeDone:  func(tls.ConnectionState, error) { mark("http: TLS done") },
+		GotFirstResponseByte: func() {
+			mark("http: first byte")
+			if memTrim > 0 {
+				win.TrimWorkingSet()
+			}
+		},
 	}
 	res, err := t.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
 	proto := "?"

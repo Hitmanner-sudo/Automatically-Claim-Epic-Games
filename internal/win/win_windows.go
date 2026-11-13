@@ -728,6 +728,25 @@ func Background(on bool) {
 	}
 }
 
+// TrimWorkingSet hands back to Windows every page of this process that is
+// not needed at this very moment. What is needed again is back at the first
+// touch.
+func TrimWorkingSet() {
+	_ = windows.SetProcessWorkingSetSizeEx(windows.CurrentProcess(), ^uintptr(0), ^uintptr(0), 0)
+}
+
+// WorkingSetCap reports the hard upper limit on this process's working set,
+// 0 if there is none.
+func WorkingSetCap() uintptr {
+	var min, max uintptr
+	var flags uint32
+	windows.GetProcessWorkingSetSizeEx(windows.CurrentProcess(), &min, &max, &flags)
+	if flags&0x4 == 0 { // QUOTA_LIMITS_HARDWS_MAX_ENABLE
+		return 0
+	}
+	return max
+}
+
 // CapWorkingSet puts a hard upper limit on how much memory this process
 // may have in use at any one moment (its working set); 0 lifts the limit.
 // What the process touches beyond the limit, Windows takes out of its
