@@ -5,8 +5,10 @@ package main
 import (
 	"context"
 	"net/http"
+	"net/http/httptrace"
 	"runtime"
 	"runtime/debug"
+	"time"
 
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/claim"
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/daemon"
@@ -52,11 +54,14 @@ type tuning struct {
 	// wsCap is a hard limit on the working set outside claim sessions, in
 	// bytes (0: none). See win.CapWorkingSet.
 	wsCap int64
+	// stages: hand the working set back to Windows at the stages of a look
+	// (see stagedTransport and stagedFeed).
+	stages bool
 }
 
 // daemonTuning is what the background process runs with.
 func daemonTuning() tuning {
-	t := tuning{procs: 2, gcPercent: 100, limit: 48 << 20, claimGCPercent: 25}
+	t := tuning{procs: 2, gcPercent: 100, limit: 48 << 20, claimGCPercent: 25, stages: true}
 	if n := runtime.NumCPU(); n < t.procs {
 		t.procs = n
 	}
@@ -99,6 +104,65 @@ func (p pacedClaimer) ClaimAll(ctx context.Context, offers []feed.Offer) (map[st
 	return p.Claimer.ClaimAll(ctx, offers)
 }
 
-// client is the HTTP client the list is read with: Go's own (nil), which
-// the measuring build wraps to mark the stages of a download.
-func (t tuning) client() *http.Client { return memClient(nil) }
+// A look goes through stages that each need a different part of the program
+// and of Windows in memory: looking the server's name up and connecting;
+// setting up the secure connection, which has Windows check the server's
+// certificate; reading and understanding the answer; and deciding what to
+// do about it. Measured, they need 6, 10, and 8 MB; left to pile up, 23.
+// So at the end of each stage the program hands back to Windows everything
+// it holds (as it does when it goes back to waiting): what the next stage
+// needs is back at the first touch, and what it does not need is no longer
+// counted against the program. Nothing is ever taken away from a stage in
+// the middle of its work, so this cannot make a look slow, which a fixed
+// upper limit can (measured too: with one below what the secure connection
+// needs at once, a look took four seconds and a million and a half page
+// faults instead of a fifth of a second).
+
+// stagedTransport hands the working set back when the connection to the
+// server stands, and again when the first byte of its answer is in (the
+// secure connection is set up in between).
+type stagedTransport struct{ base http.RoundTripper }
+
+func (s stagedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	trace := &httptrace.ClientTrace{
+		ConnectDone:          func(string, string, error) { win.TrimWorkingSet() },
+		GotFirstResponseByte: func() { win.TrimWorkingSet() },
+	}
+	return s.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
+}
+
+// stagedFeed hands the working set back between reading the list and
+// acting on it.
+type stagedFeed struct{ daemon.Feed }
+
+func (f stagedFeed) Fetch(ctx context.Context, country, locale string, now time.Time) (feed.Snapshot, error) {
+	snap, err := f.Feed.Fetch(ctx, country, locale, now)
+	win.TrimWorkingSet()
+	return snap, err
+}
+
+// duringLooks wraps what reads the list (see stagedFeed).
+func (t tuning) duringLooks(f daemon.Feed) daemon.Feed {
+	if !t.stages {
+		return f
+	}
+	return stagedFeed{f}
+}
+
+// client is the HTTP client the list is read with. Without stages it is
+// Go's own (nil); with them, Go's own transport with the stages marked.
+// (The measuring build puts its marks inside, so that each is made before
+// the working set is handed back.)
+func (t tuning) client() *http.Client {
+	base := memBase(nil)
+	if !t.stages {
+		if base == nil {
+			return nil
+		}
+		return &http.Client{Transport: base, Timeout: 30 * time.Second}
+	}
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return &http.Client{Transport: stagedTransport{base: base}, Timeout: 30 * time.Second}
+}

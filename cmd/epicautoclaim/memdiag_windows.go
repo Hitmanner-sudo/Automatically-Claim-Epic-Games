@@ -23,6 +23,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
+	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/daemon"
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/win"
 )
 
@@ -39,7 +40,12 @@ func memKnobs(t *tuning) {
 	capKB := int(t.wsCap >> 10)
 	envInt("EAC_WSCAP_KB", &capKB)
 	t.wsCap = int64(capKB) << 10
-	envInt("EAC_TRIM", &memTrim)
+	stages := 0
+	if t.stages {
+		stages = 1
+	}
+	envInt("EAC_STAGES", &stages)
+	t.stages = stages != 0
 	mb := int(t.limit >> 20)
 	envInt("EAC_LIMIT_MB", &mb)
 	t.limit = int64(mb) << 20
@@ -61,10 +67,6 @@ type processMemoryCountersEx2 struct {
 	privateWorkingSetSize      uintptr
 	sharedCommitUsage          uint64
 }
-
-// memTrim: 1 hands the working set back at the stages of a download (when
-// the connection stands, and when the first byte of the answer is in).
-var memTrim int
 
 // memStart is when the program started, near enough.
 var memStart = time.Now()
@@ -107,6 +109,13 @@ func memMark(logf func(string, ...any), label string) {
 	if strings.HasPrefix(label, "end") {
 		logf("mem modules: %s", strings.Join(modules(), " "))
 	}
+	if label == "asleep" && memEverySec > 0 {
+		// Looks an hour apart never find the connection of the one before
+		// still open; looks seconds apart must not either.
+		if tr, ok := http.DefaultTransport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+	}
 }
 
 // modules lists the DLLs loaded into this process.
@@ -147,25 +156,12 @@ func (t markingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 	mark("http: before")
-	if memTrim > 0 {
-		win.TrimWorkingSet()
-	}
 	trace := &httptrace.ClientTrace{
-		DNSDone: func(httptrace.DNSDoneInfo) { mark("http: name looked up") },
-		ConnectDone: func(string, string, error) {
-			mark("http: connected")
-			if memTrim > 0 {
-				win.TrimWorkingSet()
-			}
-		},
-		TLSHandshakeStart: func() { mark("http: TLS starts") },
-		TLSHandshakeDone:  func(tls.ConnectionState, error) { mark("http: TLS done") },
-		GotFirstResponseByte: func() {
-			mark("http: first byte")
-			if memTrim > 0 {
-				win.TrimWorkingSet()
-			}
-		},
+		DNSDone:              func(httptrace.DNSDoneInfo) { mark("http: name looked up") },
+		ConnectDone:          func(string, string, error) { mark("http: connected") },
+		TLSHandshakeStart:    func() { mark("http: TLS starts") },
+		TLSHandshakeDone:     func(tls.ConnectionState, error) { mark("http: TLS done") },
+		GotFirstResponseByte: func() { mark("http: first byte") },
 	}
 	res, err := t.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
 	proto := "?"
@@ -176,10 +172,21 @@ func (t markingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return res, err
 }
 
-func memClient(c *http.Client) *http.Client {
-	if c == nil {
-		c = &http.Client{Timeout: 30 * time.Second, Transport: http.DefaultTransport}
+// memBase is the transport the list is read through, with the marks.
+func memBase(t http.RoundTripper) http.RoundTripper {
+	if t == nil {
+		t = http.DefaultTransport
 	}
-	c.Transport = markingTransport{base: c.Transport}
-	return c
+	return markingTransport{base: t}
 }
+
+// memDaemon lets the measuring workflow have several looks in a row
+// (EAC_EVERY_SEC) instead of one an hour.
+func memDaemon(d *daemon.Daemon) {
+	envInt("EAC_EVERY_SEC", &memEverySec)
+	if memEverySec > 0 {
+		d.CheckEvery = time.Duration(memEverySec) * time.Second
+	}
+}
+
+var memEverySec int

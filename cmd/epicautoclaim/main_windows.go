@@ -155,8 +155,9 @@ type app struct {
 	// the account already has (see claim.Options.Again).
 	again bool
 	// http is the client the free-games list is read with; nil means Go's
-	// default, which is what a normal build uses. (Only the measuring build
-	// sets one, to mark the stages of a download: see tuning.client.)
+	// default. The background process brings its own, which reads the list
+	// the same way and hands memory back between the stages: see
+	// tuning.client.
 	http *http.Client
 	// tune is set in the background process only: see tuning.
 	tune *tuning
@@ -386,7 +387,9 @@ func cmdRun(a *app, scheduled bool, afterPID uint32) int {
 	d := a.daemon()
 	if a.tune != nil {
 		d.Claimer = a.tune.duringClaims(d.Claimer)
+		d.Feed = a.tune.duringLooks(d.Feed)
 	}
+	memDaemon(d)
 	// The program runs for as long as the user is signed in, and reads its
 	// settings once, as it starts. So before every round it looks whether
 	// the settings file has been changed since; if so it hands over to a
@@ -422,6 +425,11 @@ func cmdRun(a *app, scheduled bool, afterPID uint32) int {
 			debug.FreeOSMemory()
 		}
 		win.Background(waiting)
+		if !waiting && a.tune != nil && a.tune.wsCap > 0 {
+			// (Windows sets limits of its own on a process in the
+			// background and may not put this one back.)
+			_ = win.CapWorkingSet(uintptr(a.tune.wsCap))
+		}
 		if waiting {
 			memMark(a.log.Printf, "asleep")
 		} else {
@@ -434,6 +442,10 @@ func cmdRun(a *app, scheduled bool, afterPID uint32) int {
 	}
 	a.log.Printf("%s %s started%s; country %s; looking %s; next look %s", appName, version, mode, country(a.cfg), howOften(a.cfg), describeDue(due))
 	memMark(a.log.Printf, "started")
+	if a.tune != nil && a.tune.stages {
+		// Starting is a stage too: what it took is not needed for a look.
+		win.TrimWorkingSet()
+	}
 	d.Run(ctx, opt)
 	a.log.Printf("stopped")
 	return 0
