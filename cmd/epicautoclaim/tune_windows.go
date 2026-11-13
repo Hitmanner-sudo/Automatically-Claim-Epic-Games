@@ -8,6 +8,8 @@ import (
 	"net/http/httptrace"
 	"runtime"
 	"runtime/debug"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/claim"
@@ -55,21 +57,36 @@ type tuning struct {
 	// bytes (0: none). See win.CapWorkingSet.
 	wsCap int64
 	// stages: hand the working set back to Windows at the stages of a look
-	// (see stagedTransport and stagedFeed).
+	// and several times a second while one is in progress (see
+	// stagedTransport, stagedFeed and lookTrimmer).
 	stages bool
+	// look is running while a look is in progress (with stages).
+	look lookTrimmer
 }
 
 // daemonTuning is what the background process runs with.
-func daemonTuning() tuning {
-	t := tuning{procs: 2, gcPercent: 100, limit: 48 << 20, claimGCPercent: 25, stages: true}
+func daemonTuning() *tuning {
+	t := &tuning{procs: 2, gcPercent: 100, limit: 48 << 20, claimGCPercent: 25, stages: true}
 	if n := runtime.NumCPU(); n < t.procs {
 		t.procs = n
 	}
-	memKnobs(&t) // (does nothing in a normal build)
+	memKnobs(t) // (does nothing in a normal build)
 	return t
 }
 
-func (t tuning) apply() {
+// looking is told when a look begins and when it is over.
+func (t *tuning) looking(on bool) {
+	if !t.stages {
+		return
+	}
+	if on {
+		t.look.begin()
+	} else {
+		t.look.end()
+	}
+}
+
+func (t *tuning) apply() {
 	if t.procs > 0 {
 		runtime.GOMAXPROCS(t.procs)
 	}
@@ -83,19 +100,24 @@ func (t tuning) apply() {
 // duringClaims wraps what carries out the claim sessions so that they run
 // at the claim pace of the garbage collector, and the pace of the looks is
 // put back afterwards.
-func (t tuning) duringClaims(c daemon.Claimer) daemon.Claimer {
-	return pacedClaimer{Claimer: c, percent: t.claimGCPercent, wsCap: t.wsCap}
+func (t *tuning) duringClaims(c daemon.Claimer) daemon.Claimer {
+	return pacedClaimer{Claimer: c, percent: t.claimGCPercent, wsCap: t.wsCap, look: &t.look}
 }
 
 type pacedClaimer struct {
 	daemon.Claimer
 	percent int
 	wsCap   int64
+	look    *lookTrimmer
 }
 
 func (p pacedClaimer) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]claim.Result, error) {
 	old := debug.SetGCPercent(p.percent)
 	defer debug.SetGCPercent(old)
+	// A claim is real work against the clock: nothing is handed back
+	// under it.
+	p.look.paused.Store(true)
+	defer p.look.paused.Store(false)
 	if p.wsCap > 0 {
 		// A claim is real work against the clock: no limit meanwhile.
 		_ = win.CapWorkingSet(0)
@@ -119,16 +141,68 @@ func (p pacedClaimer) ClaimAll(ctx context.Context, offers []feed.Offer) (map[st
 // faults instead of a fifth of a second).
 
 // stagedTransport hands the working set back when the connection to the
-// server stands, and again when the first byte of its answer is in (the
-// secure connection is set up in between).
+// server stands; when the request has been sent (the secure connection was
+// set up in between, and the wait for the answer, the longest part of a
+// look, begins); and when the first byte of the answer is in.
 type stagedTransport struct{ base http.RoundTripper }
 
 func (s stagedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	trace := &httptrace.ClientTrace{
 		ConnectDone:          func(string, string, error) { win.TrimWorkingSet() },
+		WroteRequest:         func(httptrace.WroteRequestInfo) { win.TrimWorkingSet() },
 		GotFirstResponseByte: func() { win.TrimWorkingSet() },
 	}
 	return s.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
+}
+
+// lookTrimmer hands the working set back four times a second for as long
+// as a look is in progress. The stages above are exact but know only a
+// look that goes well; this covers the rest: a name server or a server
+// that is slow to answer, the pauses between tries when the list cannot be
+// read, and whatever else a look comes to do. Its cost is bounded: each
+// time, what is in use at that moment comes back at the first touch (some
+// thousand page faults of two or three microseconds). While the program
+// waits for the next look it does not run at all, and during a claim
+// session it holds still.
+type lookTrimmer struct {
+	mu     sync.Mutex
+	stop   chan struct{}
+	paused atomic.Bool
+}
+
+const lookTrimEvery = 250 * time.Millisecond
+
+func (l *lookTrimmer) begin() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.stop != nil {
+		return
+	}
+	stop := make(chan struct{})
+	l.stop = stop
+	go func() {
+		t := time.NewTicker(lookTrimEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				if !l.paused.Load() {
+					win.TrimWorkingSet()
+				}
+			}
+		}
+	}()
+}
+
+func (l *lookTrimmer) end() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.stop != nil {
+		close(l.stop)
+		l.stop = nil
+	}
 }
 
 // stagedFeed hands the working set back between reading the list and
@@ -142,7 +216,7 @@ func (f stagedFeed) Fetch(ctx context.Context, country, locale string, now time.
 }
 
 // duringLooks wraps what reads the list (see stagedFeed).
-func (t tuning) duringLooks(f daemon.Feed) daemon.Feed {
+func (t *tuning) duringLooks(f daemon.Feed) daemon.Feed {
 	if !t.stages {
 		return f
 	}
@@ -153,7 +227,7 @@ func (t tuning) duringLooks(f daemon.Feed) daemon.Feed {
 // Go's own (nil); with them, Go's own transport with the stages marked.
 // (The measuring build puts its marks inside, so that each is made before
 // the working set is handed back.)
-func (t tuning) client() *http.Client {
+func (t *tuning) client() *http.Client {
 	base := memBase(nil)
 	if !t.stages {
 		if base == nil {

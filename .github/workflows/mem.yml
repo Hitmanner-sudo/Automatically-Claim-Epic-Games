@@ -38,13 +38,12 @@ jobs:
           $exe = Join-Path $PWD 'mem\EpicAutoClaim.exe'
           $data = Join-Path $env:LOCALAPPDATA 'EpicAutoClaim'
           $log = Join-Path $data 'logs\EpicAutoClaim.log'
-          $knobs = 'EAC_PROCS', 'EAC_GC', 'EAC_LIMIT_MB', 'EAC_CLAIM_GC', 'EAC_WSCAP_KB', 'EAC_STAGES', 'EAC_EVERY_SEC'
+          $knobs = 'EAC_PROCS', 'EAC_GC', 'EAC_LIMIT_MB', 'EAC_CLAIM_GC', 'EAC_WSCAP_KB', 'EAC_STAGES'
           $variants = @(
-            @{ name = 'A: as released (handed back at the stages)'; looks = 3; env = @{ EAC_EVERY_SEC = '6' } },
-            @{ name = 'B: not handed back at the stages';           looks = 3; env = @{ EAC_EVERY_SEC = '6'; EAC_STAGES = '0' } },
-            @{ name = 'C: stages, and capped at 16 MB';             looks = 3; env = @{ EAC_EVERY_SEC = '6'; EAC_WSCAP_KB = '16384' } },
-            @{ name = 'D: no stages, capped at 12 MB';              looks = 3; env = @{ EAC_EVERY_SEC = '6'; EAC_STAGES = '0'; EAC_WSCAP_KB = '12288' } },
-            @{ name = 'E: as released, one look';                   looks = 1; env = @{} }
+            @{ name = 'A: as released (handed back at the stages and four times a second)'; looks = 1; env = @{} },
+            @{ name = 'B: nothing handed back during a look';         looks = 1; env = @{ EAC_STAGES = '0' } },
+            @{ name = 'C: as released, again';                        looks = 1; env = @{} },
+            @{ name = 'D: as released, one thread per processor as on a PC with 24'; looks = 1; env = @{ EAC_PROCS = '24' } }
           )
           $table = @()
           foreach ($v in $variants) {
@@ -93,20 +92,13 @@ jobs:
               $row['ms since start'] = $g[1].Value
               $row['page faults'] = $g[2].Value
             }
-            # The most the process held at any mark, in the first look
-            # (which includes starting) and in the later ones.
+            # The most the process held at any mark of the look.
             if (Test-Path $log) {
-              $lines = @(Get-Content $log)
-              $first = -1; for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match ' next check ') { $first = $i; break } }
-              $w1 = 0.0; $p1 = 0.0; $w2 = 0.0; $p2 = 0.0
-              for ($i = 0; $i -lt $lines.Count; $i++) {
-                if ($lines[$i] -match ' mem .*? ws=([0-9.]+) privateWS=([0-9.]+)') {
-                  $w = [double]$Matches[1]; $pv = [double]$Matches[2]
-                  if ($first -lt 0 -or $i -le $first + 3) { $w1 = [math]::Max($w1, $w); $p1 = [math]::Max($p1, $pv) } else { $w2 = [math]::Max($w2, $w); $p2 = [math]::Max($p2, $pv) }
-                }
+              $w1 = 0.0; $p1 = 0.0
+              foreach ($line in (Get-Content $log)) {
+                if ($line -match ' mem .*? ws=([0-9.]+) privateWS=([0-9.]+)') { $w1 = [math]::Max($w1, [double]$Matches[1]); $p1 = [math]::Max($p1, [double]$Matches[2]) }
               }
-              $row['first look: most WS at a mark'] = $w1; $row['most private'] = $p1
-              $row['later looks: most WS at a mark'] = $w2; $row['later most private'] = $p2
+              $row['most WS at a mark'] = $w1; $row['most private at a mark'] = $p1
             }
             $row['sampled max WS'] = '{0:N1}' -f ($maxWs / 1MB)
             $row['asleep WS'] = '{0:N1}' -f ($asleepWs / 1MB)

@@ -23,7 +23,6 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/daemon"
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/win"
 )
 
@@ -109,13 +108,6 @@ func memMark(logf func(string, ...any), label string) {
 	if strings.HasPrefix(label, "end") {
 		logf("mem modules: %s", strings.Join(modules(), " "))
 	}
-	if label == "asleep" && memEverySec > 0 {
-		// Looks an hour apart never find the connection of the one before
-		// still open; looks seconds apart must not either.
-		if tr, ok := http.DefaultTransport.(*http.Transport); ok {
-			tr.CloseIdleConnections()
-		}
-	}
 }
 
 // modules lists the DLLs loaded into this process.
@@ -161,6 +153,7 @@ func (t markingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		ConnectDone:          func(string, string, error) { mark("http: connected") },
 		TLSHandshakeStart:    func() { mark("http: TLS starts") },
 		TLSHandshakeDone:     func(tls.ConnectionState, error) { mark("http: TLS done") },
+		WroteRequest:         func(httptrace.WroteRequestInfo) { mark("http: request sent") },
 		GotFirstResponseByte: func() { mark("http: first byte") },
 	}
 	res, err := t.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
@@ -179,14 +172,3 @@ func memBase(t http.RoundTripper) http.RoundTripper {
 	}
 	return markingTransport{base: t}
 }
-
-// memDaemon lets the measuring workflow have several looks in a row
-// (EAC_EVERY_SEC) instead of one an hour.
-func memDaemon(d *daemon.Daemon) {
-	envInt("EAC_EVERY_SEC", &memEverySec)
-	if memEverySec > 0 {
-		d.CheckEvery = time.Duration(memEverySec) * time.Second
-	}
-}
-
-var memEverySec int
