@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -134,8 +135,32 @@ func judgeBody(body []byte) (v Verdict, facts []PriceFact, readable bool) {
 	return judgeBodyDepth(body, 0)
 }
 
-// reFieldName: what the name of a form field looks like.
-var reFieldName = regexp.MustCompile(`^[\p{L}\p{N}_.\-\[\]:$ ]{1,100}$`)
+// isFieldName reports whether s looks like the name of a form field: one to
+// a hundred characters, each a letter, a digit or one of "_.-[]:$ ".
+//
+// (Written out by hand on purpose. As a regular expression,
+// `^[\p{L}\p{N}_.\-\[\]:$ ]{1,100}$`, it took almost four megabytes to
+// prepare and kept two of them, every time the program started, for a
+// check that is made during a claim only. A test holds the two to the same
+// answers.)
+func isFieldName(s string) bool {
+	n := 0
+	for _, r := range s {
+		if n++; n > 100 {
+			return false
+		}
+		switch r {
+		case '_', '.', '-', '[', ']', ':', '$', ' ':
+			continue
+		}
+		// (A byte that is not valid UTF-8 arrives here as U+FFFD, which
+		// is neither.)
+		if !unicode.IsLetter(r) && !unicode.IsNumber(r) {
+			return false
+		}
+	}
+	return n >= 1
+}
 
 // lastSegment reduces a form field's name to its last part: "order[total]"
 // and "order.total" are both "total".
@@ -201,7 +226,7 @@ func judgeBodyDepth(body []byte, depth int) (v Verdict, facts []PriceFact, reada
 	}
 	keys := make([]string, 0, len(vals))
 	for k := range vals {
-		if !reFieldName.MatchString(k) {
+		if !isFieldName(k) {
 			return Unknown, nil, false
 		}
 		keys = append(keys, k)

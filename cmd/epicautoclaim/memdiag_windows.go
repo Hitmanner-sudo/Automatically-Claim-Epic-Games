@@ -14,7 +14,6 @@ import (
 	"net/http/httptrace"
 	"os"
 	"runtime"
-	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -83,11 +82,14 @@ func memMark(logf func(string, ...any), label string) {
 	}
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-	logf("mem %-22s ws=%s privateWS=%s peakWS=%s commit=%s | go: mapped=%.1f heapInuse=%.1f heapIdle-released=%.1f stacks=%.1f gcSys=%.1f other=%.1f numGC=%d | goroutines=%d threads=%d procs=%d modules=%d",
+	// (No runtime/pprof here: with it in the program the runtime keeps a
+	// table for memory profiling, 1.4 MB that a released build does not have.)
+	logf("mem %-22s ws=%s privateWS=%s peakWS=%s commit=%s | go: mapped=%.1f heapInuse=%.1f heapIdle-released=%.1f stacks=%.1f gcSys=%.1f spans+caches=%.1f profiling=%.1f other=%.1f totalAlloc=%.1f numGC=%d | goroutines=%d procs=%d modules=%d",
 		label, mb(c.workingSetSize), private, mb(c.peakWorkingSetSize), mb(c.privateUsage),
 		float64(m.Sys-m.HeapReleased)/(1<<20), float64(m.HeapInuse)/(1<<20), float64(m.HeapIdle-m.HeapReleased)/(1<<20),
-		float64(m.StackSys)/(1<<20), float64(m.GCSys)/(1<<20), float64(m.MSpanSys+m.MCacheSys+m.BuckHashSys+m.OtherSys)/(1<<20), m.NumGC,
-		runtime.NumGoroutine(), pprof.Lookup("threadcreate").Count(), runtime.GOMAXPROCS(0), len(modules()))
+		float64(m.StackSys)/(1<<20), float64(m.GCSys)/(1<<20), float64(m.MSpanSys+m.MCacheSys)/(1<<20), float64(m.BuckHashSys)/(1<<20), float64(m.OtherSys)/(1<<20),
+		float64(m.TotalAlloc)/(1<<20), m.NumGC,
+		runtime.NumGoroutine(), runtime.GOMAXPROCS(0), len(modules()))
 	if strings.HasPrefix(label, "end") {
 		logf("mem modules: %s", strings.Join(modules(), " "))
 	}

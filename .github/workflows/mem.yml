@@ -40,15 +40,12 @@ jobs:
           $log = Join-Path $data 'logs\EpicAutoClaim.log'
           $knobs = 'EAC_PROCS', 'EAC_HTTP', 'EAC_GC', 'EAC_LIMIT_MB'
           $variants = @(
-            @{ name = 'A: as 0.2.2 would on a PC with 24 processors'; env = @{ EAC_PROCS = '24'; EAC_HTTP = '0' } },
-            @{ name = 'B: as 0.2.2 on this machine';                  env = @{ EAC_PROCS = '0';  EAC_HTTP = '0' } },
-            @{ name = 'C: 2 processors';                              env = @{ EAC_PROCS = '2';  EAC_HTTP = '0' } },
-            @{ name = 'D: 1 processor';                               env = @{ EAC_PROCS = '1';  EAC_HTTP = '0' } },
-            @{ name = 'E: 2 processors, connection not kept';         env = @{ EAC_PROCS = '2';  EAC_HTTP = '1' } },
-            @{ name = 'F: 2 processors, HTTP/1.1';                    env = @{ EAC_PROCS = '2';  EAC_HTTP = '2' } },
-            @{ name = 'G: 2 processors, HTTP/1.1, gc 10, limit 16';   env = @{ EAC_PROCS = '2';  EAC_HTTP = '2'; EAC_GC = '10'; EAC_LIMIT_MB = '16' } },
-            @{ name = 'H: 1 processor, HTTP/1.1, gc 10, limit 16';    env = @{ EAC_PROCS = '1';  EAC_HTTP = '2'; EAC_GC = '10'; EAC_LIMIT_MB = '16' } },
-            @{ name = 'I: 24 processors, connection not kept';        env = @{ EAC_PROCS = '24'; EAC_HTTP = '1' } }
+            @{ name = 'A: as released (2 threads of its own, connection not kept)'; env = @{} },
+            @{ name = 'B: as released, on a PC with 24 processors left to the runtime'; env = @{ EAC_PROCS = '24' } },
+            @{ name = 'C: 1 thread of its own';                       env = @{ EAC_PROCS = '1' } },
+            @{ name = 'D: gc 10, limit 16';                           env = @{ EAC_GC = '10'; EAC_LIMIT_MB = '16' } },
+            @{ name = 'E: HTTP/1.1';                                  env = @{ EAC_HTTP = '2' } },
+            @{ name = 'F: connection kept (as any Go program)';       env = @{ EAC_HTTP = '0' } }
           )
           $table = @()
           foreach ($v in $variants) {
@@ -94,4 +91,4 @@ jobs:
           }
           ''
           '===== Summary (MB)'
-          $table | Format-Table -AutoSize | Out-String -Width 300
+          foreach ($r in $table) { ($r.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' | ' }
