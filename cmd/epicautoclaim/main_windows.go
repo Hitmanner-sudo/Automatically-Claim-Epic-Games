@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -153,6 +154,9 @@ type app struct {
 	// again: a manual run that goes through the checkout also for games
 	// the account already has (see claim.Options.Again).
 	again bool
+	// http is the client the free-games list is read with; nil means Go's
+	// default. (The background process brings a leaner one: see tuning.)
+	http *http.Client
 }
 
 func country(cfg config.Config) string {
@@ -205,7 +209,7 @@ func (a *app) runner() *runner.Runner {
 
 func (a *app) daemon() *daemon.Daemon {
 	d := &daemon.Daemon{
-		Feed:       &feed.Client{},
+		Feed:       &feed.Client{HTTP: a.http},
 		Claimer:    a.runner(),
 		State:      a.st,
 		Logf:       a.log.Printf,
@@ -408,15 +412,22 @@ func cmdRun(a *app, scheduled bool, afterPID uint32) int {
 	// processor, the disk and memory (Windows' "efficiency mode").
 	opt := daemon.RunOptions{Settle: holdOff, Waiting: func(waiting bool) {
 		if waiting {
+			memMark(a.log.Printf, "end of look")
 			debug.FreeOSMemory()
 		}
 		win.Background(waiting)
+		if waiting {
+			memMark(a.log.Printf, "asleep")
+		} else {
+			memMark(a.log.Printf, "woke")
+		}
 	}}
 	due := d.Due()
 	if scheduled {
 		keepTaskCurrent(a)
 	}
 	a.log.Printf("%s %s started%s; country %s; looking %s; next look %s", appName, version, mode, country(a.cfg), howOften(a.cfg), describeDue(due))
+	memMark(a.log.Printf, "started")
 	d.Run(ctx, opt)
 	a.log.Printf("stopped")
 	return 0
@@ -1045,13 +1056,14 @@ func main() {
 	// The background process: no console, no windows, only the log file.
 	if len(args) > 0 && args[0] == "run" {
 		// It has next to nothing to compute, so it is told to keep its own
-		// memory small rather than fast.
-		debug.SetGCPercent(25)
-		debug.SetMemoryLimit(48 << 20)
+		// memory small rather than fast (see tuning).
+		tune := daemonTuning()
+		tune.apply()
 		a, err := newApp(io.Discard, false)
 		if err != nil {
 			os.Exit(1)
 		}
+		a.http = tune.client()
 		scheduled := false
 		var afterPID uint32
 		for _, arg := range args[1:] {

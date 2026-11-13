@@ -7,6 +7,7 @@ on:
       - 'ci/egl-probe.ps1'
       - '.github/workflows/egl-probe.yml'
       - '.github/workflows/cef90.yml'
+      - '.github/workflows/mem.yml'
   pull_request:
   workflow_dispatch:
 

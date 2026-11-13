@@ -1,0 +1,97 @@
+name: Memory of the background process
+
+# Measures what the background process holds in memory while it looks at
+# the free-games list, and what it holds while it waits, in several
+# settings. Started by hand. It uses the "memdiag" build (never released),
+# which takes its tuning from the environment and writes memory figures
+# into its log at marked moments (cmd/epicautoclaim/memdiag_windows.go).
+#
+# The launcher is not installed here, so a look is: download the list, see
+# what is free, find no launcher, go back to waiting. That is what an
+# hourly look costs on a PC where everything free has been claimed already.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: Measure
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build (memdiag)
+        shell: pwsh
+        run: |
+          go build -tags memdiag -trimpath -ldflags "-H=windowsgui -s -w -X main.version=memdiag" -o mem/EpicAutoClaim.exe ./cmd/epicautoclaim
+          if ($LASTEXITCODE -ne 0) { throw 'build failed' }
+          "processors here: $([Environment]::ProcessorCount)"
+      - name: Measure
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'mem\EpicAutoClaim.exe'
+          $data = Join-Path $env:LOCALAPPDATA 'EpicAutoClaim'
+          $log = Join-Path $data 'logs\EpicAutoClaim.log'
+          $knobs = 'EAC_PROCS', 'EAC_HTTP', 'EAC_GC', 'EAC_LIMIT_MB'
+          $variants = @(
+            @{ name = 'A: as 0.2.2 would on a PC with 24 processors'; env = @{ EAC_PROCS = '24'; EAC_HTTP = '0' } },
+            @{ name = 'B: as 0.2.2 on this machine';                  env = @{ EAC_PROCS = '0';  EAC_HTTP = '0' } },
+            @{ name = 'C: 2 processors';                              env = @{ EAC_PROCS = '2';  EAC_HTTP = '0' } },
+            @{ name = 'D: 1 processor';                               env = @{ EAC_PROCS = '1';  EAC_HTTP = '0' } },
+            @{ name = 'E: 2 processors, connection not kept';         env = @{ EAC_PROCS = '2';  EAC_HTTP = '1' } },
+            @{ name = 'F: 2 processors, HTTP/1.1';                    env = @{ EAC_PROCS = '2';  EAC_HTTP = '2' } },
+            @{ name = 'G: 2 processors, HTTP/1.1, gc 10, limit 16';   env = @{ EAC_PROCS = '2';  EAC_HTTP = '2'; EAC_GC = '10'; EAC_LIMIT_MB = '16' } },
+            @{ name = 'H: 1 processor, HTTP/1.1, gc 10, limit 16';    env = @{ EAC_PROCS = '1';  EAC_HTTP = '2'; EAC_GC = '10'; EAC_LIMIT_MB = '16' } },
+            @{ name = 'I: 24 processors, connection not kept';        env = @{ EAC_PROCS = '24'; EAC_HTTP = '1' } }
+          )
+          $table = @()
+          foreach ($v in $variants) {
+            Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue
+            foreach ($k in $knobs) { Remove-Item "Env:$k" -ErrorAction SilentlyContinue }
+            foreach ($k in $v.env.Keys) { Set-Item "Env:$k" $v.env[$k] }
+            $p = Start-Process -FilePath $exe -ArgumentList 'run' -PassThru
+            $maxWs = 0; $maxCommit = 0
+            $deadline = (Get-Date).AddSeconds(40)
+            while ((Get-Date) -lt $deadline) {
+              $p.Refresh()
+              if ($p.HasExited) { break }
+              $maxWs = [math]::Max($maxWs, $p.WorkingSet64)
+              $maxCommit = [math]::Max($maxCommit, $p.PrivateMemorySize64)
+              if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'mem asleep' -Quiet)) { break }
+              Start-Sleep -Milliseconds 40
+            }
+            Start-Sleep -Seconds 4
+            $p.Refresh()
+            $asleepWs = if ($p.HasExited) { -1 } else { $p.WorkingSet64 }
+            $asleepPrivate = -1
+            $raw = Get-CimInstance Win32_PerfRawData_PerfProc_Process -Filter "IDProcess=$($p.Id)" -ErrorAction SilentlyContinue
+            if ($raw) { $asleepPrivate = $raw.WorkingSetPrivate }
+            ''
+            "===== $($v.name)"
+            if (Test-Path $log) { Get-Content $log } else { 'no log was written' }
+            $end = if (Test-Path $log) { Select-String -Path $log -Pattern 'mem end of look\s+ws=(\S+) privateWS=(\S+) peakWS=(\S+) commit=(\S+) \| go: mapped=(\S+)' | Select-Object -Last 1 } else { $null }
+            $row = [ordered]@{ variant = $v.name }
+            if ($end) {
+              $g = $end.Matches[0].Groups
+              $row['end of look: private WS'] = $g[2].Value
+              $row['WS'] = $g[1].Value
+              $row['peak WS'] = $g[3].Value
+              $row['commit'] = $g[4].Value
+              $row['Go mapped'] = $g[5].Value
+            }
+            $row['sampled max WS'] = '{0:N1}' -f ($maxWs / 1MB)
+            $row['asleep WS'] = '{0:N1}' -f ($asleepWs / 1MB)
+            $row['asleep private WS'] = '{0:N1}' -f ($asleepPrivate / 1MB)
+            $table += [pscustomobject]$row
+            Start-Process -FilePath $exe -ArgumentList 'stop' -Wait
+            if (-not $p.WaitForExit(20000)) { Stop-Process -Id $p.Id -Force; 'the process had to be ended' }
+          }
+          ''
+          '===== Summary (MB)'
+          $table | Format-Table -AutoSize | Out-String -Width 300
