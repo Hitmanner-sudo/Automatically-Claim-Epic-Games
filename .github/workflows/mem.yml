@@ -31,6 +31,12 @@ jobs:
         run: |
           go build -tags memdiag -trimpath -ldflags "-H=windowsgui -s -w -X main.version=memdiag" -o mem/EpicAutoClaim.exe ./cmd/epicautoclaim
           if ($LASTEXITCODE -ne 0) { throw 'build failed' }
+          # The same with the garbage collector of before Go 1.26, to see
+          # what the new one costs or saves a program this small.
+          $env:GOEXPERIMENT = 'nogreenteagc'
+          go build -tags memdiag -trimpath -ldflags "-H=windowsgui -s -w -X main.version=memdiag-oldgc" -o mem-oldgc/EpicAutoClaim.exe ./cmd/epicautoclaim
+          if ($LASTEXITCODE -ne 0) { 'the build with the older collector failed; it is left out' }
+          Remove-Item Env:GOEXPERIMENT
           "processors here: $([Environment]::ProcessorCount)"
       - name: Measure
         shell: pwsh
@@ -40,18 +46,22 @@ jobs:
           $log = Join-Path $data 'logs\EpicAutoClaim.log'
           $knobs = 'EAC_PROCS', 'EAC_HTTP', 'EAC_GC', 'EAC_LIMIT_MB'
           $variants = @(
-            @{ name = 'A: as released (2 threads of its own, connection not kept)'; env = @{} },
-            @{ name = 'B: as released, on a PC with 24 processors left to the runtime'; env = @{ EAC_PROCS = '24' } },
-            @{ name = 'C: 1 thread of its own';                       env = @{ EAC_PROCS = '1' } },
-            @{ name = 'D: gc 10, limit 16';                           env = @{ EAC_GC = '10'; EAC_LIMIT_MB = '16' } },
-            @{ name = 'E: HTTP/1.1';                                  env = @{ EAC_HTTP = '2' } },
-            @{ name = 'F: connection kept (as any Go program)';       env = @{ EAC_HTTP = '0' } }
+            @{ name = 'A: as released (gc 25)';        env = @{} },
+            @{ name = 'B: gc 100';                     env = @{ EAC_GC = '100' } },
+            @{ name = 'C: gc 200';                     env = @{ EAC_GC = '200' } },
+            @{ name = 'D: gc 400';                     env = @{ EAC_GC = '400' } },
+            @{ name = 'E: as released, older collector'; exe = 'mem-oldgc'; env = @{} },
+            @{ name = 'F: gc 200, older collector';    exe = 'mem-oldgc'; env = @{ EAC_GC = '200' } },
+            @{ name = 'G: as released, again';         env = @{} }
           )
           $table = @()
           foreach ($v in $variants) {
             Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue
             foreach ($k in $knobs) { Remove-Item "Env:$k" -ErrorAction SilentlyContinue }
             foreach ($k in $v.env.Keys) { Set-Item "Env:$k" $v.env[$k] }
+            $exe = Join-Path $PWD 'mem\EpicAutoClaim.exe'
+            if ($v.exe) { $exe = Join-Path $PWD "$($v.exe)\EpicAutoClaim.exe" }
+            if (-not (Test-Path $exe)) { "===== $($v.name): not built, left out"; continue }
             $p = Start-Process -FilePath $exe -ArgumentList 'run' -PassThru
             $maxWs = 0; $maxCommit = 0
             $deadline = (Get-Date).AddSeconds(40)
