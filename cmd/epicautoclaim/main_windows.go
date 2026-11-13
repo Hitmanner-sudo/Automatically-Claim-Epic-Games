@@ -421,11 +421,17 @@ func cmdRun(a *app, scheduled bool, afterPID uint32) int {
 		if waiting {
 			memMark(a.log.Printf, "end of look")
 			debug.FreeOSMemory()
+		} else {
+			// Out of the background first: waking collects (see resting),
+			// and that should not run at the lowest priority.
+			win.Background(false)
 		}
 		if a.tune != nil && memRestingAllowed() {
 			a.tune.resting(waiting)
 		}
-		win.Background(waiting)
+		if waiting {
+			win.Background(true)
+		}
 		if waiting {
 			memMark(a.log.Printf, "asleep")
 		} else {

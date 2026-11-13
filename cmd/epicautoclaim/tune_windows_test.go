@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"runtime"
 	"runtime/debug"
 	"sync/atomic"
 	"testing"
@@ -157,8 +158,16 @@ func TestNothingIsCollectedWhileTheProgramWaits(t *testing.T) {
 		t.Fatalf("handed back %d time(s) into the wait, want 2", got)
 	}
 
-	// Waking for a look: on again, at the pace of the looks.
+	// Waking for a look: one collection at once (the runtime's own would
+	// be overdue and come at some moment of the look), then on again at
+	// the pace of the looks.
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
 	tune.resting(false)
+	runtime.ReadMemStats(&after)
+	if after.NumGC == before.NumGC {
+		t.Fatal("waking for a look did not collect")
+	}
 	if got := gcPercent(); got != 100 {
 		t.Fatalf("for a look the collector is at %d, want 100", got)
 	}

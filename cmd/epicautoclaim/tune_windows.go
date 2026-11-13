@@ -37,17 +37,19 @@ import (
 //     before any of this was measured;
 //   - handing the working set back at the stages of a look (see below):
 //     the most the process has in memory at once during a look goes from
-//     20 MB to under 12, of its own from 7.3 to under 5;
+//     23 MB to under 12, of its own from 7.7 to 5;
 //   - no garbage collection while the program waits (see resting): the Go
 //     runtime otherwise runs one every two minutes whether or not there is
-//     anything to collect, and each brings some 2 MB of the program's own
-//     back into memory, where they stay until the next look;
+//     anything to collect, and each brings some 3 MB of the program's own
+//     back into memory, where they stay until the next look (measured two
+//     and a half minutes into a wait: 3.7 MB of its own with it, 0.8
+//     without);
 //   - how the list is downloaded (connection kept or not, HTTP/2 or 1.1)
 //     made no difference, so that is left as Go does it.
 //
 // What a look still costs is the secure connection: for the tenth of a
 // second it takes, Go's cryptography and Windows' certificate check need
-// about 10 MB at once, 4.5 of them the program's own.
+// about 11 MB at once, 5 of them the program's own.
 //
 // Looked into and left alone:
 //
@@ -144,7 +146,7 @@ var trimNow = win.TrimWorkingSet
 // and of Windows in memory: looking the server's name up and connecting;
 // setting up the secure connection, which has Windows check the server's
 // certificate; reading and understanding the answer; and deciding what to
-// do about it. Measured, they need 8, 11, and 7 MB; left to pile up, 20.
+// do about it. Measured, they need 8, 11, and 7 MB; left to pile up, 23.
 // So at the end of each stage the program hands back to Windows everything
 // it holds (as it does when it goes back to waiting): what the next stage
 // needs is back at the first touch, and what it does not need is no longer
@@ -209,7 +211,7 @@ func (t *tuning) duringLooks(f daemon.Feed) daemon.Feed {
 //
 // While it waits there is nothing to collect, but the Go runtime starts a
 // garbage collection every two minutes all the same, and a collection walks
-// through the program's data: some 2 MB that were handed back to Windows
+// through the program's data: some 3 MB that were handed back to Windows
 // are in memory again two minutes after every look, and stay. So the
 // collector is switched off for the wait (the memory limit stays in force)
 // and on again for the look.
@@ -226,6 +228,12 @@ func (t *tuning) resting(on bool) {
 	}
 	t.restTrims = nil
 	if !on {
+		// The runtime's two-minute collection is overdue the moment the
+		// collector is back on, and would start at some moment of the
+		// look. Have it now, while the collector is still off (so that
+		// the two cannot overlap): the look's first stage hands back
+		// what it touched.
+		runtime.GC()
 		debug.SetGCPercent(t.gcPercent)
 		return
 	}
