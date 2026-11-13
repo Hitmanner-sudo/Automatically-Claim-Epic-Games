@@ -11,6 +11,7 @@ import (
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/claim"
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/daemon"
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/feed"
+	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/win"
 )
 
 // tuning is how the background process keeps itself small. It has next to
@@ -48,6 +49,9 @@ type tuning struct {
 	// claimGCPercent is the garbage collector's pace while a claim
 	// session runs.
 	claimGCPercent int
+	// wsCap is a hard limit on the working set outside claim sessions, in
+	// bytes (0: none). See win.CapWorkingSet.
+	wsCap int64
 }
 
 // daemonTuning is what the background process runs with.
@@ -66,23 +70,32 @@ func (t tuning) apply() {
 	}
 	debug.SetGCPercent(t.gcPercent)
 	debug.SetMemoryLimit(t.limit)
+	if t.wsCap > 0 {
+		_ = win.CapWorkingSet(uintptr(t.wsCap))
+	}
 }
 
 // duringClaims wraps what carries out the claim sessions so that they run
 // at the claim pace of the garbage collector, and the pace of the looks is
 // put back afterwards.
 func (t tuning) duringClaims(c daemon.Claimer) daemon.Claimer {
-	return pacedClaimer{Claimer: c, percent: t.claimGCPercent}
+	return pacedClaimer{Claimer: c, percent: t.claimGCPercent, wsCap: t.wsCap}
 }
 
 type pacedClaimer struct {
 	daemon.Claimer
 	percent int
+	wsCap   int64
 }
 
 func (p pacedClaimer) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]claim.Result, error) {
 	old := debug.SetGCPercent(p.percent)
 	defer debug.SetGCPercent(old)
+	if p.wsCap > 0 {
+		// A claim is real work against the clock: no limit meanwhile.
+		_ = win.CapWorkingSet(0)
+		defer func() { _ = win.CapWorkingSet(uintptr(p.wsCap)) }()
+	}
 	return p.Claimer.ClaimAll(ctx, offers)
 }
 

@@ -143,7 +143,7 @@ jobs:
             # that costs most: its figure says nothing about a real look.
             $downloaded = -not (Select-String -Path $log -Pattern 'could not read the free-games list' -Quiet)
             function Own([string]$label) {
-              $m = Select-String -Path $log -Pattern ('mem ' + $label + '\s+ws=\S+ privateWS=([0-9.]+)') | Select-Object -Last 1
+              $m = Select-String -Path $log -Pattern ('mem ' + $label + '\s+.*? ws=\S+ privateWS=([0-9.]+)') | Select-Object -Last 1
               if (-not $m) { throw "the log has no '$label' line with the memory of the process's own" }
               [double]$m.Matches[0].Groups[1].Value
             }

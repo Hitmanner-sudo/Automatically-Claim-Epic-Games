@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -33,6 +34,9 @@ func memKnobs(t *tuning) {
 	envInt("EAC_PROCS", &t.procs) // 0: leave it to the runtime (or GOMAXPROCS)
 	envInt("EAC_GC", &t.gcPercent)
 	envInt("EAC_CLAIM_GC", &t.claimGCPercent)
+	capKB := int(t.wsCap >> 10)
+	envInt("EAC_WSCAP_KB", &capKB)
+	t.wsCap = int64(capKB) << 10
 	mb := int(t.limit >> 20)
 	envInt("EAC_LIMIT_MB", &mb)
 	t.limit = int64(mb) << 20
@@ -54,6 +58,9 @@ type processMemoryCountersEx2 struct {
 	privateWorkingSetSize      uintptr
 	sharedCommitUsage          uint64
 }
+
+// memStart is when the program started, near enough.
+var memStart = time.Now()
 
 var (
 	procK32GetProcessMemoryInfo = windows.NewLazySystemDLL("kernel32.dll").NewProc("K32GetProcessMemoryInfo")
@@ -84,8 +91,8 @@ func memMark(logf func(string, ...any), label string) {
 	runtime.ReadMemStats(&m)
 	// (No runtime/pprof here: with it in the program the runtime keeps a
 	// table for memory profiling, 1.4 MB that a released build does not have.)
-	logf("mem %-22s ws=%s privateWS=%s peakWS=%s commit=%s | go: mapped=%.1f heapInuse=%.1f heapIdle-released=%.1f stacks=%.1f gcSys=%.1f spans+caches=%.1f profiling=%.1f other=%.1f totalAlloc=%.1f numGC=%d | goroutines=%d procs=%d modules=%d",
-		label, mb(c.workingSetSize), private, mb(c.peakWorkingSetSize), mb(c.privateUsage),
+	logf("mem %-22s t=%dms faults=%d ws=%s privateWS=%s peakWS=%s commit=%s | go: mapped=%.1f heapInuse=%.1f heapIdle-released=%.1f stacks=%.1f gcSys=%.1f spans+caches=%.1f profiling=%.1f other=%.1f totalAlloc=%.1f numGC=%d | goroutines=%d procs=%d modules=%d",
+		label, time.Since(memStart).Milliseconds(), c.pageFaultCount, mb(c.workingSetSize), private, mb(c.peakWorkingSetSize), mb(c.privateUsage),
 		float64(m.Sys-m.HeapReleased)/(1<<20), float64(m.HeapInuse)/(1<<20), float64(m.HeapIdle-m.HeapReleased)/(1<<20),
 		float64(m.StackSys)/(1<<20), float64(m.GCSys)/(1<<20), float64(m.MSpanSys+m.MCacheSys)/(1<<20), float64(m.BuckHashSys)/(1<<20), float64(m.OtherSys)/(1<<20),
 		float64(m.TotalAlloc)/(1<<20), m.NumGC,
@@ -151,7 +158,7 @@ func (t markingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func memClient(c *http.Client) *http.Client {
 	if c == nil {
-		c = &http.Client{Timeout: 30 * 1e9, Transport: http.DefaultTransport}
+		c = &http.Client{Timeout: 30 * time.Second, Transport: http.DefaultTransport}
 	}
 	c.Transport = markingTransport{base: c.Transport}
 	return c

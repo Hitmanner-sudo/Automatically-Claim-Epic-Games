@@ -38,12 +38,15 @@ jobs:
           $exe = Join-Path $PWD 'mem\EpicAutoClaim.exe'
           $data = Join-Path $env:LOCALAPPDATA 'EpicAutoClaim'
           $log = Join-Path $data 'logs\EpicAutoClaim.log'
-          $knobs = 'EAC_PROCS', 'EAC_GC', 'EAC_LIMIT_MB'
+          $knobs = 'EAC_PROCS', 'EAC_GC', 'EAC_LIMIT_MB', 'EAC_CLAIM_GC', 'EAC_WSCAP_KB'
           $variants = @(
-            @{ name = 'A: as released';                               env = @{} },
-            @{ name = 'B: one thread per processor, as on a PC with 24'; env = @{ EAC_PROCS = '24' } },
-            @{ name = 'C: garbage collector at 25';                   env = @{ EAC_GC = '25' } },
-            @{ name = 'D: as released, again';                        env = @{} }
+            @{ name = 'A: as released';                 env = @{} },
+            @{ name = 'B: working set capped at 12 MB'; env = @{ EAC_WSCAP_KB = '12288' } },
+            @{ name = 'C: capped at 8 MB';              env = @{ EAC_WSCAP_KB = '8192' } },
+            @{ name = 'D: capped at 6 MB';              env = @{ EAC_WSCAP_KB = '6144' } },
+            @{ name = 'E: capped at 4 MB';              env = @{ EAC_WSCAP_KB = '4096' } },
+            @{ name = 'F: capped at 2 MB';              env = @{ EAC_WSCAP_KB = '2048' } },
+            @{ name = 'G: as released, again';          env = @{} }
           )
           $table = @()
           foreach ($v in $variants) {
@@ -81,15 +84,17 @@ jobs:
             ''
             "===== $($v.name)"
             if (Test-Path $log) { Get-Content $log } else { 'no log was written' }
-            $end = if (Test-Path $log) { Select-String -Path $log -Pattern 'mem end of look\s+ws=(\S+) privateWS=(\S+) peakWS=(\S+) commit=(\S+) \| go: mapped=(\S+)' | Select-Object -Last 1 } else { $null }
+            $end = if (Test-Path $log) { Select-String -Path $log -Pattern 'mem end of look\s+t=(\d+)ms faults=(\d+) ws=(\S+) privateWS=(\S+) peakWS=(\S+) commit=(\S+) \| go: mapped=(\S+)' | Select-Object -Last 1 } else { $null }
             $row = [ordered]@{ variant = $v.name }
             if ($end) {
               $g = $end.Matches[0].Groups
-              $row['end of look: private WS'] = $g[2].Value
-              $row['WS'] = $g[1].Value
-              $row['peak WS'] = $g[3].Value
-              $row['commit'] = $g[4].Value
-              $row['Go mapped'] = $g[5].Value
+              $row['end of look: private WS'] = $g[4].Value
+              $row['WS'] = $g[3].Value
+              $row['peak WS'] = $g[5].Value
+              $row['commit'] = $g[6].Value
+              $row['Go mapped'] = $g[7].Value
+              $row['ms since start'] = $g[1].Value
+              $row['page faults'] = $g[2].Value
             }
             $row['sampled max WS'] = '{0:N1}' -f ($maxWs / 1MB)
             $row['asleep WS'] = '{0:N1}' -f ($asleepWs / 1MB)

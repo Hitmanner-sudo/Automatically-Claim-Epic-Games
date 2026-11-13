@@ -728,6 +728,34 @@ func Background(on bool) {
 	}
 }
 
+// CapWorkingSet puts a hard upper limit on how much memory this process
+// may have in use at any one moment (its working set); 0 lifts the limit.
+// What the process touches beyond the limit, Windows takes out of its
+// working set again at once; it stays where Windows can hand it back
+// quickly or give it to someone else. For a program that is in no hurry
+// this costs a few page faults and nothing else.
+func CapWorkingSet(max uintptr) error {
+	const (
+		hardMinDisable = 0x2 // QUOTA_LIMITS_HARDWS_MIN_DISABLE
+		hardMaxEnable  = 0x4 // QUOTA_LIMITS_HARDWS_MAX_ENABLE
+		hardMaxDisable = 0x8 // QUOTA_LIMITS_HARDWS_MAX_DISABLE
+		page           = 4096
+		// Windows' own defaults, for when the limit is lifted.
+		defaultMin = 50 * page
+		defaultMax = 345 * page
+		// The least Windows accepts as a minimum.
+		leastMin = 20 * page
+	)
+	h := windows.CurrentProcess()
+	if max == 0 {
+		return windows.SetProcessWorkingSetSizeEx(h, defaultMin, defaultMax, hardMinDisable|hardMaxDisable)
+	}
+	if max < 2*leastMin {
+		max = 2 * leastMin
+	}
+	return windows.SetProcessWorkingSetSizeEx(h, leastMin, max, hardMinDisable|hardMaxEnable)
+}
+
 // LockHeld reports whether some process holds the named single-instance
 // lock, without creating it. A lock that exists but may not be opened (its
 // holder runs with higher rights) counts as held.
