@@ -52,14 +52,25 @@ jobs:
             foreach ($k in $v.env.Keys) { Set-Item "Env:$k" $v.env[$k] }
             $p = Start-Process -FilePath $exe -ArgumentList 'run' -PassThru
             $maxWs = 0; $maxCommit = 0
-            $deadline = (Get-Date).AddSeconds(40)
+            # (Started within two minutes of this machine's sign-in, the
+            # program first waits those out, as it does on a PC. A look is
+            # over when it has said when it will look next and has gone
+            # back to waiting after that.)
+            $deadline = (Get-Date).AddSeconds(240)
             while ((Get-Date) -lt $deadline) {
               $p.Refresh()
               if ($p.HasExited) { break }
               $maxWs = [math]::Max($maxWs, $p.WorkingSet64)
               $maxCommit = [math]::Max($maxCommit, $p.PrivateMemorySize64)
-              if ((Test-Path $log) -and (Select-String -Path $log -Pattern 'mem asleep' -Quiet)) { break }
-              Start-Sleep -Milliseconds 40
+              if (Test-Path $log) {
+                $lines = @(Get-Content $log)
+                $said = -1
+                for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match ' next check ') { $said = $i } }
+                $over = $false
+                if ($said -ge 0) { for ($i = $said + 1; $i -lt $lines.Count; $i++) { if ($lines[$i] -match ' mem asleep ') { $over = $true } } }
+                if ($over) { break }
+              }
+              Start-Sleep -Milliseconds 60
             }
             Start-Sleep -Seconds 4
             $p.Refresh()

@@ -122,10 +122,23 @@ jobs:
           Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue
           $p = Start-Process -FilePath $exe -ArgumentList 'run' -PassThru
           try {
-            $deadline = (Get-Date).AddSeconds(90)
-            while ((Get-Date) -lt $deadline -and -not ((Test-Path $log) -and (Select-String -Path $log -Pattern 'mem asleep' -Quiet))) { Start-Sleep -Milliseconds 200 }
+            # A look is over when the program has said when it will look next
+            # and has gone back to waiting after that. (Started within two
+            # minutes of this machine's sign-in, the program first waits
+            # those out, as it does on a PC: that wait is not a look.)
+            function LookIsOver {
+              if (-not (Test-Path $log)) { return $false }
+              $lines = @(Get-Content $log)
+              $said = -1
+              for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match ' next check ') { $said = $i } }
+              if ($said -lt 0) { return $false }
+              for ($i = $said + 1; $i -lt $lines.Count; $i++) { if ($lines[$i] -match ' mem asleep ') { return $true } }
+              return $false
+            }
+            $deadline = (Get-Date).AddSeconds(240)
+            while ((Get-Date) -lt $deadline -and -not (LookIsOver)) { Start-Sleep -Milliseconds 300 }
             if (Test-Path $log) { Get-Content $log } else { throw 'the measuring build wrote no log' }
-            if (-not (Select-String -Path $log -Pattern 'mem asleep' -Quiet)) { throw 'the look was not over after 90 seconds (see the log above; a list that cannot be downloaded is tried for up to three minutes), so nothing was measured' }
+            if (-not (LookIsOver)) { throw 'no look was over after four minutes (see the log above; a list that cannot be downloaded is tried for up to three minutes), so nothing was measured' }
             # A look that could not download the list did not do the part
             # that costs most: its figure says nothing about a real look.
             $downloaded = -not (Select-String -Path $log -Pattern 'could not read the free-games list' -Quiet)
