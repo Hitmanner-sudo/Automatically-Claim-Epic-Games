@@ -155,9 +155,8 @@ type app struct {
 	// the account already has (see claim.Options.Again).
 	again bool
 	// http is the client the free-games list is read with; nil means Go's
-	// default. The background process brings its own, which reads the list
-	// the same way and hands memory back between the stages: see
-	// tuning.client.
+	// default, which is what a normal build uses. (Only the measuring build
+	// sets one, to mark the stages of a download: see tuning.client.)
 	http *http.Client
 	// tune is set in the background process only: see tuning.
 	tune *tuning
@@ -422,6 +421,9 @@ func cmdRun(a *app, scheduled bool, afterPID uint32) int {
 		if waiting {
 			memMark(a.log.Printf, "end of look")
 			debug.FreeOSMemory()
+		}
+		if a.tune != nil && memRestingAllowed() {
+			a.tune.resting(waiting)
 		}
 		win.Background(waiting)
 		if waiting {

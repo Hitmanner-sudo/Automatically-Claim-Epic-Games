@@ -4,10 +4,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http"
 	"net/http/httptrace"
 	"runtime"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/claim"
@@ -34,8 +36,12 @@ import (
 //     a failed claim saves its page). So claims run at 25, as they did
 //     before any of this was measured;
 //   - handing the working set back at the stages of a look (see below):
-//     the most the process ever has in memory at once goes from 20 MB to
-//     under 12, of its own from 7.3 to under 5;
+//     the most the process has in memory at once during a look goes from
+//     20 MB to under 12, of its own from 7.3 to under 5;
+//   - no garbage collection while the program waits (see resting): the Go
+//     runtime otherwise runs one every two minutes whether or not there is
+//     anything to collect, and each brings some 2 MB of the program's own
+//     back into memory, where they stay until the next look;
 //   - how the list is downloaded (connection kept or not, HTTP/2 or 1.1)
 //     made no difference, so that is left as Go does it.
 //
@@ -62,7 +68,17 @@ import (
 //     second was tried): no better than the stages on a PC with memory to
 //     spare, and on one without, every time is a chance that what was
 //     handed back has to be read from the disk again. The stages are a
-//     fixed handful per look.
+//     fixed handful per look;
+//   - learning the program's folder from the environment instead of from
+//     Windows' shell, which loads a dozen libraries of the shell and the
+//     window system at start: 3 MB less in memory for the first instant
+//     after starting and nothing after it (the stages hand them back),
+//     against the folder then depending on the console a command was
+//     typed in;
+//   - building against the frozen cryptography module (GOFIPS140=v1.0.0)
+//     to be rid of a 32 MB buffer in Go 1.26's own that is set aside and
+//     never touched: it shows in "commit size" only, occupies nothing,
+//     and Go itself is about to stop setting it aside.
 type tuning struct {
 	// procs is how many threads may run the program's own code at a time
 	// (0: as many as the PC has processors).
@@ -76,8 +92,12 @@ type tuning struct {
 	// session runs.
 	claimGCPercent int
 	// stages: hand the working set back to Windows at the stages of a look
-	// (see stagedTransport and stagedFeed).
+	// (see lookTrace and stagedFeed) and as the program settles down to
+	// wait (see resting).
 	stages bool
+
+	restMu    sync.Mutex
+	restTrims []*time.Timer
 }
 
 // daemonTuning is what the background process runs with.
@@ -135,34 +155,43 @@ var trimNow = win.TrimWorkingSet
 // the secure connection needs at once, a look took four seconds and a
 // million and a half page faults instead of a fifth of a second).
 
-// stagedTransport hands the working set back before each wait on the
-// network: before the server's name is looked up, before the connection is
-// made, when the request has been sent (the secure connection was set up
-// just before; the wait for the answer is the longest part of a look), and
-// when the first byte of the answer is in. A try that fails ends with it
-// too: a pause follows before the next.
-type stagedTransport struct{ base http.RoundTripper }
-
-func (s stagedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	trace := &httptrace.ClientTrace{
-		DNSStart:             func(httptrace.DNSStartInfo) { trimNow() },
-		ConnectStart:         func(string, string) { trimNow() },
-		WroteRequest:         func(httptrace.WroteRequestInfo) { trimNow() },
-		GotFirstResponseByte: func() { trimNow() },
-	}
-	res, err := s.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
-	if err != nil {
-		trimNow()
-	}
-	return res, err
+// lookTrace hands the working set back before each wait on the network:
+// before the server's name is looked up, before the connection is made,
+// when the request has been sent (the secure connection was set up just
+// before; the wait for the answer is the longest part of a look), and when
+// the first byte of the answer is in. A step that fails hands back too: a
+// pause follows before the next try.
+//
+// It rides on the context of the look, so the list is downloaded by the
+// very client, with the very transport, that every other command uses.
+var lookTrace = &httptrace.ClientTrace{
+	DNSStart: func(httptrace.DNSStartInfo) { trimNow() },
+	DNSDone: func(i httptrace.DNSDoneInfo) {
+		if i.Err != nil {
+			trimNow()
+		}
+	},
+	ConnectStart: func(string, string) { trimNow() },
+	ConnectDone: func(_, _ string, err error) {
+		if err != nil {
+			trimNow()
+		}
+	},
+	TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+		if err != nil {
+			trimNow()
+		}
+	},
+	WroteRequest:         func(httptrace.WroteRequestInfo) { trimNow() },
+	GotFirstResponseByte: func() { trimNow() },
 }
 
-// stagedFeed hands the working set back between reading the list and
-// acting on it.
+// stagedFeed reads the list with lookTrace, and hands the working set back
+// once more between reading the list and acting on it.
 type stagedFeed struct{ daemon.Feed }
 
 func (f stagedFeed) Fetch(ctx context.Context, country, locale string, now time.Time) (feed.Snapshot, error) {
-	snap, err := f.Feed.Fetch(ctx, country, locale, now)
+	snap, err := f.Feed.Fetch(httptrace.WithClientTrace(ctx, lookTrace), country, locale, now)
 	trimNow()
 	return snap, err
 }
@@ -175,20 +204,44 @@ func (t *tuning) duringLooks(f daemon.Feed) daemon.Feed {
 	return stagedFeed{f}
 }
 
-// client is the HTTP client the list is read with. Without stages it is
-// Go's own (nil); with them, Go's own transport with the stages marked.
-// (The measuring build puts its marks inside, so that each is made before
-// the working set is handed back.)
-func (t *tuning) client() *http.Client {
-	base := memBase(nil)
-	if !t.stages {
-		if base == nil {
-			return nil
+// resting is told when the program goes back to waiting for the next look
+// and when it wakes for one.
+//
+// While it waits there is nothing to collect, but the Go runtime starts a
+// garbage collection every two minutes all the same, and a collection walks
+// through the program's data: some 2 MB that were handed back to Windows
+// are in memory again two minutes after every look, and stay. So the
+// collector is switched off for the wait (the memory limit stays in force)
+// and on again for the look.
+//
+// And what the program still touches while it settles down (the log, the
+// connection to Epic's server that Go keeps for a minute and a half and
+// then closes) is handed back a few seconds, and again two minutes, into
+// the wait.
+func (t *tuning) resting(on bool) {
+	t.restMu.Lock()
+	defer t.restMu.Unlock()
+	for _, tm := range t.restTrims {
+		tm.Stop()
+	}
+	t.restTrims = nil
+	if !on {
+		debug.SetGCPercent(t.gcPercent)
+		return
+	}
+	debug.SetGCPercent(-1)
+	if t.stages {
+		for _, after := range restTrimAfter {
+			t.restTrims = append(t.restTrims, time.AfterFunc(after, func() { trimNow() }))
 		}
-		return &http.Client{Transport: base, Timeout: 30 * time.Second}
 	}
-	if base == nil {
-		base = http.DefaultTransport
-	}
-	return &http.Client{Transport: stagedTransport{base: base}, Timeout: 30 * time.Second}
 }
+
+// restTrimAfter is how far into a wait the working set is handed back once
+// more (see resting).
+var restTrimAfter = []time.Duration{3 * time.Second, 2 * time.Minute}
+
+// client is the HTTP client the list is read with: nil, which is Go's own
+// with a time limit (see feed.Client), the same for every command. (Only
+// the measuring build brings one, to mark the stages of a download.)
+func (t *tuning) client() *http.Client { return memClient() }

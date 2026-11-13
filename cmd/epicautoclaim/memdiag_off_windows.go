@@ -11,4 +11,6 @@ func memKnobs(*tuning) {}
 
 func memMark(func(string, ...any), string) {}
 
-func memBase(t http.RoundTripper) http.RoundTripper { return t }
+func memClient() *http.Client { return nil }
+
+func memRestingAllowed() bool { return true }

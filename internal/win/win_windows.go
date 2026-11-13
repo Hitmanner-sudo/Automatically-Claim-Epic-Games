@@ -786,17 +786,6 @@ func MessageBox(title, text string, isError bool) {
 
 // LocalAppData returns %LOCALAPPDATA%.
 func LocalAppData() (string, error) {
-	// From the environment when it is there, as Go's own os.UserCacheDir
-	// does. Asking Windows' shell for the folder (SHGetKnownFolderPath)
-	// loads a dozen libraries of the shell and the window system into the
-	// process for good (shell32, combase, ole32, user32, gdi32 and more).
-	// A program without a window never needs them otherwise, and they
-	// then cost memory at every start and with every new thread.
-	if dir := os.Getenv("LOCALAPPDATA"); filepath.IsAbs(dir) {
-		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
-			return filepath.Clean(dir), nil
-		}
-	}
 	return windows.KnownFolderPath(windows.FOLDERID_LocalAppData, 0)
 }
 

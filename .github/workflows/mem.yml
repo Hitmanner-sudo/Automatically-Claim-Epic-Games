@@ -38,12 +38,12 @@ jobs:
           $exe = Join-Path $PWD 'mem\EpicAutoClaim.exe'
           $data = Join-Path $env:LOCALAPPDATA 'EpicAutoClaim'
           $log = Join-Path $data 'logs\EpicAutoClaim.log'
-          $knobs = 'EAC_PROCS', 'EAC_GC', 'EAC_LIMIT_MB', 'EAC_CLAIM_GC', 'EAC_STAGES'
+          $knobs = 'EAC_PROCS', 'EAC_GC', 'EAC_LIMIT_MB', 'EAC_CLAIM_GC', 'EAC_STAGES', 'EAC_REST_GC'
           $variants = @(
-            @{ name = 'A: as released (handed back at the stages)'; looks = 1; env = @{} },
-            @{ name = 'B: nothing handed back during a look';         looks = 1; env = @{ EAC_STAGES = '0' } },
-            @{ name = 'C: as released, again';                        looks = 1; env = @{} },
-            @{ name = 'D: as released, one thread per processor as on a PC with 24'; looks = 1; env = @{ EAC_PROCS = '24' } }
+            @{ name = 'A: as released, and two and a half minutes of waiting after the look'; idle = 150; env = @{} },
+            @{ name = 'B: the collector left on while waiting (as before)';                 idle = 150; env = @{ EAC_REST_GC = '1' } },
+            @{ name = 'C: nothing handed back during a look';                               idle = 0;   env = @{ EAC_STAGES = '0' } },
+            @{ name = 'D: as released, one thread per processor as on a PC with 24';        idle = 0;   env = @{ EAC_PROCS = '24' } }
           )
           $table = @()
           foreach ($v in $variants) {
@@ -66,7 +66,7 @@ jobs:
                 $lines = @(Get-Content $log)
                 $said = @(); for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match ' next check ') { $said += $i } }
                 $over = $false
-                if ($said.Count -ge $v.looks) { for ($i = $said[$v.looks - 1] + 1; $i -lt $lines.Count; $i++) { if ($lines[$i] -match ' mem asleep ') { $over = $true } } }
+                if ($said.Count -ge 1) { for ($i = $said[0] + 1; $i -lt $lines.Count; $i++) { if ($lines[$i] -match ' mem asleep ') { $over = $true } } }
                 if ($over) { break }
               }
               Start-Sleep -Milliseconds 60
@@ -77,6 +77,18 @@ jobs:
             $asleepPrivate = -1
             $raw = Get-CimInstance Win32_PerfRawData_PerfProc_Process -Filter "IDProcess=$($p.Id)" -ErrorAction SilentlyContinue
             if ($raw) { $asleepPrivate = $raw.WorkingSetPrivate }
+            # What it holds as the wait goes on (the Go runtime's two-minute
+            # collection would show after about 130 seconds).
+            $later = ''
+            if ($v.idle -gt 0) {
+              foreach ($at in 30, 90, $v.idle) {
+                Start-Sleep -Seconds ($at - $(if ($at -eq 30) { 4 } elseif ($at -eq 90) { 30 } else { 90 }))
+                $p.Refresh()
+                $raw = Get-CimInstance Win32_PerfRawData_PerfProc_Process -Filter "IDProcess=$($p.Id)" -ErrorAction SilentlyContinue
+                $pw = if ($raw) { '{0:N1}' -f ($raw.WorkingSetPrivate / 1MB) } else { '?' }
+                $later += " after ${at}s: {0:N1} in memory, $pw its own;" -f ($p.WorkingSet64 / 1MB)
+              }
+            }
             ''
             "===== $($v.name)"
             if (Test-Path $log) { Get-Content $log } else { 'no log was written' }
@@ -103,6 +115,7 @@ jobs:
             $row['sampled max WS'] = '{0:N1}' -f ($maxWs / 1MB)
             $row['asleep WS'] = '{0:N1}' -f ($asleepWs / 1MB)
             $row['asleep private WS'] = '{0:N1}' -f ($asleepPrivate / 1MB)
+            if ($later) { $row['waiting'] = $later }
             $table += [pscustomobject]$row
             Start-Process -FilePath $exe -ArgumentList 'stop' -Wait
             if (-not $p.WaitForExit(20000)) { Stop-Process -Id $p.Id -Force; 'the process had to be ended' }

@@ -42,6 +42,7 @@ func memKnobs(t *tuning) {
 	}
 	envInt("EAC_STAGES", &stages)
 	t.stages = stages != 0
+	envInt("EAC_REST_GC", &memRestGC)
 	mb := int(t.limit >> 20)
 	envInt("EAC_LIMIT_MB", &mb)
 	t.limit = int64(mb) << 20
@@ -63,6 +64,10 @@ type processMemoryCountersEx2 struct {
 	privateWorkingSetSize      uintptr
 	sharedCommitUsage          uint64
 }
+
+// memRestGC: 1 leaves the garbage collector on while the program waits, as
+// before, to measure what switching it off saves.
+var memRestGC int
 
 // memStart is when the program started, near enough.
 var memStart = time.Now()
@@ -162,10 +167,12 @@ func (t markingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return res, err
 }
 
-// memBase is the transport the list is read through, with the marks.
-func memBase(t http.RoundTripper) http.RoundTripper {
-	if t == nil {
-		t = http.DefaultTransport
-	}
-	return markingTransport{base: t}
+// memClient reads the list as feed.Client's own does, through a transport
+// that marks the stages. (The marks are made before the working set is
+// handed back at the same stage: a trace attached later runs first.)
+func memClient() *http.Client {
+	return &http.Client{Timeout: 30 * time.Second, Transport: markingTransport{base: http.DefaultTransport}}
 }
+
+// memRestingAllowed: see memRestGC.
+func memRestingAllowed() bool { return memRestGC == 0 }
