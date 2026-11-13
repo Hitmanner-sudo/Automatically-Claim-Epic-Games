@@ -40,7 +40,7 @@ jobs:
           $log = Join-Path $data 'logs\EpicAutoClaim.log'
           $knobs = 'EAC_PROCS', 'EAC_GC', 'EAC_LIMIT_MB', 'EAC_CLAIM_GC', 'EAC_STAGES'
           $variants = @(
-            @{ name = 'A: as released (handed back at the stages and four times a second)'; looks = 1; env = @{} },
+            @{ name = 'A: as released (handed back at the stages)'; looks = 1; env = @{} },
             @{ name = 'B: nothing handed back during a look';         looks = 1; env = @{ EAC_STAGES = '0' } },
             @{ name = 'C: as released, again';                        looks = 1; env = @{} },
             @{ name = 'D: as released, one thread per processor as on a PC with 24'; looks = 1; env = @{ EAC_PROCS = '24' } }

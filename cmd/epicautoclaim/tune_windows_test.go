@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime/debug"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -42,8 +43,9 @@ func TestMemoryIsHandedBackAtTheStagesOfADownload(t *testing.T) {
 	if string(body) != "{}" {
 		t.Fatalf("the download came through as %q", body)
 	}
-	// When the connection stood, when the request was sent, and when the
-	// first byte of the answer was in.
+	// Before connecting, when the request was sent, and when the first
+	// byte of the answer was in. (No name to look up: the server is
+	// addressed by number.)
 	if got := n.Load(); got < 3 {
 		t.Fatalf("handed back %d time(s) during a download, want at least 3", got)
 	}
@@ -72,54 +74,37 @@ func TestMemoryIsHandedBackAfterTheListIsRead(t *testing.T) {
 	}
 }
 
-type slowClaimer struct{ during func() }
-
-func (c slowClaimer) ClaimAll(context.Context, []feed.Offer) (map[string]claim.Result, error) {
-	c.during()
-	return nil, nil
+func TestAFailedTryEndsWithMemoryHandedBack(t *testing.T) {
+	n := countTrims(t)
+	c := &http.Client{Transport: stagedTransport{base: http.DefaultTransport}, Timeout: 5 * time.Second}
+	// Nothing listens there: the try fails, and a pause would follow.
+	if res, err := c.Get("http://127.0.0.1:1/"); err == nil {
+		res.Body.Close()
+		t.Skip("something answers on port 1 of this machine")
+	}
+	// Before connecting, and when the try had failed.
+	if got := n.Load(); got < 2 {
+		t.Fatalf("handed back %d time(s) around a failed try, want at least 2", got)
+	}
 }
 
-func TestTheTrimmerRunsOnlyDuringALookAndHoldsStillDuringAClaim(t *testing.T) {
-	n := countTrims(t)
-	tune := &tuning{stages: true, claimGCPercent: 25}
+type countingClaimer struct{ ran *bool }
 
-	// Not running: nothing is handed back.
-	time.Sleep(3 * lookTrimEvery)
-	if n.Load() != 0 {
-		t.Fatalf("handed back %d time(s) with no look in progress", n.Load())
+func (c countingClaimer) ClaimAll(context.Context, []feed.Offer) (map[string]claim.Result, error) {
+	*c.ran = true
+	return map[string]claim.Result{"k": {Outcome: claim.Claimed}}, nil
+}
+
+func TestAClaimSessionRunsAtItsOwnPaceAndThePaceOfTheLooksComesBack(t *testing.T) {
+	was := debug.SetGCPercent(100)
+	defer debug.SetGCPercent(was)
+	ran := false
+	tune := &tuning{claimGCPercent: 25}
+	res, err := tune.duringClaims(countingClaimer{&ran}).ClaimAll(context.Background(), nil)
+	if err != nil || !ran || res["k"].Outcome != claim.Claimed {
+		t.Fatalf("the claim session did not run or its results were lost: %v, %v", res, err)
 	}
-
-	// A look: several times a second. Beginning twice starts it once.
-	tune.looking(true)
-	tune.looking(true)
-	time.Sleep(4*lookTrimEvery + lookTrimEvery/2)
-	during := n.Load()
-	if during < 2 || during > 6 {
-		t.Fatalf("handed back %d time(s) in a look of %v, want about 4", during, 4*lookTrimEvery)
-	}
-
-	// A claim session inside the look: it holds still, and goes on after.
-	_, _ = tune.duringClaims(slowClaimer{during: func() {
-		time.Sleep(lookTrimEvery / 2) // (a tick that was under way)
-		before := n.Load()
-		time.Sleep(4 * lookTrimEvery)
-		if got := n.Load(); got != before {
-			t.Errorf("handed back %d time(s) during a claim session", got-before)
-		}
-	}}).ClaimAll(context.Background(), nil)
-	after := n.Load()
-	time.Sleep(3 * lookTrimEvery)
-	if n.Load() == after {
-		t.Error("nothing is handed back any more after the claim session")
-	}
-
-	// The look is over: it stops. Ending twice is harmless.
-	tune.looking(false)
-	tune.looking(false)
-	time.Sleep(lookTrimEvery / 2)
-	stopped := n.Load()
-	time.Sleep(3 * lookTrimEvery)
-	if n.Load() != stopped {
-		t.Fatalf("handed back %d more time(s) after the look was over", n.Load()-stopped)
+	if now := debug.SetGCPercent(100); now != 100 {
+		t.Fatalf("after a claim session the collector is left at %d, want the pace of the looks (100)", now)
 	}
 }

@@ -8,8 +8,6 @@ import (
 	"net/http/httptrace"
 	"runtime"
 	"runtime/debug"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/claim"
@@ -35,9 +33,9 @@ import (
 //     megabytes, and at 25 it holds about 2 MB less (up to 6 MB less when
 //     a failed claim saves its page). So claims run at 25, as they did
 //     before any of this was measured;
-//   - handing the working set back at the stages of a look and four times
-//     a second during one (see below): the most the process ever has in
-//     memory at once goes from 20 MB to 11.5, of its own from 7.3 to 4.9;
+//   - handing the working set back at the stages of a look (see below):
+//     the most the process ever has in memory at once goes from 20 MB to
+//     under 12, of its own from 7.3 to under 5;
 //   - how the list is downloaded (connection kept or not, HTTP/2 or 1.1)
 //     made no difference, so that is left as Go does it.
 //
@@ -59,7 +57,12 @@ import (
 //     be kept right;
 //   - WinHTTP and the like instead of Go's client (more libraries, the
 //     same certificate check), and a helper process for each look (the
-//     same memory, in a second row of Task Manager).
+//     same memory, in a second row of Task Manager);
+//   - handing the working set back on a timer during a look (four times a
+//     second was tried): no better than the stages on a PC with memory to
+//     spare, and on one without, every time is a chance that what was
+//     handed back has to be read from the disk again. The stages are a
+//     fixed handful per look.
 type tuning struct {
 	// procs is how many threads may run the program's own code at a time
 	// (0: as many as the PC has processors).
@@ -73,11 +76,8 @@ type tuning struct {
 	// session runs.
 	claimGCPercent int
 	// stages: hand the working set back to Windows at the stages of a look
-	// and several times a second while one is in progress (see
-	// stagedTransport, stagedFeed and lookTrimmer).
+	// (see stagedTransport and stagedFeed).
 	stages bool
-	// look is running while a look is in progress (with stages).
-	look lookTrimmer
 }
 
 // daemonTuning is what the background process runs with.
@@ -88,18 +88,6 @@ func daemonTuning() *tuning {
 	}
 	memKnobs(t) // (does nothing in a normal build)
 	return t
-}
-
-// looking is told when a look begins and when it is over.
-func (t *tuning) looking(on bool) {
-	if !t.stages {
-		return
-	}
-	if on {
-		t.look.begin()
-	} else {
-		t.look.end()
-	}
 }
 
 func (t *tuning) apply() {
@@ -114,22 +102,17 @@ func (t *tuning) apply() {
 // at the claim pace of the garbage collector, and the pace of the looks is
 // put back afterwards.
 func (t *tuning) duringClaims(c daemon.Claimer) daemon.Claimer {
-	return pacedClaimer{Claimer: c, percent: t.claimGCPercent, look: &t.look}
+	return pacedClaimer{Claimer: c, percent: t.claimGCPercent}
 }
 
 type pacedClaimer struct {
 	daemon.Claimer
 	percent int
-	look    *lookTrimmer
 }
 
 func (p pacedClaimer) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]claim.Result, error) {
 	old := debug.SetGCPercent(p.percent)
 	defer debug.SetGCPercent(old)
-	// A claim is real work against the clock: nothing is handed back
-	// under it.
-	p.look.paused.Store(true)
-	defer p.look.paused.Store(false)
 	return p.Claimer.ClaimAll(ctx, offers)
 }
 
@@ -145,75 +128,33 @@ var trimNow = win.TrimWorkingSet
 // So at the end of each stage the program hands back to Windows everything
 // it holds (as it does when it goes back to waiting): what the next stage
 // needs is back at the first touch, and what it does not need is no longer
-// counted against the program. Nothing is ever taken away from a stage in
-// the middle of its work, so this cannot make a look slow, which a fixed
-// upper limit can (measured too: with one below what the secure connection
-// needs at once, a look took four seconds and a million and a half page
-// faults instead of a fifth of a second).
+// counted against the program. It is a fixed handful of times per look,
+// each before the program waits for something, and nothing is ever taken
+// away from a stage in the middle of its work: so it cannot make a look
+// slow the way a fixed upper limit can (measured too: with one below what
+// the secure connection needs at once, a look took four seconds and a
+// million and a half page faults instead of a fifth of a second).
 
-// stagedTransport hands the working set back when the connection to the
-// server stands; when the request has been sent (the secure connection was
-// set up in between, and the wait for the answer, the longest part of a
-// look, begins); and when the first byte of the answer is in.
+// stagedTransport hands the working set back before each wait on the
+// network: before the server's name is looked up, before the connection is
+// made, when the request has been sent (the secure connection was set up
+// just before; the wait for the answer is the longest part of a look), and
+// when the first byte of the answer is in. A try that fails ends with it
+// too: a pause follows before the next.
 type stagedTransport struct{ base http.RoundTripper }
 
 func (s stagedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	trace := &httptrace.ClientTrace{
-		ConnectDone:          func(string, string, error) { trimNow() },
+		DNSStart:             func(httptrace.DNSStartInfo) { trimNow() },
+		ConnectStart:         func(string, string) { trimNow() },
 		WroteRequest:         func(httptrace.WroteRequestInfo) { trimNow() },
 		GotFirstResponseByte: func() { trimNow() },
 	}
-	return s.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
-}
-
-// lookTrimmer hands the working set back four times a second for as long
-// as a look is in progress. The stages above are exact but know only a
-// look that goes well; this covers the rest: a name server or a server
-// that is slow to answer, the pauses between tries when the list cannot be
-// read, and whatever else a look comes to do. Its cost is bounded: each
-// time, what is in use at that moment comes back at the first touch (some
-// thousand page faults of two or three microseconds). While the program
-// waits for the next look it does not run at all, and during a claim
-// session it holds still.
-type lookTrimmer struct {
-	mu     sync.Mutex
-	stop   chan struct{}
-	paused atomic.Bool
-}
-
-const lookTrimEvery = 250 * time.Millisecond
-
-func (l *lookTrimmer) begin() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.stop != nil {
-		return
+	res, err := s.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
+	if err != nil {
+		trimNow()
 	}
-	stop := make(chan struct{})
-	l.stop = stop
-	go func() {
-		t := time.NewTicker(lookTrimEvery)
-		defer t.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-t.C:
-				if !l.paused.Load() {
-					trimNow()
-				}
-			}
-		}
-	}()
-}
-
-func (l *lookTrimmer) end() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.stop != nil {
-		close(l.stop)
-		l.stop = nil
-	}
+	return res, err
 }
 
 // stagedFeed hands the working set back between reading the list and

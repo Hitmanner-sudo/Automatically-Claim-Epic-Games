@@ -419,9 +419,6 @@ func cmdRun(a *app, scheduled bool, afterPID uint32) int {
 	// its memory back to Windows and drops to the lowest priority for the
 	// processor, the disk and memory (Windows' "efficiency mode").
 	opt := daemon.RunOptions{Settle: holdOff, Waiting: func(waiting bool) {
-		if a.tune != nil {
-			a.tune.looking(!waiting)
-		}
 		if waiting {
 			memMark(a.log.Printf, "end of look")
 			debug.FreeOSMemory()
@@ -442,10 +439,6 @@ func cmdRun(a *app, scheduled bool, afterPID uint32) int {
 	if a.tune != nil && a.tune.stages {
 		// Starting is a stage too: what it took is not needed for a look.
 		trimNow()
-		// (A look that is due at once begins without the program having
-		// waited first.)
-		a.tune.looking(true)
-		defer a.tune.looking(false)
 	}
 	d.Run(ctx, opt)
 	a.log.Printf("stopped")
