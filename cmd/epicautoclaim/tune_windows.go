@@ -3,9 +3,14 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"runtime"
 	"runtime/debug"
+
+	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/claim"
+	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/daemon"
+	"github.com/Hitmanner-sudo/Automatically-Claim-Epic-Games/internal/feed"
 )
 
 // tuning is how the background process keeps itself small. It has next to
@@ -19,9 +24,13 @@ import (
 //   - two threads of its own instead of one per processor: 1.4 MB less on
 //     a PC with 24 processors (the Go runtime otherwise prepares caches
 //     and a garbage-collector worker for each);
-//   - the garbage collector at its ordinary pace (100): 0.5 MB less than
-//     at 25, which made it run twice in the middle of a look whose whole
-//     garbage is 1.5 MB. Memory is handed back after every look anyway;
+//   - the garbage collector at its ordinary pace (100) for the looks:
+//     0.5 MB less than at 25, which made it run twice in the middle of a
+//     look whose whole garbage is 1.5 MB. Memory is handed back after
+//     every look anyway. A claim is another matter: it handles pages of
+//     megabytes, and at 25 it holds about 2 MB less (up to 6 MB less when
+//     a failed claim saves its page). So claims run at 25, as they did
+//     before any of this was measured;
 //   - how the list is downloaded (connection kept or not, HTTP/2 or 1.1)
 //     made no difference, so that is left as Go does it.
 //
@@ -36,11 +45,14 @@ type tuning struct {
 	// needs more for a moment, is not held up by it.
 	gcPercent int
 	limit     int64
+	// claimGCPercent is the garbage collector's pace while a claim
+	// session runs.
+	claimGCPercent int
 }
 
 // daemonTuning is what the background process runs with.
 func daemonTuning() tuning {
-	t := tuning{procs: 2, gcPercent: 100, limit: 48 << 20}
+	t := tuning{procs: 2, gcPercent: 100, limit: 48 << 20, claimGCPercent: 25}
 	if n := runtime.NumCPU(); n < t.procs {
 		t.procs = n
 	}
@@ -54,6 +66,24 @@ func (t tuning) apply() {
 	}
 	debug.SetGCPercent(t.gcPercent)
 	debug.SetMemoryLimit(t.limit)
+}
+
+// duringClaims wraps what carries out the claim sessions so that they run
+// at the claim pace of the garbage collector, and the pace of the looks is
+// put back afterwards.
+func (t tuning) duringClaims(c daemon.Claimer) daemon.Claimer {
+	return pacedClaimer{Claimer: c, percent: t.claimGCPercent}
+}
+
+type pacedClaimer struct {
+	daemon.Claimer
+	percent int
+}
+
+func (p pacedClaimer) ClaimAll(ctx context.Context, offers []feed.Offer) (map[string]claim.Result, error) {
+	old := debug.SetGCPercent(p.percent)
+	defer debug.SetGCPercent(old)
+	return p.Claimer.ClaimAll(ctx, offers)
 }
 
 // client is the HTTP client the list is read with: Go's own (nil), which

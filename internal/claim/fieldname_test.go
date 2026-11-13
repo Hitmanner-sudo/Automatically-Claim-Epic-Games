@@ -62,8 +62,9 @@ func TestAFieldNameIsJudgedAsTheExpressionJudgedIt(t *testing.T) {
 	}
 }
 
-// initBudget is how much this package may allocate while the program
-// starts. The background process starts at every sign-in and lives on
+// initBudget is how much this package, or one it imports, may allocate
+// while the program starts. (The automated Windows run asks the same of
+// the whole program: see "What starting costs" in ci.yml.) The background process starts at every sign-in and lives on
 // about a megabyte; what a package prepares "just in case" at start-up is
 // paid every time and kept for good. (One regular expression once cost
 // four megabytes here.)

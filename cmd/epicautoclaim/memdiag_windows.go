@@ -32,6 +32,7 @@ func envInt(name string, into *int) {
 func memKnobs(t *tuning) {
 	envInt("EAC_PROCS", &t.procs) // 0: leave it to the runtime (or GOMAXPROCS)
 	envInt("EAC_GC", &t.gcPercent)
+	envInt("EAC_CLAIM_GC", &t.claimGCPercent)
 	mb := int(t.limit >> 20)
 	envInt("EAC_LIMIT_MB", &mb)
 	t.limit = int64(mb) << 20

@@ -155,8 +155,11 @@ type app struct {
 	// the account already has (see claim.Options.Again).
 	again bool
 	// http is the client the free-games list is read with; nil means Go's
-	// default. (The background process brings a leaner one: see tuning.)
+	// default, which is what a normal build uses. (Only the measuring build
+	// sets one, to mark the stages of a download: see tuning.client.)
 	http *http.Client
+	// tune is set in the background process only: see tuning.
+	tune *tuning
 }
 
 func country(cfg config.Config) string {
@@ -381,6 +384,9 @@ func cmdRun(a *app, scheduled bool, afterPID uint32) int {
 		a.log.Printf("%v", a.cfgErr)
 	}
 	d := a.daemon()
+	if a.tune != nil {
+		d.Claimer = a.tune.duringClaims(d.Claimer)
+	}
 	// The program runs for as long as the user is signed in, and reads its
 	// settings once, as it starts. So before every round it looks whether
 	// the settings file has been changed since; if so it hands over to a
@@ -1063,7 +1069,7 @@ func main() {
 		if err != nil {
 			os.Exit(1)
 		}
-		a.http = tune.client()
+		a.http, a.tune = tune.client(), &tune
 		scheduled := false
 		var afterPID uint32
 		for _, arg := range args[1:] {

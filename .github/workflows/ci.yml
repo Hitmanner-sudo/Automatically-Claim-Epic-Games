@@ -80,6 +80,32 @@ jobs:
           name: EpicAutoClaim
           path: dist/EpicAutoClaim.exe
           if-no-files-found: error
+      - name: What starting costs
+        shell: pwsh
+        run: |
+          # The Go runtime says, when asked, what each package's start-up
+          # allocated. The background process starts at every sign-in and
+          # lives on about a megabyte: what a package prepares "just in
+          # case" while starting is paid every time and kept for good. (One
+          # pattern once cost four megabytes.) Asked of the real program,
+          # with a command that does nothing else.
+          $err = Join-Path $env:RUNNER_TEMP 'inittrace.txt'
+          $out = Join-Path $env:RUNNER_TEMP 'inittrace-out.txt'
+          $env:GODEBUG = 'inittrace=1'
+          $p = Start-Process -FilePath "$env:RUNNER_TEMP/eac-console.exe" -ArgumentList 'version' -Wait -NoNewWindow -PassThru -RedirectStandardError $err -RedirectStandardOutput $out
+          Remove-Item Env:GODEBUG
+          if ($p.ExitCode -ne 0) { throw "the program did not run with the start-up trace (exit code $($p.ExitCode))" }
+          $own = Select-String -Path $err -Pattern '^init (\S*Automatically-Claim-Epic-Games/\S+|main) @.*?, (\d+) bytes, (\d+) allocs'
+          if (-not $own) { Get-Content $err | Select-Object -First 20; throw 'the start-up trace names none of the program''s packages' }
+          $worst = 0
+          foreach ($m in $own) {
+            $g = $m.Matches[0].Groups
+            $n = [int64]$g[2].Value
+            "{0,9} bytes in {1,5} allocations: {2}" -f $n, $g[3].Value, $g[1].Value
+            if ($n -gt 512KB) { throw "$($g[1].Value) allocates $n bytes while the program starts; a package may allocate 512 kB (prepare it at first use instead)" }
+            $worst = [math]::Max($worst, $n)
+          }
+          "the most one of the program's packages allocates while starting: $worst bytes"
       - name: What a look at the list costs in memory
         shell: pwsh
         run: |
@@ -99,6 +125,10 @@ jobs:
             $deadline = (Get-Date).AddSeconds(90)
             while ((Get-Date) -lt $deadline -and -not ((Test-Path $log) -and (Select-String -Path $log -Pattern 'mem asleep' -Quiet))) { Start-Sleep -Milliseconds 200 }
             if (Test-Path $log) { Get-Content $log } else { throw 'the measuring build wrote no log' }
+            if (-not (Select-String -Path $log -Pattern 'mem asleep' -Quiet)) { throw 'the look was not over after 90 seconds (see the log above; a list that cannot be downloaded is tried for up to three minutes), so nothing was measured' }
+            # A look that could not download the list did not do the part
+            # that costs most: its figure says nothing about a real look.
+            $downloaded = -not (Select-String -Path $log -Pattern 'could not read the free-games list' -Quiet)
             function Own([string]$label) {
               $m = Select-String -Path $log -Pattern ('mem ' + $label + '\s+ws=\S+ privateWS=([0-9.]+)') | Select-Object -Last 1
               if (-not $m) { throw "the log has no '$label' line with the memory of the process's own" }
@@ -112,7 +142,8 @@ jobs:
             # lookup and certificate check), 0.2 to 0.3 asleep. Before:
             # 7.4 at start and 11 at the end of a look.
             if ($start -gt 4.5) { throw "the program holds $start MB of its own right after starting; it may hold 4.5 (something is prepared at start-up that should wait for its first use)" }
-            if ($look -gt 10) { throw "the program holds $look MB of its own at the end of a look; it may hold 10" }
+            if (-not $downloaded) { '::warning::the list could not be downloaded here (the network, not the program), so what a look costs was not measured in this run' }
+            elseif ($look -gt 10) { throw "the program holds $look MB of its own at the end of a look; it may hold 10" }
             if ($asleep -gt 1.5) { throw "the program holds $asleep MB of its own when it has gone back to waiting; it may hold 1.5" }
           } finally {
             Start-Process -FilePath $exe -ArgumentList 'stop' -Wait
