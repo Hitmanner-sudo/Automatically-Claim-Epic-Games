@@ -23,8 +23,7 @@ import (
 // kilobytes and compares it with what it knows.
 //
 // The values are measured, not guessed (workflow "Memory of the background
-// process", on a Windows machine, memory of the process's own at the end
-// of a look):
+// process", on a Windows machine):
 //
 //   - two threads of its own instead of one per processor: 1.4 MB less on
 //     a PC with 24 processors (the Go runtime otherwise prepares caches
@@ -36,11 +35,31 @@ import (
 //     megabytes, and at 25 it holds about 2 MB less (up to 6 MB less when
 //     a failed claim saves its page). So claims run at 25, as they did
 //     before any of this was measured;
+//   - handing the working set back at the stages of a look and four times
+//     a second during one (see below): the most the process ever has in
+//     memory at once goes from 20 MB to 11.5, of its own from 7.3 to 4.9;
 //   - how the list is downloaded (connection kept or not, HTTP/2 or 1.1)
 //     made no difference, so that is left as Go does it.
 //
-// What a look costs beyond that is Windows' own: its name lookup and its
-// certificate check load their libraries into the process.
+// What a look still costs is the secure connection: for the tenth of a
+// second it takes, Go's cryptography and Windows' certificate check need
+// about 10 MB at once, 4.5 of them the program's own.
+//
+// Looked into and left alone:
+//
+//   - a hard upper limit on the working set (SetProcessWorkingSetSizeEx
+//     with QUOTA_LIMITS_HARDWS_MAX_ENABLE). At 12 MB and more it costs
+//     nothing, but then it does no better than the stages; below what the
+//     certificate check needs at once (about 10 MB here, another figure
+//     on another PC) a look took four seconds and a million and a half
+//     page faults;
+//   - checking the server's certificate against a few roots built into
+//     the program before asking Windows: about 2 MB less for that tenth
+//     of a second, for a second way of trusting a server that then has to
+//     be kept right;
+//   - WinHTTP and the like instead of Go's client (more libraries, the
+//     same certificate check), and a helper process for each look (the
+//     same memory, in a second row of Task Manager).
 type tuning struct {
 	// procs is how many threads may run the program's own code at a time
 	// (0: as many as the PC has processors).
@@ -53,9 +72,6 @@ type tuning struct {
 	// claimGCPercent is the garbage collector's pace while a claim
 	// session runs.
 	claimGCPercent int
-	// wsCap is a hard limit on the working set outside claim sessions, in
-	// bytes (0: none). See win.CapWorkingSet.
-	wsCap int64
 	// stages: hand the working set back to Windows at the stages of a look
 	// and several times a second while one is in progress (see
 	// stagedTransport, stagedFeed and lookTrimmer).
@@ -92,22 +108,18 @@ func (t *tuning) apply() {
 	}
 	debug.SetGCPercent(t.gcPercent)
 	debug.SetMemoryLimit(t.limit)
-	if t.wsCap > 0 {
-		_ = win.CapWorkingSet(uintptr(t.wsCap))
-	}
 }
 
 // duringClaims wraps what carries out the claim sessions so that they run
 // at the claim pace of the garbage collector, and the pace of the looks is
 // put back afterwards.
 func (t *tuning) duringClaims(c daemon.Claimer) daemon.Claimer {
-	return pacedClaimer{Claimer: c, percent: t.claimGCPercent, wsCap: t.wsCap, look: &t.look}
+	return pacedClaimer{Claimer: c, percent: t.claimGCPercent, look: &t.look}
 }
 
 type pacedClaimer struct {
 	daemon.Claimer
 	percent int
-	wsCap   int64
 	look    *lookTrimmer
 }
 
@@ -118,19 +130,18 @@ func (p pacedClaimer) ClaimAll(ctx context.Context, offers []feed.Offer) (map[st
 	// under it.
 	p.look.paused.Store(true)
 	defer p.look.paused.Store(false)
-	if p.wsCap > 0 {
-		// A claim is real work against the clock: no limit meanwhile.
-		_ = win.CapWorkingSet(0)
-		defer func() { _ = win.CapWorkingSet(uintptr(p.wsCap)) }()
-	}
 	return p.Claimer.ClaimAll(ctx, offers)
 }
+
+// trimNow hands the working set back to Windows. (A variable so that a test
+// can count the times.)
+var trimNow = win.TrimWorkingSet
 
 // A look goes through stages that each need a different part of the program
 // and of Windows in memory: looking the server's name up and connecting;
 // setting up the secure connection, which has Windows check the server's
 // certificate; reading and understanding the answer; and deciding what to
-// do about it. Measured, they need 6, 10, and 8 MB; left to pile up, 23.
+// do about it. Measured, they need 8, 11, and 7 MB; left to pile up, 20.
 // So at the end of each stage the program hands back to Windows everything
 // it holds (as it does when it goes back to waiting): what the next stage
 // needs is back at the first touch, and what it does not need is no longer
@@ -148,9 +159,9 @@ type stagedTransport struct{ base http.RoundTripper }
 
 func (s stagedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	trace := &httptrace.ClientTrace{
-		ConnectDone:          func(string, string, error) { win.TrimWorkingSet() },
-		WroteRequest:         func(httptrace.WroteRequestInfo) { win.TrimWorkingSet() },
-		GotFirstResponseByte: func() { win.TrimWorkingSet() },
+		ConnectDone:          func(string, string, error) { trimNow() },
+		WroteRequest:         func(httptrace.WroteRequestInfo) { trimNow() },
+		GotFirstResponseByte: func() { trimNow() },
 	}
 	return s.base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
 }
@@ -189,7 +200,7 @@ func (l *lookTrimmer) begin() {
 				return
 			case <-t.C:
 				if !l.paused.Load() {
-					win.TrimWorkingSet()
+					trimNow()
 				}
 			}
 		}
@@ -211,7 +222,7 @@ type stagedFeed struct{ daemon.Feed }
 
 func (f stagedFeed) Fetch(ctx context.Context, country, locale string, now time.Time) (feed.Snapshot, error) {
 	snap, err := f.Feed.Fetch(ctx, country, locale, now)
-	win.TrimWorkingSet()
+	trimNow()
 	return snap, err
 }
 

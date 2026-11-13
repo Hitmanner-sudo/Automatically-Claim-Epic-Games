@@ -148,16 +148,24 @@ jobs:
               [double]$m.Matches[0].Groups[1].Value
             }
             $start = Own 'started'; $look = Own 'end of look'; $asleep = Own 'asleep'
-            "memory of its own, in MB: $start at start, $look at the end of a look, $asleep asleep"
-            # What it may cost. Measured on these machines after the
-            # start-up was put right: 2.4 to 3.0 at start, 7.2 to 7.8 at the
-            # end of a look (most of the difference is Windows' own name
-            # lookup and certificate check), 0.2 to 0.3 asleep. Before:
-            # 7.4 at start and 11 at the end of a look.
-            if ($start -gt 4.5) { throw "the program holds $start MB of its own right after starting; it may hold 4.5 (something is prepared at start-up that should wait for its first use)" }
-            if (-not $downloaded) { '::warning::the list could not be downloaded here (the network, not the program), so what a look costs was not measured in this run' }
-            elseif ($look -gt 10) { throw "the program holds $look MB of its own at the end of a look; it may hold 10" }
+            # The most the process had in memory at any moment since it
+            # started, its own and the Windows libraries it shares: Windows
+            # itself keeps that figure.
+            $m = Select-String -Path $log -Pattern 'mem asleep\s+.*? peakWS=([0-9.]+)' | Select-Object -Last 1
+            if (-not $m) { throw "the log has no 'asleep' line with the peak" }
+            $peak = [double]$m.Matches[0].Groups[1].Value
+            "memory of its own, in MB: $start at start, $look at the end of a look, $asleep asleep; the most in memory at once, shared libraries included: $peak"
+            # What it may cost. Measured on these machines: 2.1 at start,
+            # 3.7 at the end of a look, 0.2 asleep, and 11.5 at once at
+            # most (the secure connection needs that much for a tenth of a
+            # second). Build 0.2.2: 7.4, 11, 0.3, and 26.
+            if ($start -gt 4) { throw "the program holds $start MB of its own right after starting; it may hold 4 (something is prepared at start-up that should wait for its first use)" }
             if ($asleep -gt 1.5) { throw "the program holds $asleep MB of its own when it has gone back to waiting; it may hold 1.5" }
+            if (-not $downloaded) { '::warning::the list could not be downloaded here (the network, not the program), so what a look costs was not measured in this run' }
+            else {
+              if ($look -gt 6) { throw "the program holds $look MB of its own at the end of a look; it may hold 6" }
+              if ($peak -gt 16) { throw "the program had $peak MB in memory at once; it may have 16 (is the working set still handed back at the stages of a look?)" }
+            }
           } finally {
             Start-Process -FilePath $exe -ArgumentList 'stop' -Wait
             if (-not $p.WaitForExit(20000)) { Stop-Process -Id $p.Id -Force }

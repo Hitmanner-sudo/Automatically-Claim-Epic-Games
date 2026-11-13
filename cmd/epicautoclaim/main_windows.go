@@ -427,11 +427,6 @@ func cmdRun(a *app, scheduled bool, afterPID uint32) int {
 			debug.FreeOSMemory()
 		}
 		win.Background(waiting)
-		if !waiting && a.tune != nil && a.tune.wsCap > 0 {
-			// (Windows sets limits of its own on a process in the
-			// background and may not put this one back.)
-			_ = win.CapWorkingSet(uintptr(a.tune.wsCap))
-		}
 		if waiting {
 			memMark(a.log.Printf, "asleep")
 		} else {
@@ -446,7 +441,7 @@ func cmdRun(a *app, scheduled bool, afterPID uint32) int {
 	memMark(a.log.Printf, "started")
 	if a.tune != nil && a.tune.stages {
 		// Starting is a stage too: what it took is not needed for a look.
-		win.TrimWorkingSet()
+		trimNow()
 		// (A look that is due at once begins without the program having
 		// waited first.)
 		a.tune.looking(true)

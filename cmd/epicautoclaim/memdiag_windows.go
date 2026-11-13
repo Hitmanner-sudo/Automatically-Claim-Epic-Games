@@ -36,9 +36,6 @@ func memKnobs(t *tuning) {
 	envInt("EAC_PROCS", &t.procs) // 0: leave it to the runtime (or GOMAXPROCS)
 	envInt("EAC_GC", &t.gcPercent)
 	envInt("EAC_CLAIM_GC", &t.claimGCPercent)
-	capKB := int(t.wsCap >> 10)
-	envInt("EAC_WSCAP_KB", &capKB)
-	t.wsCap = int64(capKB) << 10
 	stages := 0
 	if t.stages {
 		stages = 1
